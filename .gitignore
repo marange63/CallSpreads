@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/
+
+# Personal runtime state (mutated by the app; not needed to run)
+positions.json
+templates.json
+*.tmp
+
+# Generated chart output
+qqq_rolling_63d.png
