@@ -10,6 +10,7 @@ Usage:
 Then open http://localhost:8765 in your browser.
 """
 
+import errno
 import http.server
 import json
 import math
@@ -3149,20 +3150,44 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def start_server(preferred_port, max_tries=20):
+    """Bind the server, auto-selecting the next free port if the preferred
+    one is already in use (e.g. a previous instance is still running)."""
+    for offset in range(max_tries):
+        port = preferred_port + offset
+        try:
+            httpd = socketserver.TCPServer(("", port), SpreadHandler)
+        except OSError as exc:
+            # WinError 10048 / errno 98/48: address already in use -> try next port
+            if getattr(exc, "winerror", None) == 10048 or exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                if offset == 0:
+                    print(f"Port {preferred_port} is busy (another instance may be running). "
+                          f"Looking for a free port...")
+                continue
+            raise
+        return httpd, port
+    raise SystemExit(
+        f"Could not find a free port in range {preferred_port}-{preferred_port + max_tries - 1}. "
+        f"Close the other server window and try again."
+    )
+
+
 def main():
+    httpd, port = start_server(PORT)
+
     print(f"""
     ╔══════════════════════════════════════════════╗
     ║       Call Spread Finder                      ║
     ║                                              ║
-    ║   Open: http://localhost:{PORT}                ║
+    ║   Open: http://localhost:{port}                ║
     ║   Press Ctrl+C to stop                       ║
     ╚══════════════════════════════════════════════╝
     """)
 
-    with socketserver.TCPServer(("", PORT), SpreadHandler) as httpd:
+    with httpd:
         httpd.allow_reuse_address = True
         # Open browser after a short delay
-        threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{port}")).start()
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
