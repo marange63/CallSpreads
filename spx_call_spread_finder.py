@@ -359,7 +359,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                             skipped_leg_premium_min += 1
                             continue
 
-                    total_premium = net_premium * contracts/ide
+                    total_premium = net_premium * contracts
 
                     # Compute deltas using implied vol
                     iv_buy = float(row_buy["impliedVolatility"])
@@ -551,9 +551,18 @@ def _leg_snapshot(row):
     vol = int(row["volume"]) if row.get("volume") and not math.isnan(float(row["volume"])) else 0
     iv_raw = float(row["impliedVolatility"]) if "impliedVolatility" in row else 0.0
     iv = iv_raw if iv_raw > 0 else None
-    mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else max(bid, ask, last)
+    # Today's mark: live bid/ask mid when both quoted (fresh even if untraded),
+    # else the best of bid/ask/last. `quotedMid` flags a genuine two-sided market.
+    quoted_mid = bid > 0 and ask > 0
+    mid = (bid + ask) / 2 if quoted_mid else max(bid, ask, last)
+    # Yesterday's close: Yahoo's official prior-day close. It equals lastPrice - change
+    # and matches regularMarketPreviousClose, so it stays valid even when the last
+    # TRADE is days stale (staleness sits in lastPrice, which cancels here).
+    change_raw = float(row["change"]) if "change" in row else float("nan")
+    prev_close = None if math.isnan(change_raw) else round(last - change_raw, 2)
     return {"bid": round(bid, 2), "ask": round(ask, 2), "last": round(last, 2),
             "mid": round(mid, 2), "volume": vol,
+            "prevClose": prev_close, "quotedMid": quoted_mid,
             "iv": round(iv * 100, 1) if iv is not None else None,
             "_iv_raw": iv}
 
@@ -576,6 +585,33 @@ def _record_pnl(position_id, pnl):
         del hist[:len(hist) - _HISTORY_MAX]
 
 
+def _underlying_spot_and_time(oc, tk):
+    """Return (spot, quote_epoch_seconds) for an option_chain result.
+
+    Prefers the underlying quote bundled with the chain (`oc.underlying`) because
+    it comes from the *same* HTTP response as the option quotes, so spot is
+    time-aligned with the bids/asks/IVs used for P&L and greeks. Falls back
+    through post/pre-market price, a bid/ask mid, and finally a separate daily
+    history close (which is NOT time-aligned, so quote_time is reported as None).
+    """
+    u = getattr(oc, "underlying", None) or {}
+    # Try each price source paired with its own timestamp.
+    for price_key, time_key in (
+        ("regularMarketPrice", "regularMarketTime"),
+        ("postMarketPrice", "postMarketTime"),
+        ("preMarketPrice", "preMarketTime"),
+    ):
+        px = u.get(price_key)
+        if px:
+            return float(px), u.get(time_key)
+    # Bid/ask mid of the underlying, if quoted.
+    bid, ask = u.get("bid") or 0, u.get("ask") or 0
+    if bid and ask:
+        return (float(bid) + float(ask)) / 2, u.get("regularMarketTime")
+    # Last resort: a separate daily-close fetch, not aligned with the chain.
+    return float(tk.history(period="1d")["Close"].iloc[-1]), None
+
+
 def fetch_position_quotes(positions, haircut_pct=0.80):
     """Fetch live leg data for every saved position, batching chain calls.
 
@@ -584,7 +620,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
     """
     results = []
     chain_cache = {}   # (symbol, expiration) -> calls DataFrame
-    spot_cache = {}    # symbol -> float
+    spot_cache = {}    # symbol -> (spot: float, quote_epoch_seconds: int | None)
 
     for p in positions:
         symbol = p["symbol"]
@@ -599,6 +635,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
         result["long"] = None
         result["short"] = None
         result["spot"] = None
+        result["quoteTime"] = None
         result["spreadMid"] = None
         result["spreadLiquidation"] = None
         result["currentValue"] = None
@@ -614,6 +651,9 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
         result["pnlPct"] = None
         result["adjPnl"] = None
         result["adjPnlPct"] = None
+        result["dayChange"] = None
+        result["dayChangePct"] = None
+        result["dayChangeStale"] = None
         result["netDelta"] = None
         result["netThetaPerDay"] = None
         result["netVega"] = None
@@ -626,12 +666,16 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
             key = (symbol, exp)
             if key not in chain_cache:
                 tk = yf.Ticker(symbol)
-                chain_cache[key] = tk.option_chain(exp).calls
+                oc = tk.option_chain(exp)
+                chain_cache[key] = oc.calls
                 if symbol not in spot_cache:
-                    spot_cache[symbol] = float(tk.history(period="1d")["Close"].iloc[-1])
+                    # Spot from the chain's own underlying snapshot => time-aligned
+                    # with the option quotes below (see _underlying_spot_and_time).
+                    spot_cache[symbol] = _underlying_spot_and_time(oc, tk)
             calls = chain_cache[key]
-            spot = spot_cache.get(symbol)
+            spot, quote_ts = spot_cache.get(symbol, (None, None))
             result["spot"] = round(spot, 2) if spot is not None else None
+            result["quoteTime"] = int(quote_ts) if quote_ts else None
 
             long_match = calls[calls["strike"] == float(p["longStrike"])]
             short_match = calls[calls["strike"] == float(p["shortStrike"])]
@@ -655,6 +699,23 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
                 result["spreadLiquidation"] = round(spread_liq, 2)
                 result["currentValue"] = current_value
                 result["liquidationValue"] = liquidation_value
+
+                # Change on the day: today's spread mark vs. yesterday's close, valued
+                # leg-by-leg. Today = live bid/ask mid (fresh even for untraded strikes);
+                # yesterday = Yahoo's official prior-day close (prevClose). This avoids the
+                # stale-last-trade problem that plagues thinly traded legs. Commissions and
+                # the haircut are fixed intraday, so this is the day's delta for both raw
+                # and adjusted P&L.
+                long_prev, short_prev = long_leg["prevClose"], short_leg["prevClose"]
+                if long_prev is not None and short_prev is not None:
+                    spread_prev_close = long_prev - short_prev
+                    day_change = round((spread_mid - spread_prev_close) * 100 * contracts, 2)
+                    result["dayChange"] = day_change
+                    # True if today's mid on either leg fell back to a one-sided/last price
+                    # (no live two-sided quote) — the day figure is then less reliable.
+                    result["dayChangeStale"] = not (long_leg["quotedMid"] and short_leg["quotedMid"])
+                    if result["entryCost"]:
+                        result["dayChangePct"] = round(day_change / abs(result["entryCost"]) * 100, 2)
                 if result["entryCost"]:
                     result["pnl"] = round(current_value - result["entryCost"], 2)
                     result["pnlPct"] = round(result["pnl"] / abs(result["entryCost"]) * 100, 2)
@@ -2131,6 +2192,12 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   .pnl-neg { color: var(--red); font-weight: 600; }
   .err-row { color: var(--yellow); }
 
+  .quote-age { display: inline-block; font-family: var(--font); font-size: 10px; font-weight: 500;
+               padding: 1px 6px; border-radius: 999px; margin-left: 6px; vertical-align: middle; }
+  .quote-age.qa-fresh   { background: rgba(16, 185, 129, 0.15); color: var(--green); }
+  .quote-age.qa-delayed { background: rgba(245, 158, 11, 0.15); color: var(--yellow); }
+  .quote-age.qa-stale   { background: rgba(239, 68, 68, 0.15);  color: var(--red); }
+
   .empty { padding: 60px 32px; text-align: center; color: var(--text-dim); }
   .err-banner { background: rgba(239, 68, 68, 0.1); color: var(--red); padding: 10px 32px;
                 border-bottom: 1px solid var(--red); font-size: 13px; display: none; }
@@ -2149,8 +2216,11 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
           display: flex; flex-direction: column; gap: 4px; }
   .stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
   .stat-value { font-size: 18px; font-weight: 600; }
+  .stat-sub { font-size: 11px; font-weight: 500; }
+  .stat-sub.dim { color: var(--text-dim); }
+  .stat-highlight { grid-column: span 2; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+                    border: 2px solid #fff; border-radius: 8px; padding: 6px; }
 
-  .spark { display: inline-block; vertical-align: middle; }
   .greek-block { display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); font-size: 12px; }
   .greek-block .lbl { color: var(--text-dim); font-size: 10px; }
 </style>
@@ -2212,8 +2282,10 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <div class="stat"><div class="stat-label">Entry Cost</div><div class="stat-value mono" id="sumEntry">--</div></div>
     <div class="stat"><div class="stat-label">Current Value</div><div class="stat-value mono" id="sumCurrent">--</div></div>
     <div class="stat"><div class="stat-label">Total P&amp;L</div><div class="stat-value mono" id="sumPnl">--</div></div>
-    <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div></div>
-    <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
+    <div class="stat-highlight">
+      <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
+      <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
+    </div>
     <div class="stat"><div class="stat-label">Net &Delta;+&Gamma; P&amp;L (1&sigma; move)</div><div class="stat-value mono" id="sumDelta">--</div></div>
     <div class="stat"><div class="stat-label">Net &Theta; ($/day)</div><div class="stat-value mono" id="sumTheta">--</div></div>
     <div class="stat"><div class="stat-label">Net Vega ($/1% IV)</div><div class="stat-value mono" id="sumVega">--</div></div>
@@ -2237,8 +2309,8 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th>Current Value</th>
         <th>P&amp;L</th>
         <th id="colAdjPnlLabel">Adj P&amp;L (80%)</th>
+        <th>Day</th>
         <th>Greeks (&Delta;+&Gamma; 1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
-        <th>Chart</th>
         <th></th>
       </tr>
     </thead>
@@ -2257,32 +2329,30 @@ function $(id) { return document.getElementById(id); }
 function dollarFmt(v, dp=2) { return (v >= 0 ? '$' : '-$') + Math.abs(v).toFixed(dp); }
 function sign(v) { return (v >= 0 ? '+' : ''); }
 
+// Badge showing how stale the quote snapshot is. quoteTime is epoch seconds
+// from the option chain's own underlying, so it dates BOTH spot and options.
+function quoteAgeBadge(epochSec) {
+  if (!epochSec) return '';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - epochSec));
+  let label;
+  if (secs < 60) label = secs + 's';
+  else if (secs < 3600) label = Math.floor(secs / 60) + 'm';
+  else if (secs < 86400) label = Math.floor(secs / 3600) + 'h';
+  else label = Math.floor(secs / 86400) + 'd';
+  // Yahoo option quotes are ~15 min delayed, so a couple of minutes is "fresh";
+  // >=30 min usually means a stuck feed or a closed market.
+  let cls = 'qa-fresh';
+  if (secs >= 1800) cls = 'qa-stale';
+  else if (secs >= 120) cls = 'qa-delayed';
+  return `<span class="quote-age ${cls}" title="Quote snapshot age (spot + options)">${label} ago</span>`;
+}
+
 function showErr(msg) { const b = $('errBanner'); b.textContent = msg; b.classList.add('show'); }
 function clearErr() { $('errBanner').classList.remove('show'); }
 
 function dteFromExp(expStr) {
   const exp = new Date(expStr + 'T16:00:00');
   return Math.round((exp - new Date()) / 86400000);
-}
-
-function sparkline(history, w=100, h=28) {
-  if (!history || history.length < 2) return '<span class="dim">–</span>';
-  const ys = history.map(p => p[1]);
-  const min = Math.min(...ys), max = Math.max(...ys);
-  const range = max - min || 1;
-  const pts = ys.map((y, i) => {
-    const x = (i / (ys.length - 1)) * (w - 2) + 1;
-    const py = h - 2 - ((y - min) / range) * (h - 4);
-    return `${x.toFixed(1)},${py.toFixed(1)}`;
-  }).join(' ');
-  const color = ys[ys.length - 1] >= ys[0] ? 'var(--green)' : 'var(--red)';
-  const zeroLine = min <= 0 && max >= 0
-    ? `<line x1="1" x2="${w-1}" y1="${(h - 2 - ((0 - min) / range) * (h - 4)).toFixed(1)}" y2="${(h - 2 - ((0 - min) / range) * (h - 4)).toFixed(1)}" stroke="var(--text-dim)" stroke-width="0.5" stroke-dasharray="2,2"/>`
-    : '';
-  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-    ${zeroLine}
-    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.3"/>
-  </svg>`;
 }
 
 function fmtSignedDollar(v, dp=0) {
@@ -2299,7 +2369,9 @@ function updateSummary(rows) {
   const totalCurrent = withData.reduce((s, r) => s + (r.currentValue || 0), 0);
   const totalPnl = withData.reduce((s, r) => s + r.pnl, 0);
   const totalAdjPnl = withData.reduce((s, r) => s + (r.adjPnl || 0), 0);
+  const totalDayChange = withData.reduce((s, r) => s + (r.dayChange || 0), 0);
   const totalRet = totalEntry ? (totalAdjPnl / Math.abs(totalEntry)) * 100 : 0;
+  const totalDayPct = totalEntry ? (totalDayChange / Math.abs(totalEntry)) * 100 : 0;
   const totalDelta = withData.reduce((s, r) => s + (r.netDelta || 0), 0);
   const totalOneSigmaPnl = withData.reduce((s, r) => s + (r.oneSigmaPnl || 0), 0);
   const totalTheta = withData.reduce((s, r) => s + (r.netThetaPerDay || 0), 0);
@@ -2319,6 +2391,17 @@ function updateSummary(rows) {
   retEl.textContent = (totalRet >= 0 ? '+' : '') + totalRet.toFixed(2) + '%';
   retEl.className = 'stat-value mono ' + (totalRet >= 0 ? 'pnl-pos' : 'pnl-neg');
   setPnlText('sumAdjPnl', totalAdjPnl);
+  // Change on the day: today's live mid vs. yesterday's close, per leg (see backend).
+  // Haircut/commissions are fixed intraday, so this is the day's delta for adjusted P&L.
+  const dayRows = withData.filter(r => r.dayChange !== null && r.dayChange !== undefined);
+  const anyStale = dayRows.some(r => r.dayChangeStale);
+  const dayEl = $('sumAdjPnlDay');
+  dayEl.textContent = 'Day ' + fmtSignedDollar(totalDayChange, 0) +
+    ' (' + sign(totalDayPct) + totalDayPct.toFixed(2) + '%)' + (anyStale ? ' ~' : '');
+  dayEl.title = anyStale
+    ? 'Today vs. yesterday’s close. ~ = a leg had no live two-sided quote, so its mark fell back to last/one-sided price.'
+    : 'Today’s live mid vs. yesterday’s close (Yahoo prior-day close).';
+  dayEl.className = 'stat-sub mono ' + (totalDayChange >= 0 ? 'pnl-pos' : 'pnl-neg');
   // Reflect the active haircut % on the label and column header
   const activeHc = currentHaircutPct().toFixed(0);
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
@@ -2399,8 +2482,6 @@ function renderTable() {
         <span>${p.netVega >= 0 ? '+' : ''}$${p.netVega.toFixed(2)}</span>
       </div></td>`;
 
-    const chartCell = `<td>${sparkline(p.history || [])}</td>`;
-
     let pnlCell = '<td class="dim">--</td>';
     if (p.pnl !== null && p.pnl !== undefined) {
       const cls = p.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
@@ -2425,8 +2506,22 @@ function renderTable() {
       </div></td>`;
     }
 
+    // Change on the day: today's live mid vs. yesterday's close (see backend).
+    let dayCell = '<td class="dim">--</td>';
+    if (p.dayChange !== null && p.dayChange !== undefined) {
+      const cls = p.dayChange >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const staleMark = p.dayChangeStale ? '<span class="tt-dim" title="A leg had no live two-sided quote; mark fell back to last/one-sided price.">~ stale quote</span>' : '';
+      const pctStr = (p.dayChangePct !== null && p.dayChangePct !== undefined)
+        ? `<span class="${cls} pct">${sign(p.dayChangePct)}${p.dayChangePct.toFixed(2)}%</span>` : '';
+      dayCell = `<td><div class="pnl-block">
+        <span class="${cls}">${sign(p.dayChange)}${dollarFmt(p.dayChange, 0)}</span>
+        ${pctStr}
+        ${staleMark}
+      </div></td>`;
+    }
+
     const label = p.label || `${p.symbol} ${p.longStrike}/${p.shortStrike}`;
-    const spotCell = p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--';
+    const spotCell = (p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--') + quoteAgeBadge(p.quoteTime);
     const midCell = p.spreadMid !== null ? `$${p.spreadMid.toFixed(2)}` : '--';
     const liqCell = p.spreadLiquidation !== null ? `$${p.spreadLiquidation.toFixed(2)}` : '--';
     const curCell = p.currentValue !== null ? dollarFmt(p.currentValue, 0) : '--';
@@ -2452,8 +2547,8 @@ function renderTable() {
       <td class="mono">${curCell}</td>
       ${pnlCell}
       ${adjPnlCell}
+      ${dayCell}
       ${greeksCell}
-      ${chartCell}
       <td>
         <button class="ghost" data-edit="${p.id}">Edit</button>
         <button class="danger" data-del="${p.id}">Delete</button>
