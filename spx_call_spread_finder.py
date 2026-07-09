@@ -34,6 +34,8 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "yfinance", "-q"])
     import yfinance as yf
 
+import numpy as np  # ships with pandas/yfinance; used for the Monte Carlo path engine
+
 PORT = 8765
 
 # ---------------------------------------------------------------------------
@@ -160,10 +162,148 @@ def implied_vol(price, S, K, T, r, max_iter=50, tol=1e-6):
 
 
 # ---------------------------------------------------------------------------
+# Path-aware profit-target probability (Monte Carlo)
+# ---------------------------------------------------------------------------
+#
+# Estimates P[ a spread's Adjusted P&L touches a profit target at any point before
+# expiry ]. This is a first-passage problem: the target is a *constant* barrier in
+# spread-VALUE space (V*, see spread_prob_target) but a *moving* barrier in underlying
+# space because the spread reprices as theta decays. We simulate zero-drift GBM paths
+# for the underlying ONCE per expiration, invert V* into a per-timestep critical
+# underlying level, then test how many paths ever cross it. Assumptions: zero drift
+# (conservative "no edge"), per-leg IVs frozen along the path, ATM IV drives diffusion,
+# and Black-Scholes *mid* prices the path (the haircut in Adjusted P&L stands in for the
+# mid->liquidation bid/ask crossing). Daily monitoring slightly undercounts intraday
+# touches; finer stepping for short-DTE is the mitigation.
+
+# Haircut the Finder assumes when computing P(+X%), matching the Monitor's default so a
+# spread's probability reads identically on both pages.
+FINDER_HAIRCUT_PCT = 0.80
+
+# Monte Carlo settings. Paths are shared across every spread of an expiration, so the
+# Finder can afford a modest count; the Monitor has few positions so it uses more.
+MC_PATHS_FINDER = 2000
+MC_PATHS_MONITOR = 10000
+MC_SEED = 12345  # fixed so the displayed probability doesn't jitter purely from the RNG
+
+
+def _norm_cdf_np(x):
+    """Vectorized standard-normal CDF (Zelen & Severo approximation, |err| < 7.5e-8)."""
+    x = np.asarray(x, dtype=float)
+    t = 1.0 / (1.0 + 0.2316419 * np.abs(x))
+    d = 0.3989422804014327 * np.exp(-x * x / 2.0)
+    p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937
+        + t * (-1.821255978 + t * 1.330274429))))
+    return np.where(x >= 0.0, 1.0 - p, p)
+
+
+def _bs_call_price_vec(S, K, T, r, sigma):
+    """Black-Scholes call price, vectorized over same-shaped arrays S and T (K/r/sigma scalar)."""
+    S = np.asarray(S, dtype=float)
+    T = np.asarray(T, dtype=float)
+    pos = T > 0
+    if sigma <= 0:
+        return np.where(pos, np.maximum(S - K * np.exp(-r * np.where(pos, T, 0.0)), 0.0),
+                        np.maximum(S - K, 0.0))
+    Tp = np.where(pos, T, 1.0)  # dummy value where T<=0; masked out below
+    sqrtT = np.sqrt(Tp)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma * sigma) * Tp) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    priced = S * _norm_cdf_np(d1) - K * np.exp(-r * Tp) * _norm_cdf_np(d2)
+    return np.where(pos, priced, np.maximum(S - K, 0.0))
+
+
+def simulate_paths(spot, atm_iv, T, n_paths, n_steps, drift=0.0, seed=MC_SEED):
+    """Simulate zero-drift GBM underlying paths on a daily grid.
+
+    Returns (S_matrix, T_remaining) where S_matrix has shape (n_paths, n_steps) holding
+    the underlying price at each future step (step k is (k+1) days ahead; the last step is
+    expiry) and T_remaining[k] is the time-to-expiry in years at that step. With drift=0
+    the price has zero expected return (E[S_t] = spot); the -0.5*sigma^2 term is the Ito
+    correction. Returns (None, None) for degenerate inputs.
+    """
+    if not atm_iv or atm_iv <= 0 or T <= 0 or n_steps < 1:
+        return None, None
+    rng = np.random.default_rng(seed)
+    dt = T / n_steps
+    drift_term = (drift - 0.5 * atm_iv * atm_iv) * dt
+    diff_term = atm_iv * math.sqrt(dt)
+    z = rng.standard_normal((int(n_paths), int(n_steps)))
+    log_paths = np.cumsum(drift_term + diff_term * z, axis=1)
+    S = spot * np.exp(log_paths)
+    steps = np.arange(1, n_steps + 1)
+    T_remaining = T - steps * dt
+    return S, T_remaining
+
+
+def critical_levels(K1, K2, iv_l, iv_s, r, T_remaining, V_star, width):
+    """Smallest underlying level whose bull-call-spread value >= V_star, per remaining time.
+
+    Spread value is monotonically increasing in S (0 -> width*exp(-r*T)), so we bisect.
+    Returns an array aligned with T_remaining; np.inf where V_star exceeds the reachable
+    maximum at that step (the target simply cannot be hit then).
+    """
+    T_rem = np.asarray(T_remaining, dtype=float)
+    S_star = np.full(T_rem.shape, np.inf)
+    # Deep-ITM asymptote of the spread value: width*exp(-r*T) (=width at expiry).
+    asymptote = np.where(T_rem > 0, width * np.exp(-r * np.maximum(T_rem, 0.0)), width)
+    reachable = asymptote >= V_star
+    if not np.any(reachable):
+        return S_star
+    idx = np.where(reachable)[0]
+    Tr = T_rem[idx]
+    lo = np.zeros_like(Tr)
+    hi = np.full_like(Tr, max(K2, width) * 10.0)
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        val = (_bs_call_price_vec(mid, K1, Tr, r, iv_l)
+               - _bs_call_price_vec(mid, K2, Tr, r, iv_s))
+        ge = val >= V_star
+        hi = np.where(ge, mid, hi)
+        lo = np.where(ge, lo, mid)
+    S_star[idx] = hi
+    return S_star
+
+
+def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
+                       entry_debit, contracts, target_frac,
+                       total_commission, haircut, width, value_offset=0.0):
+    """Probability (percent, 1 dp) the spread's Adjusted P&L touches its profit target.
+
+    target_frac is the target as a fraction of entry cost (e.g. 0.05 for 5%). Adjusted P&L
+    is (liquidation - entry)*mult, haircut on gains, minus commission (the exact formula
+    the position table displays), so the required per-share liquidation value is
+    L* = entry_debit + (target_dollars + total_commission) / (haircut * 100 * contracts).
+
+    Along the path we only have a Black-Scholes *mid*, which does not equal the current
+    quoted liquidation (BS-vs-market model error plus the bid/ask crossing). `value_offset`
+    = BS_mid(spot, T) - current_liquidation calibrates that gap so the barrier is anchored
+    to the real current value the user sees: the underlying barrier is where
+    BS_mid(S, t) reaches L* + value_offset. Returns None for degenerate inputs, 0.0 when
+    the target is unreachable.
+    """
+    if S_paths is None or T <= 0 or not iv_l or not iv_s or contracts <= 0 or entry_debit <= 0:
+        return None
+    if haircut <= 0 or width <= 0:
+        return None
+    mult = 100.0 * contracts
+    entry_cost = entry_debit * mult
+    target_dollars = target_frac * entry_cost
+    # Liquidation-space barrier, then shift into BS-mid space via the calibration offset.
+    L_star = entry_debit + (target_dollars + total_commission) / (haircut * mult)
+    V_star = L_star + value_offset
+    if V_star > width:
+        return 0.0
+    S_star = critical_levels(K1, K2, iv_l, iv_s, r, T_remaining, V_star, width)
+    hit = (np.asarray(S_paths) >= S_star[None, :]).any(axis=1)
+    return round(float(hit.mean()) * 100.0, 1)
+
+
+# ---------------------------------------------------------------------------
 # Data fetching & spread finding
 # ---------------------------------------------------------------------------
 
-def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, min_leg_premium=0, symbol="^SPX", move_pct=1.0):
+def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, min_leg_premium=0, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0):
     if risk_free_rate is None:
         risk_free_rate = RISK_FREE_RATE_PCT / 100.0
     """
@@ -271,6 +411,11 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
             if not valid_iv_calls.empty:
                 idx = (valid_iv_calls["strike"] - spot).abs().idxmin()
                 exp_atm_iv = float(valid_iv_calls.loc[idx, "impliedVolatility"])
+
+            # Simulate underlying paths once per expiration; every spread below reuses
+            # them for its profit-target probability (P(+X%)).
+            target_paths, target_T_remaining = simulate_paths(
+                spot, exp_atm_iv, T, MC_PATHS_FINDER, max(1, dte), drift=0.0, seed=MC_SEED)
 
             print(f"  {exp_date_str} ({dte}d): {len(calls)} total calls, ", end="")
 
@@ -438,6 +583,20 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     )
                     rr_per_sigma = reward_risk / be_move_sigma if be_move_sigma > 0 else 0
 
+                    # Path-aware probability of the Adjusted P&L touching profit_target_pct
+                    # of entry cost before expiry. Round-trip commission = commission x
+                    # contracts (finder `commission` is per-contract round-trip). Calibrate
+                    # BS-mid to the freshly-entered spread's liquidation (sell long at bid,
+                    # buy back short at ask) so the barrier is anchored to real quotes.
+                    liq_now = float(row_buy["bid"]) - float(row_sell["ask"])
+                    bs_mid_now = (bs_call_price(spot, K1, T, risk_free_rate, iv_buy)
+                                  - bs_call_price(spot, K2, T, risk_free_rate, iv_sell))
+                    prob_target = spread_prob_target(
+                        target_paths, target_T_remaining, K1, K2, iv_buy, iv_sell,
+                        risk_free_rate, T, net_premium, contracts,
+                        profit_target_pct / 100.0, commission * contracts,
+                        FINDER_HAIRCUT_PCT, spread_width, value_offset=bs_mid_now - liq_now)
+
                     spreads.append({
                         "expiration": exp_date_str,
                         "dte": dte,
@@ -470,6 +629,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "pctOtmSell": round(pct_otm_sell, 2),
                         "rewardRisk": round(reward_risk, 2),
                         "rrPerSigma": round(rr_per_sigma, 2),
+                        "probTarget": prob_target,
                         "volume_buy": int(row_buy.get("volume", 0) or 0),
                         "volume_sell": int(row_sell.get("volume", 0) or 0),
                         "oi_buy": int(row_buy.get("openInterest", 0) or 0),
@@ -492,6 +652,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
         "symbol": symbol,
         "spot": round(spot, 2),
         "movePct": move_pct,
+        "profitTargetPct": profit_target_pct,
         "prevClose": round(prev_close, 2) if prev_close is not None else None,
         "dayMove": round(day_move, 2) if day_move is not None else None,
         "dayMovePct": round(day_move_pct, 2) if day_move_pct is not None else None,
@@ -612,15 +773,18 @@ def _underlying_spot_and_time(oc, tk):
     return float(tk.history(period="1d")["Close"].iloc[-1]), None
 
 
-def fetch_position_quotes(positions, haircut_pct=0.80):
+def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
     """Fetch live leg data for every saved position, batching chain calls.
 
     haircut_pct: multiplier applied to (raw P&L − entry commission − exit commission)
     to produce Adjusted P&L. Exit commission is assumed equal to entry commission.
+    profit_target_pct: profit target (as a % of entry cost) for the path-aware P(+X%)
+    probability that the Adjusted P&L touches it before expiry.
     """
     results = []
     chain_cache = {}   # (symbol, expiration) -> calls DataFrame
     spot_cache = {}    # symbol -> (spot: float, quote_epoch_seconds: int | None)
+    paths_cache = {}   # (symbol, expiration) -> (S_matrix, T_remaining) for P(+X%)
 
     for p in positions:
         symbol = p["symbol"]
@@ -659,6 +823,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
         result["netVega"] = None
         result["oneSigmaMove"] = None
         result["oneSigmaPnl"] = None
+        result["probTarget"] = None
         result["dte"] = None
         result["history"] = _PNL_HISTORY.get(p.get("id"), [])
 
@@ -737,6 +902,15 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
                 r = RISK_FREE_RATE_PCT / 100.0
                 iv_l = long_leg.get("_iv_raw")
                 iv_s = short_leg.get("_iv_raw")
+
+                # ATM IV for this expiration: nearest-to-spot strike with a valid IV.
+                # Used both for the 1σ greeks below and to diffuse the P(+X%) paths.
+                atm_iv = None
+                valid_iv_calls = calls[calls["impliedVolatility"] > 0]
+                if not valid_iv_calls.empty:
+                    idx = (valid_iv_calls["strike"] - spot).abs().idxmin()
+                    atm_iv = float(valid_iv_calls.loc[idx, "impliedVolatility"])
+
                 if iv_l and iv_s and T > 0:
                     K1 = float(p["longStrike"])
                     K2 = float(p["shortStrike"])
@@ -760,17 +934,33 @@ def fetch_position_quotes(positions, haircut_pct=0.80):
                     # Dollar P&L for a +1σ one-day underlying move, using delta AND gamma
                     # (2nd-order Taylor: Δ·ΔS + ½·Γ·ΔS²) for maximal accuracy.
                     # Daily σ move = spot · ATM_IV · √(1/252) (trading-day convention).
-                    atm_iv = None
-                    valid_iv_calls = calls[calls["impliedVolatility"] > 0]
-                    if not valid_iv_calls.empty:
-                        idx = (valid_iv_calls["strike"] - spot).abs().idxmin()
-                        atm_iv = float(valid_iv_calls.loc[idx, "impliedVolatility"])
-                    if not atm_iv or atm_iv <= 0:
-                        atm_iv = (iv_l + iv_s) / 2.0
-                    one_sigma_dS = spot * atm_iv * math.sqrt(1 / 252)
+                    sigma_1d = atm_iv if atm_iv and atm_iv > 0 else (iv_l + iv_s) / 2.0
+                    one_sigma_dS = spot * sigma_1d * math.sqrt(1 / 252)
                     one_sigma_pnl_per = net_delta_per * one_sigma_dS + 0.5 * net_gamma_per * one_sigma_dS ** 2
                     result["oneSigmaMove"] = round(one_sigma_dS, 2)
                     result["oneSigmaPnl"] = round(one_sigma_pnl_per * 100 * contracts, 2)
+
+                # Path-aware P(+X%): probability the Adjusted P&L touches profit_target_pct
+                # of entry cost before expiry. Paths are simulated once per (symbol, exp).
+                if (iv_l and iv_s and atm_iv and T > 0 and result["entryCost"]
+                        and result["spreadLiquidation"] is not None):
+                    if key not in paths_cache:
+                        paths_cache[key] = simulate_paths(
+                            spot, atm_iv, T, MC_PATHS_MONITOR, max(1, dte),
+                            drift=0.0, seed=MC_SEED)
+                    tgt_paths, tgt_T_remaining = paths_cache[key]
+                    K1 = float(p["longStrike"])
+                    K2 = float(p["shortStrike"])
+                    # Calibrate BS-mid to the current quoted liquidation (the value the
+                    # Adj P&L column is based on) so the barrier is anchored to reality.
+                    bs_mid_now = (bs_call_price(spot, K1, T, r, iv_l)
+                                  - bs_call_price(spot, K2, T, r, iv_s))
+                    value_offset = bs_mid_now - result["spreadLiquidation"]
+                    result["probTarget"] = spread_prob_target(
+                        tgt_paths, tgt_T_remaining, K1, K2, iv_l, iv_s, r, T,
+                        long_entry - short_entry, contracts,
+                        profit_target_pct / 100.0, result["totalCommission"],
+                        haircut_pct, K2 - K1, value_offset=value_offset)
 
                 # Strip internal keys before returning
                 long_leg.pop("_iv_raw", None)
@@ -1250,6 +1440,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="tooltip-text">The underlying % move used to compute the "P&amp;L X% $" column (Δ·dS + ½·Γ·dS²). Leverage stays normalized to per-1% for comparability.</span>
   </div>
   <div class="input-group tooltip-container">
+    <label>Profit Target %</label>
+    <input type="number" id="profitTarget" value="5" min="0.1" step="0.5">
+    <span class="hint">Target for P(+X%) column</span>
+    <span class="tooltip-text">Profit target as a % of entry cost, measured on Adjusted P&amp;L (80% haircut on gains + round-trip commission, matching the Positions monitor). The "P(+X%)" column is the path-aware probability the Adjusted P&amp;L touches this target at any point before expiry (zero-drift Monte Carlo).</span>
+  </div>
+  <div class="input-group tooltip-container">
     <label>Expirations</label>
     <div id="expirationCheckboxes" style="display:flex;flex-direction:column;gap:4px;padding:6px 0;"></div>
     <span class="hint">Check one or more expirations</span>
@@ -1301,6 +1497,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label>Sort By</label>
     <select id="sortBy" onchange="applySortDropdown()">
       <option value="leverage">Leverage (high first)</option>
+      <option value="probTarget">P(+X%) (high first)</option>
       <option value="totalPremium">Premium (low first)</option>
       <option value="rewardRisk">Reward/Risk (high first)</option>
       <option value="dte">DTE (near first)</option>
@@ -1363,6 +1560,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="rewardRisk" onclick="sortTable('rewardRisk')">Reward/Risk</th>
         <th data-col="rrPerSigma" onclick="sortTable('rrPerSigma')">R/R per &sigma;</th>
         <th data-col="leverage" onclick="sortTable('leverage')">Leverage</th>
+        <th data-col="probTarget" onclick="sortTable('probTarget')" id="probTargetHeader">P(+5%)</th>
         <th data-col="pnl1pct" onclick="sortTable('pnl1pct')" id="pnlMoveHeader">P&amp;L 1% $</th>
         <th data-col="pnl1sigma" onclick="sortTable('pnl1sigma')">P&amp;L 1&sigma; 1d $</th>
         <th data-col="pnl2sigma" onclick="sortTable('pnl2sigma')">P&amp;L 2&sigma; 1d $</th>
@@ -1458,7 +1656,7 @@ populateExpirations();
 // Input IDs to capture in a template (order matters for restoring)
 const TEMPLATE_INPUT_IDS = [
   'ticker','minPremium','maxPremium','minLeverage','maxWidth','maxOtm','movePct',
-  'riskFreeRate','minNetDelta','minRewardRisk','commission','maxLegPremium',
+  'profitTarget','riskFreeRate','minNetDelta','minRewardRisk','commission','maxLegPremium',
   'minLegPremium','minDte','sortBy'
 ];
 
@@ -1602,6 +1800,7 @@ async function doSearch() {
   const minLegPremium = parseFloat(document.getElementById('minLegPremium').value) || 0;
   const minDte = parseInt(document.getElementById('minDte').value) || 0;
   const movePct = parseFloat(document.getElementById('movePct').value) || 1.0;
+  const profitTarget = parseFloat(document.getElementById('profitTarget').value) || 5.0;
   const allCb = document.getElementById('exp_all');
   let expiration = 'all';
   if (!allCb.checked) {
@@ -1658,6 +1857,7 @@ async function doSearch() {
       min_leg_premium: minLegPremium,
       min_dte: minDte,
       move_pct: movePct,
+      profit_target_pct: profitTarget,
       expiration: expiration
     });
 
@@ -1679,6 +1879,11 @@ async function doSearch() {
       const mp = Number(data.movePct);
       const label = (Number.isInteger(mp) ? mp.toFixed(0) : mp.toString()) + '%';
       document.getElementById('pnlMoveHeader').innerHTML = 'P&amp;L ' + label + ' $';
+    }
+    if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
+      const pt = Number(data.profitTargetPct);
+      const ptLabel = (Number.isInteger(pt) ? pt.toFixed(0) : pt.toString()) + '%';
+      document.getElementById('probTargetHeader').innerHTML = 'P(+' + ptLabel + ')';
     }
     {
       const parts = [];
@@ -2018,6 +2223,7 @@ function renderTable() {
       <td>${s.rewardRisk.toFixed(1)}x</td>
       <td>${s.rrPerSigma.toFixed(2)}</td>
       <td class="highlight">${s.leverage.toFixed(1)}x</td>
+      <td>${(s.probTarget === null || s.probTarget === undefined) ? '<span class="dim">--</span>' : s.probTarget.toFixed(1) + '%'}</td>
       <td>$${(s.pnl1pct * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>$${(s.pnl1sigma * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>$${(s.pnl2sigma * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
@@ -2040,7 +2246,7 @@ function renderTable() {
 
   if (display.length < spreads.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="21" style="text-align:center;color:var(--text-dim);padding:16px;">
+    tr.innerHTML = `<td colspan="22" style="text-align:center;color:var(--text-dim);padding:16px;">
       Showing ${display.length} of ${spreads.length} results. Tighten your criteria to see fewer, more targeted spreads.
     </td>`;
     tbody.appendChild(tr);
@@ -2186,6 +2392,9 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   th { background: var(--surface2); color: var(--text-dim); font-weight: 500;
        text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; }
   tbody tr:hover { background: var(--surface2); }
+  th.adj-col, td.adj-col { border-left: 2px solid #fff; border-right: 2px solid #fff; }
+  th.adj-col { border-top: 2px solid #fff; }
+  tbody tr:last-child td.adj-col { border-bottom: 2px solid #fff; }
   .mono { font-family: var(--mono); }
   .dim { color: var(--text-dim); }
   .pnl-pos { color: var(--green); font-weight: 600; }
@@ -2271,6 +2480,11 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <input id="haircutPct" type="number" min="0" max="100" step="1" value="80">
     <span class="dim">%</span>
   </div>
+  <div class="field">
+    <label for="profitTarget" title="Profit target as a % of entry cost, on Adjusted P&amp;L. The P(+X%) column is the path-aware probability the Adjusted P&amp;L touches this target before expiry.">Profit target</label>
+    <input id="profitTarget" type="number" min="0.1" step="0.5" value="5">
+    <span class="dim">%</span>
+  </div>
   <button class="ghost" id="refreshNowBtn">Refresh now</button>
   <span class="dim" id="autoStatus" style="margin-left:auto;">auto-refresh: <span style="color:var(--green);">on</span></span>
 </div>
@@ -2308,7 +2522,8 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th>Entry Cost</th>
         <th>Current Value</th>
         <th>P&amp;L</th>
-        <th id="colAdjPnlLabel">Adj P&amp;L (80%)</th>
+        <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
+        <th id="colProbTarget">P(+5%)</th>
         <th>Day</th>
         <th>Greeks (&Delta;+&Gamma; 1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
@@ -2440,10 +2655,18 @@ async function refreshQuotes() {
   try {
     clearErr();
     const hc = currentHaircutPct();
-    const r = await fetch('/api/positions/quotes?haircut=' + encodeURIComponent(hc));
+    const tgt = parseFloat($('profitTarget').value);
+    const tgtParam = (isFinite(tgt) && tgt > 0) ? tgt : 5;
+    const r = await fetch('/api/positions/quotes?haircut=' + encodeURIComponent(hc)
+      + '&target=' + encodeURIComponent(tgtParam));
     const data = await r.json();
     if (data.error) { showErr(data.error); return; }
     lastQuotes = data.positions;
+    if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
+      const pt = Number(data.profitTargetPct);
+      const ptLabel = (Number.isInteger(pt) ? pt.toFixed(0) : pt.toString());
+      $('colProbTarget').textContent = 'P(+' + ptLabel + '%)';
+    }
     renderTable();
     $('lastUpdate').textContent = data.timestamp;
   } catch (e) {
@@ -2491,7 +2714,7 @@ function renderTable() {
       </div></td>`;
     }
 
-    let adjPnlCell = '<td class="dim">--</td>';
+    let adjPnlCell = '<td class="dim adj-col">--</td>';
     if (p.adjPnl !== null && p.adjPnl !== undefined) {
       const cls = p.adjPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
       const totalComm = (p.totalCommission != null) ? p.totalCommission : 0;
@@ -2499,12 +2722,16 @@ function renderTable() {
       const derivation = (p.pnl > 0)
         ? `pnl × ${hcLabel}% − $${totalComm.toFixed(2)} comm`
         : `pnl − $${totalComm.toFixed(2)} comm (no haircut on loss)`;
-      adjPnlCell = `<td><div class="pnl-block">
+      adjPnlCell = `<td class="adj-col"><div class="pnl-block">
         <span class="${cls}">${sign(p.adjPnl)}${dollarFmt(p.adjPnl, 0)}</span>
         <span class="${cls} pct">${sign(p.adjPnlPct)}${p.adjPnlPct.toFixed(2)}%</span>
         <span class="tt-dim">${derivation}</span>
       </div></td>`;
     }
+
+    const probCell = (p.probTarget === null || p.probTarget === undefined)
+      ? '<td class="dim">--</td>'
+      : `<td class="mono">${p.probTarget.toFixed(1)}%</td>`;
 
     // Change on the day: today's live mid vs. yesterday's close (see backend).
     let dayCell = '<td class="dim">--</td>';
@@ -2547,6 +2774,7 @@ function renderTable() {
       <td class="mono">${curCell}</td>
       ${pnlCell}
       ${adjPnlCell}
+      ${probCell}
       ${dayCell}
       ${greeksCell}
       <td>
@@ -2556,7 +2784,7 @@ function renderTable() {
     `;
     if (p.error) {
       const errTd = document.createElement('tr');
-      errTd.innerHTML = `<td colspan="15" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
+      errTd.innerHTML = `<td colspan="16" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
       body.appendChild(tr);
       body.appendChild(errTd);
     } else {
@@ -2707,12 +2935,13 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             min_leg_premium = float(params.get("min_leg_premium", [0])[0])
             symbol = params.get("symbol", ["^SPX"])[0].strip().upper()
             move_pct = float(params.get("move_pct", [1.0])[0])
+            profit_target_pct = float(params.get("profit_target_pct", [5.0])[0])
 
             try:
                 print(f"\n{'='*60}")
                 print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_leg_premium=${min_leg_premium}, move_pct={move_pct}%, expiration={expiration_filter}")
                 print(f"{'='*60}")
-                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, min_leg_premium, symbol, move_pct)
+                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, min_leg_premium, symbol, move_pct, profit_target_pct)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
 
                 self.send_response(200)
@@ -2746,12 +2975,19 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 # Accept either 0.80 (fraction) or 80 (percent) — normalize to fraction.
                 haircut_pct = haircut_val / 100.0 if haircut_val > 1.5 else haircut_val
                 haircut_pct = max(0.0, min(haircut_pct, 1.0))
+                try:
+                    target_pct = float(params.get("target", ["5"])[0])
+                except ValueError:
+                    target_pct = 5.0
+                target_pct = max(0.0, target_pct)
                 positions = load_positions()
-                quotes = fetch_position_quotes(positions, haircut_pct=haircut_pct)
+                quotes = fetch_position_quotes(positions, haircut_pct=haircut_pct,
+                                               profit_target_pct=target_pct)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "haircutPct": round(haircut_pct * 100, 2),
+                    "profitTargetPct": target_pct,
                 })
             except Exception as e:
                 self._send_json({"error": str(e)})
