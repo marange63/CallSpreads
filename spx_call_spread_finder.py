@@ -748,15 +748,20 @@ def _record_pnl(position_id, pnl):
 
 
 def _underlying_spot_and_time(oc, tk):
-    """Return (spot, quote_epoch_seconds) for an option_chain result.
+    """Return (spot, quote_epoch_seconds, prev_close) for an option_chain result.
 
     Prefers the underlying quote bundled with the chain (`oc.underlying`) because
     it comes from the *same* HTTP response as the option quotes, so spot is
     time-aligned with the bids/asks/IVs used for P&L and greeks. Falls back
     through post/pre-market price, a bid/ask mid, and finally a separate daily
     history close (which is NOT time-aligned, so quote_time is reported as None).
+
+    prev_close is the underlying's official prior-day close (for the one-day
+    theoretical P&L); may be None if the chain snapshot doesn't carry it.
     """
     u = getattr(oc, "underlying", None) or {}
+    prev_close = u.get("regularMarketPreviousClose") or u.get("previousClose")
+    prev_close = float(prev_close) if prev_close else None
     # Try each price source paired with its own timestamp.
     for price_key, time_key in (
         ("regularMarketPrice", "regularMarketTime"),
@@ -765,13 +770,13 @@ def _underlying_spot_and_time(oc, tk):
     ):
         px = u.get(price_key)
         if px:
-            return float(px), u.get(time_key)
+            return float(px), u.get(time_key), prev_close
     # Bid/ask mid of the underlying, if quoted.
     bid, ask = u.get("bid") or 0, u.get("ask") or 0
     if bid and ask:
-        return (float(bid) + float(ask)) / 2, u.get("regularMarketTime")
+        return (float(bid) + float(ask)) / 2, u.get("regularMarketTime"), prev_close
     # Last resort: a separate daily-close fetch, not aligned with the chain.
-    return float(tk.history(period="1d")["Close"].iloc[-1]), None
+    return float(tk.history(period="1d")["Close"].iloc[-1]), None, prev_close
 
 
 def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
@@ -816,14 +821,13 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
         result["pnlPct"] = None
         result["adjPnl"] = None
         result["adjPnlPct"] = None
-        result["dayChange"] = None
-        result["dayChangePct"] = None
-        result["dayChangeStale"] = None
         result["netDelta"] = None
         result["netThetaPerDay"] = None
         result["netVega"] = None
         result["oneSigmaMove"] = None
         result["oneSigmaPnl"] = None
+        result["dailyTheoPnl"] = None
+        result["dailyTheoMove"] = None
         result["probTarget"] = None
         result["dte"] = None
         result["history"] = _PNL_HISTORY.get(p.get("id"), [])
@@ -839,7 +843,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                     # with the option quotes below (see _underlying_spot_and_time).
                     spot_cache[symbol] = _underlying_spot_and_time(oc, tk)
             calls = chain_cache[key]
-            spot, quote_ts = spot_cache.get(symbol, (None, None))
+            spot, quote_ts, prev_close = spot_cache.get(symbol, (None, None, None))
             result["spot"] = round(spot, 2) if spot is not None else None
             result["quoteTime"] = int(quote_ts) if quote_ts else None
 
@@ -866,22 +870,6 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                 result["currentValue"] = current_value
                 result["liquidationValue"] = liquidation_value
 
-                # Change on the day: today's spread mark vs. yesterday's close, valued
-                # leg-by-leg. Today = live bid/ask mid (fresh even for untraded strikes);
-                # yesterday = Yahoo's official prior-day close (prevClose). This avoids the
-                # stale-last-trade problem that plagues thinly traded legs. Commissions and
-                # the haircut are fixed intraday, so this is the day's delta for both raw
-                # and adjusted P&L.
-                long_prev, short_prev = long_leg["prevClose"], short_leg["prevClose"]
-                if long_prev is not None and short_prev is not None:
-                    spread_prev_close = long_prev - short_prev
-                    day_change = round((spread_mid - spread_prev_close) * 100 * contracts, 2)
-                    result["dayChange"] = day_change
-                    # True if today's mid on either leg fell back to a one-sided/last price
-                    # (no live two-sided quote) — the day figure is then less reliable.
-                    result["dayChangeStale"] = not (long_leg["quotedMid"] and short_leg["quotedMid"])
-                    if result["entryCost"]:
-                        result["dayChangePct"] = round(day_change / abs(result["entryCost"]) * 100, 2)
                 if result["entryCost"]:
                     result["pnl"] = round(current_value - result["entryCost"], 2)
                     result["pnlPct"] = round(result["pnl"] / abs(result["entryCost"]) * 100, 2)
@@ -940,6 +928,19 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                     one_sigma_pnl_per = net_delta_per * one_sigma_dS + 0.5 * net_gamma_per * one_sigma_dS ** 2
                     result["oneSigmaMove"] = round(one_sigma_dS, 2)
                     result["oneSigmaPnl"] = round(one_sigma_pnl_per * 100 * contracts, 2)
+
+                    # Daily theoretical P&L from the underlying's one-day move only:
+                    # reprice both legs with BS at current spot vs. the underlying's
+                    # prior close, holding IV and time constant so only S changes.
+                    # Uses the fresher spot to estimate the day's value change even
+                    # when the option bids/asks are stale.
+                    if prev_close and prev_close > 0:
+                        theo_now = (bs_call_price(spot, K1, T, r, iv_l)
+                                    - bs_call_price(spot, K2, T, r, iv_s))
+                        theo_prev = (bs_call_price(prev_close, K1, T, r, iv_l)
+                                     - bs_call_price(prev_close, K2, T, r, iv_s))
+                        result["dailyTheoMove"] = round(spot - prev_close, 2)
+                        result["dailyTheoPnl"] = round((theo_now - theo_prev) * 100 * contracts, 2)
 
                 # Path-aware P(+X%): probability the Adjusted P&L touches profit_target_pct
                 # of entry cost before expiry. Paths are simulated once per (symbol, exp).
@@ -2525,7 +2526,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th>P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+5%)</th>
-        <th>Day</th>
+        <th>Daily Theo P&amp;L</th>
         <th>Greeks (&Delta;+&Gamma; 1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
       </tr>
@@ -2585,9 +2586,9 @@ function updateSummary(rows) {
   const totalCurrent = withData.reduce((s, r) => s + (r.currentValue || 0), 0);
   const totalPnl = withData.reduce((s, r) => s + r.pnl, 0);
   const totalAdjPnl = withData.reduce((s, r) => s + (r.adjPnl || 0), 0);
-  const totalDayChange = withData.reduce((s, r) => s + (r.dayChange || 0), 0);
+  const totalDailyTheoPnl = withData.reduce((s, r) => s + (r.dailyTheoPnl || 0), 0);
   const totalRet = totalEntry ? (totalAdjPnl / Math.abs(totalEntry)) * 100 : 0;
-  const totalDayPct = totalEntry ? (totalDayChange / Math.abs(totalEntry)) * 100 : 0;
+  const totalDailyTheoPct = totalEntry ? (totalDailyTheoPnl / Math.abs(totalEntry)) * 100 : 0;
   const totalDelta = withData.reduce((s, r) => s + (r.netDelta || 0), 0);
   const totalOneSigmaPnl = withData.reduce((s, r) => s + (r.oneSigmaPnl || 0), 0);
   const totalTheta = withData.reduce((s, r) => s + (r.netThetaPerDay || 0), 0);
@@ -2607,17 +2608,13 @@ function updateSummary(rows) {
   retEl.textContent = (totalRet >= 0 ? '+' : '') + totalRet.toFixed(2) + '%';
   retEl.className = 'stat-value mono ' + (totalRet >= 0 ? 'pnl-pos' : 'pnl-neg');
   setPnlText('sumAdjPnl', totalAdjPnl);
-  // Change on the day: today's live mid vs. yesterday's close, per leg (see backend).
-  // Haircut/commissions are fixed intraday, so this is the day's delta for adjusted P&L.
-  const dayRows = withData.filter(r => r.dayChange !== null && r.dayChange !== undefined);
-  const anyStale = dayRows.some(r => r.dayChangeStale);
+  // Daily theoretical P&L: sum of each position's BS reprice for the underlying's
+  // one-day move (spot vs. prior close). Independent of the stale option quotes.
   const dayEl = $('sumAdjPnlDay');
-  dayEl.textContent = 'Day ' + fmtSignedDollar(totalDayChange, 0) +
-    ' (' + sign(totalDayPct) + totalDayPct.toFixed(2) + '%)' + (anyStale ? ' ~' : '');
-  dayEl.title = anyStale
-    ? 'Today vs. yesterday’s close. ~ = a leg had no live two-sided quote, so its mark fell back to last/one-sided price.'
-    : 'Today’s live mid vs. yesterday’s close (Yahoo prior-day close).';
-  dayEl.className = 'stat-sub mono ' + (totalDayChange >= 0 ? 'pnl-pos' : 'pnl-neg');
+  dayEl.textContent = 'Daily Theo ' + fmtSignedDollar(totalDailyTheoPnl, 0) +
+    ' (' + sign(totalDailyTheoPct) + totalDailyTheoPct.toFixed(2) + '%)';
+  dayEl.title = 'Sum of the per-position Daily Theo P&L (Black-Scholes reprice for the underlying’s one-day move).';
+  dayEl.className = 'stat-sub mono ' + (totalDailyTheoPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
   // Reflect the active haircut % on the label and column header
   const activeHc = currentHaircutPct().toFixed(0);
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
@@ -2734,17 +2731,16 @@ function renderTable() {
       ? '<td class="dim">--</td>'
       : `<td class="mono">${p.probTarget.toFixed(1)}%</td>`;
 
-    // Change on the day: today's live mid vs. yesterday's close (see backend).
-    let dayCell = '<td class="dim">--</td>';
-    if (p.dayChange !== null && p.dayChange !== undefined) {
-      const cls = p.dayChange >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const staleMark = p.dayChangeStale ? '<span class="tt-dim" title="A leg had no live two-sided quote; mark fell back to last/one-sided price.">~ stale quote</span>' : '';
-      const pctStr = (p.dayChangePct !== null && p.dayChangePct !== undefined)
-        ? `<span class="${cls} pct">${sign(p.dayChangePct)}${p.dayChangePct.toFixed(2)}%</span>` : '';
-      dayCell = `<td><div class="pnl-block">
-        <span class="${cls}">${sign(p.dayChange)}${dollarFmt(p.dayChange, 0)}</span>
-        ${pctStr}
-        ${staleMark}
+    // Daily theoretical P&L: BS reprice of the spread for the underlying's
+    // one-day move (spot vs. prior close), independent of the stale option quotes.
+    let dailyTheoCell = '<td class="dim">--</td>';
+    if (p.dailyTheoPnl !== null && p.dailyTheoPnl !== undefined) {
+      const cls = p.dailyTheoPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const moveStr = (p.dailyTheoMove !== null && p.dailyTheoMove !== undefined)
+        ? `<span class="tt-dim">${p.symbol} ${sign(p.dailyTheoMove)}${Math.abs(p.dailyTheoMove).toFixed(2)}</span>` : '';
+      dailyTheoCell = `<td><div class="pnl-block">
+        <span class="${cls}">${sign(p.dailyTheoPnl)}${dollarFmt(p.dailyTheoPnl, 0)}</span>
+        ${moveStr}
       </div></td>`;
     }
 
@@ -2776,7 +2772,7 @@ function renderTable() {
       ${pnlCell}
       ${adjPnlCell}
       ${probCell}
-      ${dayCell}
+      ${dailyTheoCell}
       ${greeksCell}
       <td>
         <button class="ghost" data-edit="${p.id}">Edit</button>
@@ -3172,17 +3168,38 @@ def start_server(preferred_port, max_tries=20):
     )
 
 
-def main():
-    httpd, port = start_server(PORT)
-
-    print(f"""
+def _print_banner(port):
+    """Print the startup banner, tolerating non-UTF-8 stdout (e.g. a cp1252
+    file when output is redirected) by falling back to an ASCII box."""
+    banner = f"""
     ╔══════════════════════════════════════════════╗
     ║       Call Spread Finder                      ║
     ║                                              ║
     ║   Open: http://localhost:{port}                ║
     ║   Press Ctrl+C to stop                       ║
     ╚══════════════════════════════════════════════╝
-    """)
+    """
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print(f"\n    Call Spread Finder\n"
+              f"    Open: http://localhost:{port}\n"
+              f"    Press Ctrl+C to stop\n")
+
+
+def main():
+    # Force UTF-8 on stdout/stderr so Unicode output (the banner box chars, greek
+    # symbols, etc.) survives even when output is redirected to a cp1252 file
+    # rather than a UTF-8 terminal. Best-effort: older streams may lack reconfigure.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    httpd, port = start_server(PORT)
+
+    _print_banner(port)
 
     with httpd:
         httpd.allow_reuse_address = True
