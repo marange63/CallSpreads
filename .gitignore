@@ -16,6 +16,7 @@ env/
 # Personal runtime state (mutated by the app; not needed to run)
 positions.json
 templates.json
+beta_cache.json
 *.tmp
 
 # Generated chart output

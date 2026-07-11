@@ -36,6 +36,7 @@ except ImportError:
     import yfinance as yf
 
 import numpy as np  # ships with pandas/yfinance; used for the Monte Carlo path engine
+import pandas as pd  # ships with yfinance; used for the beta regression on daily returns
 
 PORT = 8765
 
@@ -689,6 +690,151 @@ def _save_json_list(path, items):
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------------------
+# Index beta + option-implied 1-sigma engine (for the "Idx ±1σ P&L (β)" column)
+# ---------------------------------------------------------------------------
+BETA_CACHE_FILE = Path(__file__).parent / "beta_cache.json"
+BETA_LOOKBACK = "2y"          # daily-return window for the beta regression
+DEFAULT_INDEX = "^GSPC"       # S&P 500 index
+TRADING_DAYS = 252
+# Each index's option-implied vol is read straight off its volatility index
+# (annualized IV, in %). Far cheaper/more robust than parsing the index's own
+# option chain every refresh; we fall back to the chain only for unmapped indices.
+VOL_INDEX_MAP = {
+    "^GSPC": "^VIX", "^SPX": "^VIX", "SPX": "^VIX", "SPY": "^VIX", "$SPX": "^VIX",
+    "^NDX": "^VXN", "NDX": "^VXN", "QQQ": "^VXN",
+    "^RUT": "^RVX", "RUT": "^RVX",
+    "^DJI": "^VXD", "DJI": "^VXD",
+}
+
+
+def _load_json_dict(path):
+    if not path.exists():
+        return {}
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_json_dict(path, obj):
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def get_betas(symbols, index_symbol):
+    """Return {symbol: beta} vs. index_symbol from BETA_LOOKBACK daily returns.
+
+    Beta is slow-moving, so results are cached per calendar day on disk (keyed by
+    index) — the 30s quote-refresh loop then does a pure dict lookup. Only symbols
+    missing from today's cache trigger a *single batched* yfinance download of all
+    stale tickers plus the index. Symbols with insufficient history default to 1.0.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    wanted = [s for s in dict.fromkeys(symbols) if s and s != index_symbol]
+    cache = _load_json_dict(BETA_CACHE_FILE)
+    bucket = cache.get(index_symbol) or {}
+    betas = dict(bucket.get("betas") or {}) if bucket.get("date") == today else {}
+    missing = [s for s in wanted if s not in betas]
+
+    if missing:
+        try:
+            tickers = list(dict.fromkeys(missing + [index_symbol]))
+            data = yf.download(tickers, period=BETA_LOOKBACK, interval="1d",
+                               auto_adjust=True, progress=False)["Close"]
+            if isinstance(data, pd.Series):        # single-ticker frame -> promote
+                data = data.to_frame(tickers[0])
+            idx_ret = data[index_symbol].pct_change()
+            var_idx = float(idx_ret.var())
+            for s in missing:
+                if s not in data.columns or var_idx <= 0:
+                    continue
+                joined = pd.concat([data[s].pct_change(), idx_ret], axis=1).dropna()
+                if len(joined) < 30:
+                    continue
+                cov = float(joined.iloc[:, 0].cov(joined.iloc[:, 1]))
+                betas[s] = round(cov / var_idx, 4)
+        except Exception as e:
+            print(f"  Warning: beta fetch failed for {missing} vs {index_symbol} ({e})")
+        cache[index_symbol] = {"date": today, "betas": betas}
+        _save_json_dict(BETA_CACHE_FILE, cache)
+
+    return {s: betas.get(s, 1.0) for s in wanted}
+
+
+def get_index_sigma_1d(index_symbol):
+    """Return (sigma_1d, annual_iv_pct): the index's option-implied one-day return
+    sigma and the annualized IV it came from. Prefers the mapped volatility index
+    (e.g. ^GSPC -> ^VIX) as a single quote; falls back to the index's own ATM
+    chain IV. Returns (None, None) if no implied vol is obtainable."""
+    annual_iv = None
+    vol_ticker = VOL_INDEX_MAP.get(index_symbol.upper())
+    if vol_ticker:
+        try:
+            h = yf.Ticker(vol_ticker).history(period="5d")
+            if not h.empty:
+                annual_iv = float(h["Close"].iloc[-1]) / 100.0
+        except Exception:
+            annual_iv = None
+    if annual_iv is None:
+        try:
+            tk = yf.Ticker(index_symbol)
+            exps = tk.options
+            if exps:
+                oc = tk.option_chain(exps[0])
+                spot = _underlying_spot_and_time(oc, tk)[0]
+                valid = oc.calls[oc.calls["impliedVolatility"] > 0]
+                if spot and not valid.empty:
+                    i = (valid["strike"] - spot).abs().idxmin()
+                    annual_iv = float(valid.loc[i, "impliedVolatility"])
+        except Exception:
+            annual_iv = None
+    if not annual_iv or annual_iv <= 0:
+        return None, None
+    return annual_iv * math.sqrt(1.0 / TRADING_DAYS), round(annual_iv * 100, 2)
+
+
+def get_atm_iv_30d(symbol, target_days=30):
+    """~30-day constant-maturity ATM implied vol (annualized fraction) for a
+    symbol. Picks the listed expiration nearest target_days and reads the ATM
+    IV (nearest-to-spot strike). Used to put the own-vol 1σ shock on the same
+    ~30-day tenor as the index's VIX-based 1σ. Returns None if unavailable."""
+    try:
+        tk = yf.Ticker(symbol)
+        exps = tk.options
+        if not exps:
+            return None
+        now = datetime.now()
+        best = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - now).days - target_days))
+        oc = tk.option_chain(best)
+        spot = _underlying_spot_and_time(oc, tk)[0]
+        valid = oc.calls[oc.calls["impliedVolatility"] > 0]
+        if spot and not valid.empty:
+            i = (valid["strike"] - spot).abs().idxmin()
+            iv = float(valid.loc[i, "impliedVolatility"])
+            return iv if iv > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def spread_shock_pnl(spot, dS, K1, K2, T, r, iv_l, iv_s, contracts):
+    """(+shock, -shock) dollar P&L of the call spread for a ±dS move in spot,
+    via full Black-Scholes reprice of both legs holding IV and time constant.
+    Shared by the own-vol 1σ and beta-index 1σ columns so they use one engine."""
+    def theo(s):
+        return bs_call_price(s, K1, T, r, iv_l) - bs_call_price(s, K2, T, r, iv_s)
+    base = theo(spot)
+    up = (theo(spot + dS) - base) * 100 * contracts
+    dn = (theo(max(spot - dS, 1e-6)) - base) * 100 * contracts
+    return round(up, 2), round(dn, 2)
+
+
 def load_positions():
     return _load_json_list(POSITIONS_FILE)
 
@@ -779,18 +925,27 @@ def _underlying_spot_and_time(oc, tk):
     return float(tk.history(period="1d")["Close"].iloc[-1]), None, prev_close
 
 
-def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
+def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0,
+                          index_symbol=DEFAULT_INDEX):
     """Fetch live leg data for every saved position, batching chain calls.
 
     haircut_pct: multiplier applied to (raw P&L − entry commission − exit commission)
     to produce Adjusted P&L. Exit commission is assumed equal to entry commission.
     profit_target_pct: profit target (as a % of entry cost) for the path-aware P(+X%)
     probability that the Adjusted P&L touches it before expiry.
+    index_symbol: reference index for the beta-scaled 1σ index-move P&L column.
     """
     results = []
     chain_cache = {}   # (symbol, expiration) -> calls DataFrame
     spot_cache = {}    # symbol -> (spot: float, quote_epoch_seconds: int | None)
     paths_cache = {}   # (symbol, expiration) -> (S_matrix, T_remaining) for P(+X%)
+    iv30_cache = {}    # symbol -> ~30-day ATM IV (annualized), for the own-vol 1σ shock
+
+    # Beta (per-day cached) and the index's implied 1σ daily move, computed once
+    # for the whole batch — not per position and not on the hot per-refresh path.
+    index_symbol = (index_symbol or DEFAULT_INDEX).strip() or DEFAULT_INDEX
+    betas = get_betas([p["symbol"] for p in positions], index_symbol)
+    index_sigma_1d, index_iv_pct = get_index_sigma_1d(index_symbol)
 
     for p in positions:
         symbol = p["symbol"]
@@ -825,9 +980,17 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
         result["netThetaPerDay"] = None
         result["netVega"] = None
         result["oneSigmaMove"] = None
+        result["oneSigmaIvPct"] = None
         result["oneSigmaPnl"] = None
+        result["oneSigmaPnlDown"] = None
         result["dailyTheoPnl"] = None
         result["dailyTheoMove"] = None
+        result["beta"] = None
+        result["betaIndexMove"] = None
+        result["betaIndexUpPnl"] = None
+        result["betaIndexDownPnl"] = None
+        result["indexSymbol"] = index_symbol
+        result["indexIvPct"] = index_iv_pct
         result["probTarget"] = None
         result["dte"] = None
         result["history"] = _PNL_HISTORY.get(p.get("id"), [])
@@ -905,14 +1068,11 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                     K2 = float(p["shortStrike"])
                     delta_l = bs_call_delta(spot, K1, T, r, iv_l)
                     delta_s = bs_call_delta(spot, K2, T, r, iv_s)
-                    gamma_l = bs_gamma(spot, K1, T, r, iv_l)
-                    gamma_s = bs_gamma(spot, K2, T, r, iv_s)
                     theta_l = bs_call_theta(spot, K1, T, r, iv_l)
                     theta_s = bs_call_theta(spot, K2, T, r, iv_s)
                     vega_l = bs_vega(spot, K1, T, r, iv_l)
                     vega_s = bs_vega(spot, K2, T, r, iv_s)
                     net_delta_per = delta_l - delta_s
-                    net_gamma_per = gamma_l - gamma_s
                     # Position-level: long minus short, scaled by contracts * 100 multiplier
                     result["netDelta"] = round(net_delta_per * 100 * contracts, 2)
                     # Theta per calendar day, in $ (annual / 365)
@@ -920,14 +1080,19 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                     # Vega in $ per 1 vol-point (1%) move
                     result["netVega"] = round((vega_l - vega_s) * 100 * contracts * 0.01, 2)
 
-                    # Dollar P&L for a +1σ one-day underlying move, using delta AND gamma
-                    # (2nd-order Taylor: Δ·ΔS + ½·Γ·ΔS²) for maximal accuracy.
-                    # Daily σ move = spot · ATM_IV · √(1/252) (trading-day convention).
-                    sigma_1d = atm_iv if atm_iv and atm_iv > 0 else (iv_l + iv_s) / 2.0
-                    one_sigma_dS = spot * sigma_1d * math.sqrt(1 / 252)
-                    one_sigma_pnl_per = net_delta_per * one_sigma_dS + 0.5 * net_gamma_per * one_sigma_dS ** 2
+                    # Own-vol ±1σ one-day P&L: full BS reprice at spot±ΔS (same engine
+                    # as the beta column below). ΔS = spot · σ_own · √(1/252), with σ_own
+                    # taken at a ~30-day tenor to match the index's VIX-based 1σ. Falls
+                    # back to this expiration's ATM IV, then the leg-IV average.
+                    if symbol not in iv30_cache:
+                        iv30_cache[symbol] = get_atm_iv_30d(symbol)
+                    sigma_own = iv30_cache[symbol] or (atm_iv if atm_iv and atm_iv > 0 else (iv_l + iv_s) / 2.0)
+                    one_sigma_dS = spot * sigma_own * math.sqrt(1 / 252)
+                    up_own, dn_own = spread_shock_pnl(spot, one_sigma_dS, K1, K2, T, r, iv_l, iv_s, contracts)
                     result["oneSigmaMove"] = round(one_sigma_dS, 2)
-                    result["oneSigmaPnl"] = round(one_sigma_pnl_per * 100 * contracts, 2)
+                    result["oneSigmaIvPct"] = round(sigma_own * 100, 1)
+                    result["oneSigmaPnl"] = up_own          # +1σ (kept as the summary/legacy field)
+                    result["oneSigmaPnlDown"] = dn_own      # -1σ
 
                     # Daily theoretical P&L from the underlying's one-day move only:
                     # reprice both legs with BS at current spot vs. the underlying's
@@ -941,6 +1106,20 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0):
                                      - bs_call_price(prev_close, K2, T, r, iv_s))
                         result["dailyTheoMove"] = round(spot - prev_close, 2)
                         result["dailyTheoPnl"] = round((theo_now - theo_prev) * 100 * contracts, 2)
+
+                    # Beta-scaled 1σ index-move P&L: translate a ±1σ move in the
+                    # reference index into this stock's systematic move via beta
+                    # (ΔS = spot · β · σ_index_1d), then BS-reprice both legs at
+                    # spot±ΔS vs. spot (IV and time held constant). Up and down
+                    # differ in magnitude because of gamma.
+                    beta = betas.get(symbol)
+                    if beta is not None and index_sigma_1d:
+                        dS_beta = spot * beta * index_sigma_1d
+                        up_beta, dn_beta = spread_shock_pnl(spot, dS_beta, K1, K2, T, r, iv_l, iv_s, contracts)
+                        result["beta"] = round(beta, 3)
+                        result["betaIndexMove"] = round(dS_beta, 2)
+                        result["betaIndexUpPnl"] = up_beta
+                        result["betaIndexDownPnl"] = dn_beta
 
                 # Path-aware P(+X%): probability the Adjusted P&L touches profit_target_pct
                 # of entry cost before expiry. Paths are simulated once per (symbol, exp).
@@ -2487,6 +2666,10 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <input id="profitTarget" type="number" min="0.1" step="0.5" value="5">
     <span class="dim">%</span>
   </div>
+  <div class="field">
+    <label for="indexSymbol" title="Reference index for the beta-scaled ±1σ index-move P&amp;L column. Beta uses a 2-year daily lookback; the index's 1σ is its option-implied vol (VIX-family). Default ^GSPC (S&amp;P 500).">Beta index</label>
+    <input id="indexSymbol" type="text" style="width:70px;" value="^GSPC">
+  </div>
   <button class="ghost" id="refreshNowBtn">Refresh now</button>
   <span class="dim" id="autoStatus" style="margin-left:auto;">auto-refresh: <span style="color:var(--green);">on</span></span>
 </div>
@@ -2502,7 +2685,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
       <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
       <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
     </div>
-    <div class="stat"><div class="stat-label">Net &Delta;+&Gamma; P&amp;L (1&sigma; move)</div><div class="stat-value mono" id="sumDelta">--</div></div>
+    <div class="stat"><div class="stat-label">Net &plusmn;1&sigma; P&amp;L (own IV)</div><div class="stat-value mono" id="sumDelta">--</div></div>
     <div class="stat"><div class="stat-label">Net &Theta; ($/day)</div><div class="stat-value mono" id="sumTheta">--</div></div>
     <div class="stat"><div class="stat-label">Net Vega ($/1% IV)</div><div class="stat-value mono" id="sumVega">--</div></div>
   </div>
@@ -2527,7 +2710,8 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+5%)</th>
         <th>Daily Theo P&amp;L</th>
-        <th>Greeks (&Delta;+&Gamma; 1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
+        <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
+        <th title="Own-vol &plusmn;1&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
       </tr>
     </thead>
@@ -2591,6 +2775,7 @@ function updateSummary(rows) {
   const totalDailyTheoPct = totalEntry ? (totalDailyTheoPnl / Math.abs(totalEntry)) * 100 : 0;
   const totalDelta = withData.reduce((s, r) => s + (r.netDelta || 0), 0);
   const totalOneSigmaPnl = withData.reduce((s, r) => s + (r.oneSigmaPnl || 0), 0);
+  const totalOneSigmaDown = withData.reduce((s, r) => s + (r.oneSigmaPnlDown || 0), 0);
   const totalTheta = withData.reduce((s, r) => s + (r.netThetaPerDay || 0), 0);
   const totalVega = withData.reduce((s, r) => s + (r.netVega || 0), 0);
 
@@ -2620,8 +2805,10 @@ function updateSummary(rows) {
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
   const colHdr = $('colAdjPnlLabel');
   if (colHdr) colHdr.textContent = `Adj P&L (${activeHc}%)`;
-  $('sumDelta').textContent = fmtSignedDollar(totalOneSigmaPnl, 0);
-  $('sumDelta').className = 'stat-value mono ' + (totalOneSigmaPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
+  $('sumDelta').innerHTML =
+    '<span class="' + (totalOneSigmaPnl >= 0 ? 'pnl-pos' : 'pnl-neg') + '">+1σ ' + fmtSignedDollar(totalOneSigmaPnl, 0) + '</span>'
+    + ' <span class="' + (totalOneSigmaDown >= 0 ? 'pnl-pos' : 'pnl-neg') + '">−1σ ' + fmtSignedDollar(totalOneSigmaDown, 0) + '</span>';
+  $('sumDelta').className = 'stat-value mono';
   $('sumTheta').textContent = fmtSignedDollar(totalTheta, 2);
   $('sumTheta').className = 'stat-value mono ' + (totalTheta >= 0 ? 'pnl-pos' : 'pnl-neg');
   $('sumVega').textContent = fmtSignedDollar(totalVega, 2);
@@ -2655,8 +2842,10 @@ async function refreshQuotes() {
     const hc = currentHaircutPct();
     const tgt = parseFloat($('profitTarget').value);
     const tgtParam = (isFinite(tgt) && tgt > 0) ? tgt : 5;
+    const idx = ($('indexSymbol').value || '^GSPC').trim() || '^GSPC';
     const r = await fetch('/api/positions/quotes?haircut=' + encodeURIComponent(hc)
-      + '&target=' + encodeURIComponent(tgtParam));
+      + '&target=' + encodeURIComponent(tgtParam)
+      + '&index=' + encodeURIComponent(idx));
     const data = await r.json();
     if (data.error) { showErr(data.error); return; }
     lastQuotes = data.positions;
@@ -2664,6 +2853,9 @@ async function refreshQuotes() {
       const pt = Number(data.profitTargetPct);
       const ptLabel = (Number.isInteger(pt) ? pt.toFixed(0) : pt.toString());
       $('colProbTarget').textContent = 'P(+' + ptLabel + '%)';
+    }
+    if (data.indexSymbol) {
+      $('colBetaIdx').innerHTML = '&plusmn;1&sigma; ' + data.indexSymbol + ' P&L (&beta;)';
     }
     renderTable();
     $('lastUpdate').textContent = data.timestamp;
@@ -2696,12 +2888,23 @@ function renderTable() {
       </div></td>`;
     };
 
-    const greeksCell = (p.netDelta === null || p.netDelta === undefined) ? '<td class="dim">--</td>' :
-      `<td><div class="greek-block">
-        <span class="${(p.oneSigmaPnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtSignedDollar(p.oneSigmaPnl || 0, 0)}</span>
-        <span class="${p.netThetaPerDay >= 0 ? 'pnl-pos' : 'pnl-neg'}">${p.netThetaPerDay >= 0 ? '+' : ''}$${p.netThetaPerDay.toFixed(2)}</span>
-        <span>${p.netVega >= 0 ? '+' : ''}$${p.netVega.toFixed(2)}</span>
+    // Own-vol ±1σ P&L (full BS reprice, ~30d tenor) — same engine as the β column,
+    // so the two differ only by the shock source (own total vol vs β·index vol).
+    let greeksCell = '<td class="dim">--</td>';
+    if (p.netDelta !== null && p.netDelta !== undefined) {
+      const gUp = p.oneSigmaPnl, gDn = p.oneSigmaPnlDown;
+      const upCls = (gUp || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const dnCls = (gDn || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const dS = (p.oneSigmaMove != null) ? `ΔS ±${Math.abs(p.oneSigmaMove).toFixed(2)}` : '';
+      const ivPart = (p.oneSigmaIvPct != null) ? ` · IV ${p.oneSigmaIvPct.toFixed(1)}%` : '';
+      greeksCell = `<td><div class="greek-block">
+        <span class="${upCls}">+1σ ${fmtSignedDollar(gUp || 0, 0)}</span>
+        <span class="${dnCls}">−1σ ${fmtSignedDollar(gDn || 0, 0)}</span>
+        <span class="${p.netThetaPerDay >= 0 ? 'pnl-pos' : 'pnl-neg'}">Θ ${p.netThetaPerDay >= 0 ? '+' : ''}$${p.netThetaPerDay.toFixed(2)}</span>
+        <span>V ${p.netVega >= 0 ? '+' : ''}$${p.netVega.toFixed(2)}</span>
+        <span class="tt-dim">${dS}${ivPart}</span>
       </div></td>`;
+    }
 
     let pnlCell = '<td class="dim">--</td>';
     if (p.pnl !== null && p.pnl !== undefined) {
@@ -2744,6 +2947,22 @@ function renderTable() {
       </div></td>`;
     }
 
+    // Beta-scaled ±1σ index-move P&L: top = +1σ index, bottom = -1σ index,
+    // each colored by its own sign. Subtext shows beta and the implied ΔS.
+    let betaCell = '<td class="dim">--</td>';
+    if (p.betaIndexUpPnl !== null && p.betaIndexUpPnl !== undefined) {
+      const up = p.betaIndexUpPnl, dn = p.betaIndexDownPnl;
+      const upCls = up >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const dnCls = dn >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const beta = (p.beta != null) ? p.beta.toFixed(2) : '--';
+      const dS = (p.betaIndexMove != null) ? `ΔS ${sign(p.betaIndexMove)}${Math.abs(p.betaIndexMove).toFixed(2)}` : '';
+      betaCell = `<td><div class="pnl-block">
+        <span class="${upCls}">+1σ ${sign(up)}${dollarFmt(up, 0)}</span>
+        <span class="${dnCls}">−1σ ${sign(dn)}${dollarFmt(dn, 0)}</span>
+        <span class="tt-dim">β ${beta} · ${dS}</span>
+      </div></td>`;
+    }
+
     const label = p.label || `${p.symbol} ${p.longStrike}/${p.shortStrike}`;
     const spotCell = (p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--') + quoteAgeBadge(p.quoteTime);
     const midCell = p.spreadMid !== null ? `$${p.spreadMid.toFixed(2)}` : '--';
@@ -2773,6 +2992,7 @@ function renderTable() {
       ${adjPnlCell}
       ${probCell}
       ${dailyTheoCell}
+      ${betaCell}
       ${greeksCell}
       <td>
         <button class="ghost" data-edit="${p.id}">Edit</button>
@@ -2781,7 +3001,7 @@ function renderTable() {
     `;
     if (p.error) {
       const errTd = document.createElement('tr');
-      errTd.innerHTML = `<td colspan="16" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
+      errTd.innerHTML = `<td colspan="17" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
       body.appendChild(tr);
       body.appendChild(errTd);
     } else {
@@ -2871,6 +3091,14 @@ if (_savedHaircut !== null && isFinite(parseFloat(_savedHaircut))) {
 }
 $('haircutPct').addEventListener('change', () => {
   localStorage.setItem('adjPnlHaircutPct', $('haircutPct').value);
+  refreshQuotes();
+});
+
+// Persist the beta reference index across sessions and re-refresh when it changes.
+const _savedIndex = localStorage.getItem('betaIndexSymbol');
+if (_savedIndex) { $('indexSymbol').value = _savedIndex; }
+$('indexSymbol').addEventListener('change', () => {
+  localStorage.setItem('betaIndexSymbol', $('indexSymbol').value);
   refreshQuotes();
 });
 
@@ -2977,14 +3205,17 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 except ValueError:
                     target_pct = 5.0
                 target_pct = max(0.0, target_pct)
+                index_symbol = (params.get("index", [DEFAULT_INDEX])[0] or DEFAULT_INDEX).strip() or DEFAULT_INDEX
                 positions = load_positions()
                 quotes = fetch_position_quotes(positions, haircut_pct=haircut_pct,
-                                               profit_target_pct=target_pct)
+                                               profit_target_pct=target_pct,
+                                               index_symbol=index_symbol)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "haircutPct": round(haircut_pct * 100, 2),
                     "profitTargetPct": target_pct,
+                    "indexSymbol": index_symbol,
                 })
             except Exception as e:
                 self._send_json({"error": str(e)})
