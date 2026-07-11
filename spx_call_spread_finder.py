@@ -305,7 +305,7 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 # Data fetching & spread finding
 # ---------------------------------------------------------------------------
 
-def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, min_leg_premium=0, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0):
+def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, min_leg_premium=0, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0):
     if risk_free_rate is None:
         risk_free_rate = RISK_FREE_RATE_PCT / 100.0
     """
@@ -449,6 +449,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
             skipped_leg_premium_min = 0
             skipped_leverage = 0
             skipped_delta = 0
+            skipped_gamma = 0
             skipped_rr = 0
             found = 0
 
@@ -543,8 +544,19 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         skipped_leverage += 1
                         continue
 
-                    if net_delta * contracts < min_net_delta:
+                    # Filter on per-contract net delta (Δ/Contract) — the spread's
+                    # directional signature, independent of budget-driven sizing.
+                    if net_delta < min_net_delta:
                         skipped_delta += 1
+                        continue
+
+                    # Gamma made intuitive: delta gained per 1% underlying move, at the
+                    # position level (same units as netDelta). It's how fast the spread's
+                    # directional exposure accelerates as the stock moves — higher = more
+                    # convex/punchy (shorter-dated, near-money), lower = steadier/linear.
+                    gamma_per_1pct = net_gamma * (spot * 0.01) * contracts
+                    if gamma_per_1pct < min_gamma:
+                        skipped_gamma += 1
                         continue
 
                     # Max profit & other metrics (per contract in quoted points)
@@ -623,6 +635,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "netDelta": round(net_delta * contracts, 4),
                         "netDeltaPer": round(net_delta, 4),
                         "netGamma": round(net_gamma * contracts, 6),
+                        "gammaPer1pct": round(gamma_per_1pct, 3),
                         "deltaBuy": round(delta_buy, 4),
                         "deltaSell": round(delta_sell, 4),
                         "ivBuy": round(iv_buy * 100, 1),
@@ -640,7 +653,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "totalCommission": round(commission * contracts, 2),
                     })
 
-            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_leg_premium_min} under min leg prem, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_rr} under min R/R")
+            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_leg_premium_min} under min leg prem, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
 
         except Exception as e:
             print(f"  Skipping {exp_date_str}: {e}")
@@ -1270,6 +1283,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 20px;
     flex-wrap: wrap;
   }
+  /* Model-inputs row: hidden until its toggle is opened. */
+  .controls.collapsed { display: none; }
+  /* Full-width heading that groups the fields by function (forces a flex wrap). */
+  .section-label {
+    flex-basis: 100%;
+    margin: 2px 0 -2px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text);
+  }
+  .section-label:first-child { border-top: none; padding-top: 0; }
+  .section-label .sub {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-dim);
+    margin-left: 6px;
+  }
 
   .input-group {
     display: flex;
@@ -1584,6 +1619,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div class="controls">
+  <div class="section-label">Scan <span class="sub">— what universe to search</span></div>
   <div class="input-group tooltip-container">
     <label>Ticker</label>
     <input type="text" id="ticker" value="^SPX" style="width:120px;text-transform:uppercase;">
@@ -1591,22 +1627,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="tooltip-text">Enter any optionable ticker — e.g. ^SPX, AAPL, TSLA, QQQ, SPY. Use ^ prefix for indices.</span>
   </div>
   <div class="input-group tooltip-container">
-    <label>Min Premium ($)</label>
-    <input type="number" id="minPremium" value="9000" min="0" step="100">
-    <span class="hint">Min net dollars laid out</span>
-    <span class="tooltip-text">Minimum net cash outlay (long call ask − short call bid) × 100 multiplier</span>
+    <label>Expirations</label>
+    <div id="expirationCheckboxes" style="display:flex;flex-direction:column;gap:4px;padding:6px 0;"></div>
+    <span class="hint">Check one or more expirations</span>
+    <span class="tooltip-text">3rd Friday of each month — check the expirations you want to scan, or "All" to scan everything</span>
   </div>
+
+  <div class="section-label">Filters <span class="sub">— change which spreads come back</span></div>
   <div class="input-group tooltip-container">
     <label>Max Premium ($)</label>
     <input type="number" id="maxPremium" value="11000" min="100" step="100">
-    <span class="hint">Max net dollars laid out</span>
-    <span class="tooltip-text">Maximum net cash outlay (long call ask − short call bid) × 100 multiplier</span>
+    <span class="hint">Max net dollars laid out (risk cap)</span>
+    <span class="tooltip-text">Maximum net cash outlay (long call ask − short call bid) × 100 multiplier. This is your capital at risk per spread.</span>
   </div>
   <div class="input-group tooltip-container">
     <label>Min Leverage (x)</label>
     <input type="number" id="minLeverage" value="2" min="0.1" step="0.5">
     <span class="hint">Profit / premium for 1% move</span>
-    <span class="tooltip-text">Minimum ratio of dollar profit from a 1% up move to premium paid</span>
+    <span class="tooltip-text">Minimum ratio of dollar profit from a 1% up move to premium paid — your P&amp;L per 1% recovery, per dollar risked.</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min Reward/Risk</label>
+    <input type="number" id="minRewardRisk" value="0.5" min="0" step="0.1">
+    <span class="hint">Min max-profit / premium ratio</span>
+    <span class="tooltip-text">Minimum ratio of max profit to premium paid — e.g. 1.0 means max profit ≥ premium (hold-to-expiry payoff).</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Max % OTM</label>
+    <input type="number" id="maxOtm" value="5" min="0.1" step="0.5">
+    <span class="hint">Buy strike max % above spot</span>
+    <span class="tooltip-text">Maximum % the lower (buy) strike is above the current underlying price — controls where the long strike sits vs. spot (positioning for the bounce).</span>
   </div>
   <div class="input-group tooltip-container">
     <label>Max Width (pts)</label>
@@ -1615,52 +1665,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="tooltip-text">Maximum distance between strikes — e.g. 50 pts = $5,000 max risk (×100 multiplier)</span>
   </div>
   <div class="input-group tooltip-container">
-    <label>Max % OTM</label>
-    <input type="number" id="maxOtm" value="5" min="0.1" step="0.5">
-    <span class="hint">Buy strike max % above spot</span>
-    <span class="tooltip-text">Maximum % the lower (buy) strike is above the current underlying price</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>P&amp;L Move %</label>
-    <input type="number" id="movePct" value="1" min="0.1" step="0.5">
-    <span class="hint">Move used for P&amp;L $ column</span>
-    <span class="tooltip-text">The underlying % move used to compute the "P&amp;L X% $" column (Δ·dS + ½·Γ·dS²). Leverage stays normalized to per-1% for comparability.</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Profit Target %</label>
-    <input type="number" id="profitTarget" value="5" min="0.1" step="0.5">
-    <span class="hint">Target for P(+X%) column</span>
-    <span class="tooltip-text">Profit target as a % of entry cost, measured on Adjusted P&amp;L (80% haircut on gains + round-trip commission, matching the Positions monitor). The "P(+X%)" column is the path-aware probability the Adjusted P&amp;L touches this target at any point before expiry (zero-drift Monte Carlo).</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Expirations</label>
-    <div id="expirationCheckboxes" style="display:flex;flex-direction:column;gap:4px;padding:6px 0;"></div>
-    <span class="hint">Check one or more expirations</span>
-    <span class="tooltip-text">3rd Friday of each month — check the expirations you want to scan, or "All" to scan everything</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Risk-Free Rate (%)</label>
-    <input type="number" id="riskFreeRate" value="{RISK_FREE_RATE_PCT}" min="0" max="20" step="0.1">
-    <span class="hint">For Black-Scholes delta calc</span>
-    <span class="tooltip-text">Used in delta calculation — approximate current Treasury yield</span>
-  </div>
-  <div class="input-group tooltip-container">
     <label>Min Net Delta</label>
     <input type="number" id="minNetDelta" value="0.33" min="0" max="1" step="0.01">
-    <span class="hint">Per-contract net delta floor</span>
-    <span class="tooltip-text">Minimum net delta (long delta − short delta) per contract — filters out low-directional spreads</span>
+    <span class="hint">Per-contract net delta (Δ/Contract) floor</span>
+    <span class="tooltip-text">Minimum per-contract net delta (long delta − short delta) — the Δ/Contract column. Filters out low-directional spreads.</span>
   </div>
   <div class="input-group tooltip-container">
-    <label>Min Reward/Risk</label>
-    <input type="number" id="minRewardRisk" value="0.5" min="0" step="0.1">
-    <span class="hint">Min max-profit / premium ratio</span>
-    <span class="tooltip-text">Minimum ratio of max profit to premium paid — e.g. 1.0 means max profit ≥ premium</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Commission ($/spread)</label>
-    <input type="number" id="commission" value="35.80" min="0" step="0.25">
-    <span class="hint">Round-trip per spread</span>
-    <span class="tooltip-text">Total commission per spread for opening + closing (all legs, both ways). Default $35.80 = $8.95/leg &times; 2 legs &times; 2 sides. Deducted from max profit, breakeven, and reward/risk.</span>
+    <label>Min Gamma (&Delta;/1%)</label>
+    <input type="number" id="minGamma" value="0.00" step="0.01">
+    <span class="hint">&uarr; punchier/convex &middot; &darr; steadier/linear</span>
+    <span class="tooltip-text">Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Raise it to require more convexity (punchier, tends to shorter-dated / nearer-the-money spreads); lower it (or go negative) for steadier, more linear spreads (longer-dated / further OTM).</span>
   </div>
   <div class="input-group tooltip-container">
     <label>Max Leg Premium ($)</label>
@@ -1669,16 +1683,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="tooltip-text">Maximum absolute dollar value (price × 100 × contracts) for either the long or short leg individually</span>
   </div>
   <div class="input-group tooltip-container">
-    <label>Min Leg Premium ($)</label>
-    <input type="number" id="minLegPremium" value="0" min="0" step="500">
-    <span class="hint">Min $ per individual leg</span>
-    <span class="tooltip-text">Minimum absolute dollar value (price × 100 × contracts) required for both the long and short legs. Use 0 to disable.</span>
-  </div>
-  <div class="input-group tooltip-container">
     <label>Min DTE</label>
     <input type="number" id="minDte" value="30" min="0" step="1">
     <span class="hint">Min days to expiration</span>
     <span class="tooltip-text">Skip expirations with fewer than this many days remaining</span>
+  </div>
+
+  <div class="section-label">Output &amp; scenario <span class="sub">— shape the result columns, not which spreads return</span></div>
+  <div class="input-group tooltip-container">
+    <label>Recovery move %</label>
+    <input type="number" id="movePct" value="1" min="0.1" step="0.5">
+    <span class="hint">Underlying bounce → "P&amp;L X% $" column</span>
+    <span class="tooltip-text">The underlying % move you expect to recover — drives the "P&amp;L X% $" column (Δ·dS + ½·Γ·dS²). This is an UNDERLYING price move, not a P&amp;L target. It does not screen spreads (only a tiny 2nd-order effect on Leverage via gamma).</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>P&amp;L target (% of cost)</label>
+    <input type="number" id="profitTarget" value="5" min="0.1" step="0.5">
+    <span class="hint">Return on premium → "P(+X%)" column</span>
+    <span class="tooltip-text">Profit target as a % of entry cost (return on premium PAID — not an underlying move), measured on Adjusted P&amp;L (80% haircut on gains + round-trip commission, matching the Positions monitor). Drives the path-aware "P(+X%)" probability column; it does not screen spreads.</span>
   </div>
   <div class="input-group">
     <label>Sort By</label>
@@ -1691,7 +1713,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <option value="pctOtmBuy">% OTM (near first)</option>
     </select>
   </div>
-  <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
+
+  <div class="section-label" style="display:flex;align-items:center;gap:16px;">
+    <button type="button" class="primary" id="advancedToggle" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);" onclick="toggleAdvanced()">Model inputs ▸</button>
+    <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
+  </div>
+</div>
+<div class="controls collapsed" id="advancedFilters" style="border-top:none;padding-top:0;">
+  <div class="section-label" style="border-top:none;padding-top:0;">Model inputs <span class="sub">— feed the Black-Scholes math &amp; economics, so they indirectly move the filters</span></div>
+  <div class="input-group tooltip-container">
+    <label>Risk-Free Rate (%)</label>
+    <input type="number" id="riskFreeRate" value="{RISK_FREE_RATE_PCT}" min="0" max="20" step="0.1">
+    <span class="hint">Feeds Black-Scholes delta/gamma</span>
+    <span class="tooltip-text">Used in the delta/gamma calculation — approximate current Treasury yield. Changes the greeks, which feed the Delta/Gamma/Leverage filters.</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Commission ($/spread)</label>
+    <input type="number" id="commission" value="35.80" min="0" step="0.25">
+    <span class="hint">Round-trip per spread</span>
+    <span class="tooltip-text">Total commission per spread for opening + closing (all legs, both ways). Default $35.80 = $8.95/leg &times; 2 legs &times; 2 sides. Deducted from max profit, breakeven, and reward/risk — so it feeds the Reward/Risk filter.</span>
+  </div>
 </div>
 
 <div class="controls" style="border-top:none;padding-top:0;">
@@ -1706,6 +1747,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button type="button" class="primary" id="tplUpdateBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="updateSelectedTemplate()">Update Selected</button>
   <button type="button" class="primary" id="tplSaveAsBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="saveTemplateAs()">Save As New</button>
   <button type="button" class="primary" id="tplDeleteBtn" style="background:transparent;color:#ef4444;border:1px solid #ef4444;" onclick="deleteSelectedTemplate()">Delete</button>
+  <button type="button" class="primary" id="dipBuyPresetBtn" style="margin-left:auto;" onclick="applyDipBuyPreset()" title="Load a starting parameter set for buying call spreads on dips to catch a recovery, then search. Tune and Save As New to keep your own.">Dip-buy preset</button>
 </div>
 
 <div class="error-msg" id="errorMsg"></div>
@@ -1755,7 +1797,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')">BE Move &sigma;</th>
         <th data-col="netDelta" onclick="sortTable('netDelta')">Net Delta</th>
         <th data-col="netDeltaPer" onclick="sortTable('netDeltaPer')">&Delta;/Contract</th>
-        <th data-col="netGamma" onclick="sortTable('netGamma')">Net Gamma</th>
+        <th data-col="gammaPer1pct" onclick="sortTable('gammaPer1pct')" title="Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Higher = more convex/punchy.">&Gamma; (&Delta;/1%)</th>
         <th data-col="breakeven" onclick="sortTable('breakeven')">Breakeven</th>
         <th data-col="ivBuy" onclick="sortTable('ivBuy')">IV Buy</th>
         <th data-col="ivSell" onclick="sortTable('ivSell')">IV Sell</th>
@@ -1838,13 +1880,38 @@ function populateExpirations() {
 }
 populateExpirations();
 
+// ---------------- Advanced filters toggle ----------------
+function toggleAdvanced(forceOpen) {
+  const adv = document.getElementById('advancedFilters');
+  const btn = document.getElementById('advancedToggle');
+  const open = (forceOpen === undefined) ? adv.classList.contains('collapsed') : forceOpen;
+  adv.classList.toggle('collapsed', !open);
+  btn.textContent = open ? 'Model inputs ▾' : 'Model inputs ▸';
+  try { localStorage.setItem('finderAdvancedOpen', open ? '1' : '0'); } catch (e) {}
+}
+// Restore prior open/closed state (default closed).
+toggleAdvanced(localStorage.getItem('finderAdvancedOpen') === '1');
+
+// ---------------- Dip-buy / recovery preset ----------------
+// A tunable starting point for buying call spreads on dips to catch a recovery:
+// modest risk cap, meaningful leverage per 1% bounce, long strike near spot, and
+// enough time for the move. Leaves ticker & expirations as currently chosen.
+const DIP_BUY_PRESET = {
+  maxPremium: '3000', minLeverage: '3', minRewardRisk: '1', maxOtm: '3',
+  maxWidth: '50', movePct: '5', minDte: '45'
+};
+function applyDipBuyPreset() {
+  applyParams(DIP_BUY_PRESET);
+  doSearch();
+}
+
 // ---------------- Templates (saved parameter sets) ----------------
 
 // Input IDs to capture in a template (order matters for restoring)
 const TEMPLATE_INPUT_IDS = [
-  'ticker','minPremium','maxPremium','minLeverage','maxWidth','maxOtm','movePct',
-  'profitTarget','riskFreeRate','minNetDelta','minRewardRisk','commission','maxLegPremium',
-  'minLegPremium','minDte','sortBy'
+  'ticker','maxPremium','minLeverage','maxWidth','maxOtm','movePct',
+  'profitTarget','riskFreeRate','minNetDelta','minGamma','minRewardRisk','commission','maxLegPremium',
+  'minDte','sortBy'
 ];
 
 let savedTemplates = [];  // full list from /api/templates
@@ -1974,17 +2041,16 @@ fetchTemplates();
 async function doSearch() {
   const symbol = document.getElementById('ticker').value.trim().toUpperCase();
   if (!symbol) { showError('Please enter a ticker symbol.'); return; }
-  const minPremiumDollars = parseFloat(document.getElementById('minPremium').value);
   const maxPremiumDollars = parseFloat(document.getElementById('maxPremium').value);
   const minLeverage = parseFloat(document.getElementById('minLeverage').value);
   const maxWidth = parseFloat(document.getElementById('maxWidth').value);
   const maxOtm = parseFloat(document.getElementById('maxOtm').value);
   const riskFreeRate = parseFloat(document.getElementById('riskFreeRate').value) / 100;
   const minNetDelta = parseFloat(document.getElementById('minNetDelta').value);
+  const minGamma = parseFloat(document.getElementById('minGamma').value) || 0;
   const minRewardRisk = parseFloat(document.getElementById('minRewardRisk').value);
   const commission = parseFloat(document.getElementById('commission').value);
   const maxLegPremium = parseFloat(document.getElementById('maxLegPremium').value);
-  const minLegPremium = parseFloat(document.getElementById('minLegPremium').value) || 0;
   const minDte = parseInt(document.getElementById('minDte').value) || 0;
   const movePct = parseFloat(document.getElementById('movePct').value) || 1.0;
   const profitTarget = parseFloat(document.getElementById('profitTarget').value) || 5.0;
@@ -1995,20 +2061,13 @@ async function doSearch() {
     expiration = checked.length > 0 ? checked.join(',') : 'all';
   }
 
-  // Convert actual dollars to quoted points (options multiplier = 100)
-  const minPremium = minPremiumDollars / 100;
+  // Convert actual dollars to quoted points (options multiplier = 100). No min
+  // premium filter — send 0 so only the max-premium (risk) cap applies.
+  const minPremium = 0;
   const maxPremium = maxPremiumDollars / 100;
 
-  if (isNaN(minPremiumDollars) || minPremiumDollars < 0) {
-    showError('Please enter a valid min premium (0 or greater).');
-    return;
-  }
   if (isNaN(maxPremiumDollars) || maxPremiumDollars <= 0) {
     showError('Please enter a valid max premium greater than 0.');
-    return;
-  }
-  if (minPremiumDollars > maxPremiumDollars) {
-    showError('Min premium cannot exceed max premium.');
     return;
   }
   if (isNaN(minLeverage) || minLeverage <= 0) {
@@ -2038,10 +2097,10 @@ async function doSearch() {
       max_otm: maxOtm,
       risk_free_rate: riskFreeRate,
       min_net_delta: minNetDelta,
+      min_gamma: minGamma,
       min_reward_risk: minRewardRisk,
       commission: commission,
       max_leg_premium: maxLegPremium,
-      min_leg_premium: minLegPremium,
       min_dte: minDte,
       move_pct: movePct,
       profit_target_pct: profitTarget,
@@ -2418,7 +2477,7 @@ function renderTable() {
       <td>${s.breakevenMoveSigma >= 0 ? '+' : ''}${s.breakevenMoveSigma.toFixed(2)}σ</td>
       <td>${s.netDelta.toFixed(4)}</td>
       <td>${s.netDeltaPer.toFixed(4)}</td>
-      <td>${s.netGamma.toFixed(6)}</td>
+      <td>${(s.gammaPer1pct >= 0 ? '+' : '') + (s.gammaPer1pct != null ? s.gammaPer1pct.toFixed(2) : '--')}</td>
       <td>${s.breakeven.toFixed(0)}</td>
       <td class="dim">${s.ivBuy.toFixed(1)}%</td>
       <td class="dim">${s.ivSell.toFixed(1)}%</td>
@@ -3215,12 +3274,13 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             symbol = params.get("symbol", ["^SPX"])[0].strip().upper()
             move_pct = float(params.get("move_pct", [1.0])[0])
             profit_target_pct = float(params.get("profit_target_pct", [5.0])[0])
+            min_gamma = float(params.get("min_gamma", [0.0])[0])
 
             try:
                 print(f"\n{'='*60}")
                 print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_leg_premium=${min_leg_premium}, move_pct={move_pct}%, expiration={expiration_filter}")
                 print(f"{'='*60}")
-                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, min_leg_premium, symbol, move_pct, profit_target_pct)
+                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, min_leg_premium, symbol, move_pct, profit_target_pct, min_gamma)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
 
                 self.send_response(200)
