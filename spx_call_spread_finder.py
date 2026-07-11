@@ -925,16 +925,19 @@ def _underlying_spot_and_time(oc, tk):
     return float(tk.history(period="1d")["Close"].iloc[-1]), None, prev_close
 
 
-def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0,
-                          index_symbol=DEFAULT_INDEX):
+def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
+                          index_symbol=DEFAULT_INDEX, n_sigma=1.0):
     """Fetch live leg data for every saved position, batching chain calls.
 
     haircut_pct: multiplier applied to (raw P&L − entry commission − exit commission)
     to produce Adjusted P&L. Exit commission is assumed equal to entry commission.
     profit_target_pct: profit target (as a % of entry cost) for the path-aware P(+X%)
     probability that the Adjusted P&L touches it before expiry.
-    index_symbol: reference index for the beta-scaled 1σ index-move P&L column.
+    index_symbol: reference index for the beta-scaled Nσ index-move P&L column.
+    n_sigma: number of standard deviations for the ±σ move columns (own-vol and
+    beta-index). Defaults to 1; e.g. 2 shocks by ±2σ.
     """
+    n_sigma = max(0.0, float(n_sigma))
     results = []
     chain_cache = {}   # (symbol, expiration) -> calls DataFrame
     spot_cache = {}    # symbol -> (spot: float, quote_epoch_seconds: int | None)
@@ -968,6 +971,9 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0,
         # Entry cost is the pure premium outlay (commission-free) so raw P&L reflects the market move
         # only. Adjusted P&L nets out entry + mirrored exit commission and then applies haircut_pct.
         result["entryCost"] = round((long_entry - short_entry) * 100 * contracts, 2)
+        # Net premium paid per spread (long entry − short entry); the per-spread
+        # version of entryCost, shown in the "Entry Spread" column.
+        result["entrySpread"] = round(long_entry - short_entry, 2)
         result["entryCommission"] = round(entry_commission, 2)
         result["exitCommission"] = round(entry_commission, 2)
         result["totalCommission"] = round(entry_commission * 2, 2)
@@ -1087,7 +1093,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0,
                     if symbol not in iv30_cache:
                         iv30_cache[symbol] = get_atm_iv_30d(symbol)
                     sigma_own = iv30_cache[symbol] or (atm_iv if atm_iv and atm_iv > 0 else (iv_l + iv_s) / 2.0)
-                    one_sigma_dS = spot * sigma_own * math.sqrt(1 / 252)
+                    one_sigma_dS = spot * sigma_own * math.sqrt(1 / 252) * n_sigma
                     up_own, dn_own = spread_shock_pnl(spot, one_sigma_dS, K1, K2, T, r, iv_l, iv_s, contracts)
                     result["oneSigmaMove"] = round(one_sigma_dS, 2)
                     result["oneSigmaIvPct"] = round(sigma_own * 100, 1)
@@ -1114,7 +1120,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=5.0,
                     # differ in magnitude because of gamma.
                     beta = betas.get(symbol)
                     if beta is not None and index_sigma_1d:
-                        dS_beta = spot * beta * index_sigma_1d
+                        dS_beta = spot * beta * index_sigma_1d * n_sigma
                         up_beta, dn_beta = spread_shock_pnl(spot, dS_beta, K1, K2, T, r, iv_l, iv_s, contracts)
                         result["beta"] = round(beta, 3)
                         result["betaIndexMove"] = round(dS_beta, 2)
@@ -2663,12 +2669,17 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="field">
     <label for="profitTarget" title="Profit target as a % of entry cost, on Adjusted P&amp;L. The P(+X%) column is the path-aware probability the Adjusted P&amp;L touches this target before expiry.">Profit target</label>
-    <input id="profitTarget" type="number" min="0.1" step="0.5" value="5">
+    <input id="profitTarget" type="number" min="0.1" step="0.5" value="15">
     <span class="dim">%</span>
   </div>
   <div class="field">
-    <label for="indexSymbol" title="Reference index for the beta-scaled ±1σ index-move P&amp;L column. Beta uses a 2-year daily lookback; the index's 1σ is its option-implied vol (VIX-family). Default ^GSPC (S&amp;P 500).">Beta index</label>
+    <label for="indexSymbol" title="Reference index for the beta-scaled ±σ index-move P&amp;L column. Beta uses a 2-year daily lookback; the index's σ is its option-implied vol (VIX-family). Default ^GSPC (S&amp;P 500).">Beta index</label>
     <input id="indexSymbol" type="text" style="width:70px;" value="^GSPC">
+  </div>
+  <div class="field">
+    <label for="sigmaMult" title="Number of standard deviations for the ±σ move columns (own-vol Greeks and beta-index) and the summary. Default 1; e.g. set 2 to see ±2σ scenarios.">Std devs</label>
+    <input id="sigmaMult" type="number" min="0.1" max="10" step="0.5" value="1">
+    <span class="dim">&sigma;</span>
   </div>
   <button class="ghost" id="refreshNowBtn">Refresh now</button>
   <span class="dim" id="autoStatus" style="margin-left:auto;">auto-refresh: <span style="color:var(--green);">on</span></span>
@@ -2685,7 +2696,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
       <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
       <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
     </div>
-    <div class="stat"><div class="stat-label">Net &plusmn;1&sigma; P&amp;L (own IV)</div><div class="stat-value mono" id="sumDelta">--</div></div>
+    <div class="stat"><div class="stat-label" id="sumDeltaLabel">Net &plusmn;1&sigma; P&amp;L (own IV)</div><div class="stat-value mono" id="sumDelta">--</div></div>
     <div class="stat"><div class="stat-label">Net &Theta; ($/day)</div><div class="stat-value mono" id="sumTheta">--</div></div>
     <div class="stat"><div class="stat-label">Net Vega ($/1% IV)</div><div class="stat-value mono" id="sumVega">--</div></div>
   </div>
@@ -2702,16 +2713,15 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th>Long Leg (bid / ask / last / vol / IV)</th>
         <th>Short Leg (bid / ask / last / vol / IV)</th>
         <th>Contracts</th>
-        <th>Spread Mid</th>
-        <th>Liquidation</th>
+        <th title="Per-spread prices: net premium paid at entry (long entry − short entry) over the current liquidation (long bid − short ask).">Entry / Liq</th>
         <th>Entry Cost</th>
         <th>Current Value</th>
         <th>P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
-        <th id="colProbTarget">P(+5%)</th>
+        <th id="colProbTarget">P(+15%)</th>
         <th>Daily Theo P&amp;L</th>
         <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
-        <th title="Own-vol &plusmn;1&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
+        <th id="colGreeks" title="Own-vol &plusmn;&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
       </tr>
     </thead>
@@ -2725,8 +2735,11 @@ let countdownTimer = null;
 let nextRefreshAt = 0;
 let positions = [];     // raw from /api/positions
 let lastQuotes = [];    // joined w/ quotes
+let curSigmas = 1;      // active std-dev multiple for the ±σ columns
 
 function $(id) { return document.getElementById(id); }
+// Compact σ label, e.g. 1 -> "1", 1.5 -> "1.5", 2 -> "2".
+function sigStr() { return Number.isInteger(curSigmas) ? String(curSigmas) : String(curSigmas); }
 function dollarFmt(v, dp=2) { return (v >= 0 ? '$' : '-$') + Math.abs(v).toFixed(dp); }
 function sign(v) { return (v >= 0 ? '+' : ''); }
 
@@ -2805,9 +2818,10 @@ function updateSummary(rows) {
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
   const colHdr = $('colAdjPnlLabel');
   if (colHdr) colHdr.textContent = `Adj P&L (${activeHc}%)`;
+  $('sumDeltaLabel').innerHTML = 'Net &plusmn;' + sigStr() + '&sigma; P&L (own IV)';
   $('sumDelta').innerHTML =
-    '<span class="' + (totalOneSigmaPnl >= 0 ? 'pnl-pos' : 'pnl-neg') + '">+1σ ' + fmtSignedDollar(totalOneSigmaPnl, 0) + '</span>'
-    + ' <span class="' + (totalOneSigmaDown >= 0 ? 'pnl-pos' : 'pnl-neg') + '">−1σ ' + fmtSignedDollar(totalOneSigmaDown, 0) + '</span>';
+    '<span class="' + (totalOneSigmaPnl >= 0 ? 'pnl-pos' : 'pnl-neg') + '">+' + sigStr() + 'σ ' + fmtSignedDollar(totalOneSigmaPnl, 0) + '</span>'
+    + ' <span class="' + (totalOneSigmaDown >= 0 ? 'pnl-pos' : 'pnl-neg') + '">−' + sigStr() + 'σ ' + fmtSignedDollar(totalOneSigmaDown, 0) + '</span>';
   $('sumDelta').className = 'stat-value mono';
   $('sumTheta').textContent = fmtSignedDollar(totalTheta, 2);
   $('sumTheta').className = 'stat-value mono ' + (totalTheta >= 0 ? 'pnl-pos' : 'pnl-neg');
@@ -2841,21 +2855,26 @@ async function refreshQuotes() {
     clearErr();
     const hc = currentHaircutPct();
     const tgt = parseFloat($('profitTarget').value);
-    const tgtParam = (isFinite(tgt) && tgt > 0) ? tgt : 5;
+    const tgtParam = (isFinite(tgt) && tgt > 0) ? tgt : 15;
     const idx = ($('indexSymbol').value || '^GSPC').trim() || '^GSPC';
+    const sg = parseFloat($('sigmaMult').value);
+    const sgParam = (isFinite(sg) && sg > 0) ? sg : 1;
     const r = await fetch('/api/positions/quotes?haircut=' + encodeURIComponent(hc)
       + '&target=' + encodeURIComponent(tgtParam)
-      + '&index=' + encodeURIComponent(idx));
+      + '&index=' + encodeURIComponent(idx)
+      + '&sigmas=' + encodeURIComponent(sgParam));
     const data = await r.json();
     if (data.error) { showErr(data.error); return; }
     lastQuotes = data.positions;
+    if (data.nSigma !== undefined && data.nSigma !== null) curSigmas = Number(data.nSigma);
     if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
       const pt = Number(data.profitTargetPct);
       const ptLabel = (Number.isInteger(pt) ? pt.toFixed(0) : pt.toString());
       $('colProbTarget').textContent = 'P(+' + ptLabel + '%)';
     }
+    $('colGreeks').innerHTML = 'Greeks (&plusmn;' + sigStr() + '&sigma; P&L / &Theta;$/d / Vega)';
     if (data.indexSymbol) {
-      $('colBetaIdx').innerHTML = '&plusmn;1&sigma; ' + data.indexSymbol + ' P&L (&beta;)';
+      $('colBetaIdx').innerHTML = '&plusmn;' + sigStr() + '&sigma; ' + data.indexSymbol + ' P&L (&beta;)';
     }
     renderTable();
     $('lastUpdate').textContent = data.timestamp;
@@ -2898,8 +2917,8 @@ function renderTable() {
       const dS = (p.oneSigmaMove != null) ? `ΔS ±${Math.abs(p.oneSigmaMove).toFixed(2)}` : '';
       const ivPart = (p.oneSigmaIvPct != null) ? ` · IV ${p.oneSigmaIvPct.toFixed(1)}%` : '';
       greeksCell = `<td><div class="greek-block">
-        <span class="${upCls}">+1σ ${fmtSignedDollar(gUp || 0, 0)}</span>
-        <span class="${dnCls}">−1σ ${fmtSignedDollar(gDn || 0, 0)}</span>
+        <span class="${upCls}">+${sigStr()}σ ${fmtSignedDollar(gUp || 0, 0)}</span>
+        <span class="${dnCls}">−${sigStr()}σ ${fmtSignedDollar(gDn || 0, 0)}</span>
         <span class="${p.netThetaPerDay >= 0 ? 'pnl-pos' : 'pnl-neg'}">Θ ${p.netThetaPerDay >= 0 ? '+' : ''}$${p.netThetaPerDay.toFixed(2)}</span>
         <span>V ${p.netVega >= 0 ? '+' : ''}$${p.netVega.toFixed(2)}</span>
         <span class="tt-dim">${dS}${ivPart}</span>
@@ -2957,16 +2976,22 @@ function renderTable() {
       const beta = (p.beta != null) ? p.beta.toFixed(2) : '--';
       const dS = (p.betaIndexMove != null) ? `ΔS ${sign(p.betaIndexMove)}${Math.abs(p.betaIndexMove).toFixed(2)}` : '';
       betaCell = `<td><div class="pnl-block">
-        <span class="${upCls}">+1σ ${sign(up)}${dollarFmt(up, 0)}</span>
-        <span class="${dnCls}">−1σ ${sign(dn)}${dollarFmt(dn, 0)}</span>
+        <span class="${upCls}">+${sigStr()}σ ${sign(up)}${dollarFmt(up, 0)}</span>
+        <span class="${dnCls}">−${sigStr()}σ ${sign(dn)}${dollarFmt(dn, 0)}</span>
         <span class="tt-dim">β ${beta} · ${dS}</span>
       </div></td>`;
     }
 
     const label = p.label || `${p.symbol} ${p.longStrike}/${p.shortStrike}`;
     const spotCell = (p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--') + quoteAgeBadge(p.quoteTime);
-    const midCell = p.spreadMid !== null ? `$${p.spreadMid.toFixed(2)}` : '--';
-    const liqCell = p.spreadLiquidation !== null ? `$${p.spreadLiquidation.toFixed(2)}` : '--';
+    // Entry Spread and Liquidation collapsed into one column: entry price paid
+    // per spread over the current liquidation price per spread.
+    const es = (p.entrySpread !== null && p.entrySpread !== undefined) ? `$${p.entrySpread.toFixed(2)}` : '--';
+    const lq = (p.spreadLiquidation !== null && p.spreadLiquidation !== undefined) ? `$${p.spreadLiquidation.toFixed(2)}` : '--';
+    const entryLiqCell = `<div class="pnl-block">
+      <span class="mono">${es} <span class="tt-dim">entry</span></span>
+      <span class="mono">${lq} <span class="tt-dim">liq</span></span>
+    </div>`;
     const curCell = p.currentValue !== null ? dollarFmt(p.currentValue, 0) : '--';
     let entryCell = '--';
     if (p.entryCost !== null && p.entryCost !== undefined) {
@@ -2984,8 +3009,7 @@ function renderTable() {
       ${legCell(p.long, p.longStrike)}
       ${legCell(p.short, p.shortStrike)}
       <td class="mono">${p.contracts}</td>
-      <td class="mono">${midCell}</td>
-      <td class="mono">${liqCell}</td>
+      <td class="mono">${entryLiqCell}</td>
       <td class="mono">${entryCell}</td>
       <td class="mono">${curCell}</td>
       ${pnlCell}
@@ -3001,7 +3025,7 @@ function renderTable() {
     `;
     if (p.error) {
       const errTd = document.createElement('tr');
-      errTd.innerHTML = `<td colspan="17" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
+      errTd.innerHTML = `<td colspan="16" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
       body.appendChild(tr);
       body.appendChild(errTd);
     } else {
@@ -3099,6 +3123,16 @@ const _savedIndex = localStorage.getItem('betaIndexSymbol');
 if (_savedIndex) { $('indexSymbol').value = _savedIndex; }
 $('indexSymbol').addEventListener('change', () => {
   localStorage.setItem('betaIndexSymbol', $('indexSymbol').value);
+  refreshQuotes();
+});
+
+// Persist the std-dev multiple across sessions and re-refresh when it changes.
+const _savedSigmas = localStorage.getItem('sigmaMult');
+if (_savedSigmas !== null && isFinite(parseFloat(_savedSigmas))) {
+  $('sigmaMult').value = _savedSigmas;
+}
+$('sigmaMult').addEventListener('change', () => {
+  localStorage.setItem('sigmaMult', $('sigmaMult').value);
   refreshQuotes();
 });
 
@@ -3201,21 +3235,27 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 haircut_pct = haircut_val / 100.0 if haircut_val > 1.5 else haircut_val
                 haircut_pct = max(0.0, min(haircut_pct, 1.0))
                 try:
-                    target_pct = float(params.get("target", ["5"])[0])
+                    target_pct = float(params.get("target", ["15"])[0])
                 except ValueError:
-                    target_pct = 5.0
+                    target_pct = 15.0
                 target_pct = max(0.0, target_pct)
                 index_symbol = (params.get("index", [DEFAULT_INDEX])[0] or DEFAULT_INDEX).strip() or DEFAULT_INDEX
+                try:
+                    n_sigma = float(params.get("sigmas", ["1"])[0])
+                except ValueError:
+                    n_sigma = 1.0
+                n_sigma = max(0.1, min(n_sigma, 10.0))
                 positions = load_positions()
                 quotes = fetch_position_quotes(positions, haircut_pct=haircut_pct,
                                                profit_target_pct=target_pct,
-                                               index_symbol=index_symbol)
+                                               index_symbol=index_symbol, n_sigma=n_sigma)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "haircutPct": round(haircut_pct * 100, 2),
                     "profitTargetPct": target_pct,
                     "indexSymbol": index_symbol,
+                    "nSigma": n_sigma,
                 })
             except Exception as e:
                 self._send_json({"error": str(e)})
