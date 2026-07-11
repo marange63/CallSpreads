@@ -305,7 +305,7 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 # Data fetching & spread finding
 # ---------------------------------------------------------------------------
 
-def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, min_leg_premium=0, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0):
+def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0, min_short_leg_delta=0.08):
     if risk_free_rate is None:
         risk_free_rate = RISK_FREE_RATE_PCT / 100.0
     """
@@ -446,7 +446,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
             skipped_premium_zero = 0
             skipped_premium_high = 0
             skipped_leg_premium = 0
-            skipped_leg_premium_min = 0
+            skipped_short_leg = 0
             skipped_leverage = 0
             skipped_delta = 0
             skipped_gamma = 0
@@ -502,10 +502,6 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         if buy_leg_dollars > max_leg_premium or sell_leg_dollars > max_leg_premium:
                             skipped_leg_premium += 1
                             continue
-                    if min_leg_premium > 0:
-                        if buy_leg_dollars < min_leg_premium or sell_leg_dollars < min_leg_premium:
-                            skipped_leg_premium_min += 1
-                            continue
 
                     total_premium = net_premium * contracts
 
@@ -516,6 +512,13 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     delta_buy = bs_call_delta(spot, K1, T, risk_free_rate, iv_buy)
                     delta_sell = bs_call_delta(spot, K2, T, risk_free_rate, iv_sell)
                     net_delta = delta_buy - delta_sell
+
+                    # Short-leg moneyness floor (raw delta): the short (higher) strike must be
+                    # at least this delta — a normalized, cross-ticker way to keep it from being
+                    # a too-far-OTM / illiquid token. Independent of contract count.
+                    if min_short_leg_delta > 0 and delta_sell < min_short_leg_delta:
+                        skipped_short_leg += 1
+                        continue
 
                     gamma_buy = bs_gamma(spot, K1, T, risk_free_rate, iv_buy)
                     gamma_sell = bs_gamma(spot, K2, T, risk_free_rate, iv_sell)
@@ -638,6 +641,8 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "gammaPer1pct": round(gamma_per_1pct, 3),
                         "deltaBuy": round(delta_buy, 4),
                         "deltaSell": round(delta_sell, 4),
+                        "gammaBuy": round(gamma_buy, 5),
+                        "gammaSell": round(gamma_sell, 5),
                         "ivBuy": round(iv_buy * 100, 1),
                         "ivSell": round(iv_sell * 100, 1),
                         "pctOtmBuy": round(pct_otm_buy, 2),
@@ -653,7 +658,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "totalCommission": round(commission * contracts, 2),
                     })
 
-            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_leg_premium_min} under min leg prem, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
+            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
 
         except Exception as e:
             print(f"  Skipping {exp_date_str}: {e}")
@@ -1208,17 +1213,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  html { height: 100%; }
   body {
     font-family: var(--font);
     background: var(--bg);
     color: var(--text);
-    min-height: 100vh;
+    /* Fixed-viewport column: the top (header + form) stays locked; only the
+       results table (.table-wrapper) scrolls. */
+    height: 100vh;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   .header {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 20px 32px;
+    padding: 12px 32px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1277,43 +1289,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .controls {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 20px 32px;
+    padding: 7px 32px;
     display: flex;
     align-items: flex-end;
-    gap: 20px;
+    gap: 6px 14px;
     flex-wrap: wrap;
   }
   /* Model-inputs row: hidden until its toggle is opened. */
   .controls.collapsed { display: none; }
   /* Full-width heading that groups the fields by function (forces a flex wrap). */
+  /* Inline group markers — pills that sit before each group's fields instead of
+     each taking a full heading row, so the form stays dense. */
   .section-label {
-    flex-basis: 100%;
-    margin: 2px 0 -2px;
-    padding-top: 14px;
-    border-top: 1px solid var(--border);
-    font-size: 11px;
-    font-weight: 600;
+    align-self: flex-end;
+    margin: 0;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface2);
+    font-size: 9px;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
-    color: var(--text);
-  }
-  .section-label:first-child { border-top: none; padding-top: 0; }
-  .section-label .sub {
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
     color: var(--text-dim);
-    margin-left: 6px;
+    white-space: nowrap;
   }
+  .section-label .sub { display: none; }  /* long subtitle dropped to save space; grouping shown by the pill */
 
   .input-group {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 2px;
   }
 
   .input-group label {
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 500;
     color: var(--text-dim);
     text-transform: uppercase;
@@ -1325,10 +1335,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: 1px solid var(--border);
     color: var(--text);
     font-family: var(--mono);
-    font-size: 15px;
-    padding: 10px 14px;
-    border-radius: 6px;
-    width: 180px;
+    font-size: 13px;
+    padding: 5px 9px;
+    border-radius: 5px;
+    width: 150px;
     outline: none;
     transition: border-color 0.2s;
   }
@@ -1346,10 +1356,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: #fff;
   }
 
-  .input-group .hint {
-    font-size: 11px;
-    color: var(--text-dim);
-  }
+  /* Hints hidden to save vertical space — the same info lives in each field's
+     hover tooltip. */
+  .input-group .hint { display: none; }
 
   button.primary {
     background: var(--accent);
@@ -1402,10 +1411,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .table-wrapper {
-    padding: 0 32px 32px;
-    overflow-x: auto;
-    overflow-y: auto;
-    max-height: calc(100vh - 280px);
+    flex: 1 1 auto;
+    min-height: 0;        /* allow the flex child to shrink so it can scroll */
+    padding: 0 32px 24px;
+    overflow: auto;       /* only this region scrolls */
   }
 
   table {
@@ -1460,6 +1469,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     line-height: 1.7;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     pointer-events: none;
+    max-height: calc(100vh - 16px);   /* never taller than the viewport */
+    overflow: hidden;
   }
 
   .row-tooltip .tt-header {
@@ -1628,7 +1639,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="input-group tooltip-container">
     <label>Expirations</label>
-    <div id="expirationCheckboxes" style="display:flex;flex-direction:column;gap:4px;padding:6px 0;"></div>
+    <div id="expirationCheckboxes" style="display:grid;grid-template-columns:auto auto;gap:0 16px;padding:2px 0;font-size:12px;"></div>
     <span class="hint">Check one or more expirations</span>
     <span class="tooltip-text">3rd Friday of each month — check the expirations you want to scan, or "All" to scan everything</span>
   </div>
@@ -1683,6 +1694,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="tooltip-text">Maximum absolute dollar value (price × 100 × contracts) for either the long or short leg individually</span>
   </div>
   <div class="input-group tooltip-container">
+    <label>Min Short-Leg Delta</label>
+    <input type="number" id="minShortLegDelta" value="0.08" min="0" max="1" step="0.01">
+    <span class="hint">Short-call moneyness floor (Δ)</span>
+    <span class="tooltip-text">Minimum raw delta of the short (higher-strike) call — a normalized, cross-ticker measure of the short strike's moneyness (≈ probability of finishing ITM). Keeps the short leg from being a too-far-OTM / illiquid token; higher = short strike nearer the money (richer, upside capped sooner). Independent of contract count. Set 0 to disable. Default 0.08 ≈ an 8-delta short.</span>
+  </div>
+  <div class="input-group tooltip-container">
     <label>Min DTE</label>
     <input type="number" id="minDte" value="30" min="0" step="1">
     <span class="hint">Min days to expiration</span>
@@ -1714,7 +1731,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </select>
   </div>
 
-  <div class="section-label" style="display:flex;align-items:center;gap:16px;">
+  <div style="display:flex;align-items:flex-end;gap:12px;margin-left:auto;">
     <button type="button" class="primary" id="advancedToggle" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);" onclick="toggleAdvanced()">Model inputs ▸</button>
     <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
   </div>
@@ -1835,7 +1852,7 @@ function populateExpirations() {
   // "All" checkbox
   const allLabel = document.createElement('label');
   allLabel.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;';
-  allLabel.innerHTML = '<input type="checkbox" id="exp_all" value="all" checked style="accent-color:var(--accent);width:16px;height:16px;"> <span>All expirations</span>';
+  allLabel.innerHTML = '<input type="checkbox" id="exp_all" value="all" checked style="accent-color:var(--accent);width:13px;height:13px;vertical-align:middle;"> <span>All expirations</span>';
   container.appendChild(allLabel);
 
   // Date checkboxes
@@ -1854,7 +1871,7 @@ function populateExpirations() {
       const dte = Math.round((thirdFriday - today) / 86400000);
       const lbl = document.createElement('label');
       lbl.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;';
-      lbl.innerHTML = `<input type="checkbox" class="exp-date-cb" value="${val}" style="accent-color:var(--accent);width:16px;height:16px;"> <span>${label} (${dte}d)</span>`;
+      lbl.innerHTML = `<input type="checkbox" class="exp-date-cb" value="${val}" style="accent-color:var(--accent);width:13px;height:13px;vertical-align:middle;"> <span>${label} (${dte}d)</span>`;
       container.appendChild(lbl);
     }
     d.setMonth(d.getMonth() + 1);
@@ -1911,7 +1928,7 @@ function applyDipBuyPreset() {
 const TEMPLATE_INPUT_IDS = [
   'ticker','maxPremium','minLeverage','maxWidth','maxOtm','movePct',
   'profitTarget','riskFreeRate','minNetDelta','minGamma','minRewardRisk','commission','maxLegPremium',
-  'minDte','sortBy'
+  'minShortLegDelta','minDte','sortBy'
 ];
 
 let savedTemplates = [];  // full list from /api/templates
@@ -2051,6 +2068,7 @@ async function doSearch() {
   const minRewardRisk = parseFloat(document.getElementById('minRewardRisk').value);
   const commission = parseFloat(document.getElementById('commission').value);
   const maxLegPremium = parseFloat(document.getElementById('maxLegPremium').value);
+  const minShortLegDelta = parseFloat(document.getElementById('minShortLegDelta').value) || 0;
   const minDte = parseInt(document.getElementById('minDte').value) || 0;
   const movePct = parseFloat(document.getElementById('movePct').value) || 1.0;
   const profitTarget = parseFloat(document.getElementById('profitTarget').value) || 5.0;
@@ -2101,6 +2119,7 @@ async function doSearch() {
       min_reward_risk: minRewardRisk,
       commission: commission,
       max_leg_premium: maxLegPremium,
+      min_short_leg_delta: minShortLegDelta,
       min_dte: minDte,
       move_pct: movePct,
       profit_target_pct: profitTarget,
@@ -2291,11 +2310,16 @@ function buildPnlChart(s) {
   const cw = W - pad.l - pad.r;
   const ch = H - pad.t - pad.b;
 
-  // X range: include spot, K1, and K2 with padding
+  // X range: include spot, K1, and K2 with padding, then widen the whole
+  // horizontal range to 2x the default span (centered) for more context.
   const spot = currentSpot || K1;
   const xPad = width * 0.3;
-  const xMin = Math.min(K1, spot) - xPad;
-  const xMax = K2 + xPad;
+  const xLo = Math.min(K1, spot) - xPad;
+  const xHi = K2 + xPad;
+  const xMid = (xLo + xHi) / 2;
+  const xHalf = (xHi - xLo) / 2 * 2;   // 2x the default half-range
+  const xMin = xMid - xHalf;
+  const xMax = xMid + xHalf;
   const xScale = (v) => pad.l + (v - xMin) / (xMax - xMin) * cw;
 
   // Y range: maxLoss to maxGain with padding
@@ -2446,8 +2470,8 @@ function renderTable() {
       <td>${s.expiration}
         <div class="row-tooltip">
           <div class="tt-header">Spread Detail — ${s.expiration} (${s.dte}d) — ${c} contract${c > 1 ? 's' : ''}</div>
-          <span class="tt-buy">BUY</span>  ${s.buyStrike.toFixed(0)} call &nbsp;×${c} &nbsp;@ $${s.buyAsk.toFixed(2)} ask <span class="tt-dim">&nbsp; Vol: ${s.volume_buy.toLocaleString()} &nbsp; OI: ${s.oi_buy.toLocaleString()}</span><br>
-          <span class="tt-sell">SELL</span> ${s.sellStrike.toFixed(0)} call ×${c} &nbsp;@ $${s.sellBid.toFixed(2)} bid <span class="tt-dim">&nbsp; Vol: ${s.volume_sell.toLocaleString()} &nbsp; OI: ${s.oi_sell.toLocaleString()}</span>
+          <span class="tt-buy">BUY</span>  ${s.buyStrike.toFixed(0)} call &nbsp;×${c} &nbsp;@ $${s.buyAsk.toFixed(2)} ask <span class="tt-dim">&nbsp; &Delta; ${s.deltaBuy != null ? s.deltaBuy.toFixed(3) : '--'} &nbsp; &Gamma; ${s.gammaBuy != null ? s.gammaBuy.toFixed(4) : '--'} &nbsp; Vol: ${s.volume_buy.toLocaleString()} &nbsp; OI: ${s.oi_buy.toLocaleString()}</span><br>
+          <span class="tt-sell">SELL</span> ${s.sellStrike.toFixed(0)} call ×${c} &nbsp;@ $${s.sellBid.toFixed(2)} bid <span class="tt-dim">&nbsp; &Delta; ${s.deltaSell != null ? s.deltaSell.toFixed(3) : '--'} &nbsp; &Gamma; ${s.gammaSell != null ? s.gammaSell.toFixed(4) : '--'} &nbsp; Vol: ${s.volume_sell.toLocaleString()} &nbsp; OI: ${s.oi_sell.toLocaleString()}</span>
           <div class="tt-sep"></div>
           <span class="tt-buy">Pay:</span> &nbsp;$${buyEach} × ${c} = $${(s.buyAsk * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
           <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
@@ -2533,11 +2557,14 @@ document.addEventListener('mouseover', (e) => {
   let left = rect.left + rect.width / 2 - tipRect.width / 2;
   left = Math.max(pad, Math.min(left, window.innerWidth - tipRect.width - pad));
 
-  // Vertical: prefer above the row, flip below if clipped
+  // Vertical: prefer above the row; flip below if it would clip the top; then
+  // clamp so it never runs off the bottom (or top) of the viewport.
   let top = rect.top - tipRect.height - pad;
   if (top < pad) {
     top = rect.bottom + pad;
   }
+  top = Math.min(top, window.innerHeight - tipRect.height - pad);
+  top = Math.max(pad, top);
 
   tip.style.left = left + 'px';
   tip.style.top = top + 'px';
@@ -3270,7 +3297,7 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             commission = float(params.get("commission", [35.80])[0])
             min_dte = int(float(params.get("min_dte", [30])[0]))
             max_leg_premium = float(params.get("max_leg_premium", [20000])[0])
-            min_leg_premium = float(params.get("min_leg_premium", [0])[0])
+            min_short_leg_delta = float(params.get("min_short_leg_delta", [0.08])[0])
             symbol = params.get("symbol", ["^SPX"])[0].strip().upper()
             move_pct = float(params.get("move_pct", [1.0])[0])
             profit_target_pct = float(params.get("profit_target_pct", [5.0])[0])
@@ -3278,9 +3305,9 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
 
             try:
                 print(f"\n{'='*60}")
-                print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_leg_premium=${min_leg_premium}, move_pct={move_pct}%, expiration={expiration_filter}")
+                print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_short_leg_delta=${min_short_leg_delta}, move_pct={move_pct}%, expiration={expiration_filter}")
                 print(f"{'='*60}")
-                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, min_leg_premium, symbol, move_pct, profit_target_pct, min_gamma)
+                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
 
                 self.send_response(200)
