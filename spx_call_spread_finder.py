@@ -2616,6 +2616,11 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   .stat-sub.dim { color: var(--text-dim); }
   .stat-highlight { grid-column: span 2; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
                     border: 2px solid #fff; border-radius: 8px; padding: 6px; }
+  /* Combined scenario-risk box: own-vol ±σ, index-β ±σ, and Θ/Vega in one stat. */
+  .stat-risk { grid-column: span 2; }
+  .risk-rows { display: flex; flex-direction: column; gap: 4px; font-family: var(--mono); font-size: 14px; font-weight: 600; margin-top: 2px; }
+  .risk-rows .rrow { display: grid; grid-template-columns: 96px 1fr 1fr; gap: 10px; align-items: baseline; }
+  .risk-rows .rlbl { color: var(--text-dim); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
 
   .greek-block { display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); font-size: 12px; }
   .greek-block .lbl { color: var(--text-dim); font-size: 10px; }
@@ -2696,9 +2701,10 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
       <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
       <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
     </div>
-    <div class="stat"><div class="stat-label" id="sumDeltaLabel">Net &plusmn;1&sigma; P&amp;L (own IV)</div><div class="stat-value mono" id="sumDelta">--</div></div>
-    <div class="stat"><div class="stat-label">Net &Theta; ($/day)</div><div class="stat-value mono" id="sumTheta">--</div></div>
-    <div class="stat"><div class="stat-label">Net Vega ($/1% IV)</div><div class="stat-value mono" id="sumVega">--</div></div>
+    <div class="stat stat-risk">
+      <div class="stat-label" id="sumRiskLabel">Scenario P&amp;L (&plusmn;1&sigma;)</div>
+      <div class="risk-rows" id="sumRisk">--</div>
+    </div>
   </div>
 </div>
 
@@ -2707,15 +2713,11 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   <table id="posTable" style="display:none;">
     <thead>
       <tr>
-        <th>Label / Symbol</th>
-        <th>Expiration (DTE)</th>
-        <th>Spot</th>
-        <th>Long Leg (bid / ask / last / vol / IV)</th>
-        <th>Short Leg (bid / ask / last / vol / IV)</th>
+        <th title="Label, symbol, expiration (days to expiry) and current spot.">Position</th>
+        <th title="Both legs — L = long, S = short — with strike, then bid / ask / last / vol / IV.">Quote</th>
         <th>Contracts</th>
         <th title="Per-spread prices: net premium paid at entry (long entry − short entry) over the current liquidation (long bid − short ask).">Entry / Liq</th>
-        <th>Entry Cost</th>
-        <th>Current Value</th>
+        <th title="Total premium paid at entry (top) over the current total value / liquidation (bottom), with entry commission as subtext.">Cost / Value</th>
         <th>P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+15%)</th>
@@ -2791,6 +2793,9 @@ function updateSummary(rows) {
   const totalOneSigmaDown = withData.reduce((s, r) => s + (r.oneSigmaPnlDown || 0), 0);
   const totalTheta = withData.reduce((s, r) => s + (r.netThetaPerDay || 0), 0);
   const totalVega = withData.reduce((s, r) => s + (r.netVega || 0), 0);
+  const totalBetaUp = withData.reduce((s, r) => s + (r.betaIndexUpPnl || 0), 0);
+  const totalBetaDown = withData.reduce((s, r) => s + (r.betaIndexDownPnl || 0), 0);
+  const idxSym = (withData.find(r => r.indexSymbol) || {}).indexSymbol || '^GSPC';
 
   const setPnlText = (id, val, dp=0) => {
     const el = $(id);
@@ -2818,14 +2823,20 @@ function updateSummary(rows) {
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
   const colHdr = $('colAdjPnlLabel');
   if (colHdr) colHdr.textContent = `Adj P&L (${activeHc}%)`;
-  $('sumDeltaLabel').innerHTML = 'Net &plusmn;' + sigStr() + '&sigma; P&L (own IV)';
-  $('sumDelta').innerHTML =
-    '<span class="' + (totalOneSigmaPnl >= 0 ? 'pnl-pos' : 'pnl-neg') + '">+' + sigStr() + 'σ ' + fmtSignedDollar(totalOneSigmaPnl, 0) + '</span>'
-    + ' <span class="' + (totalOneSigmaDown >= 0 ? 'pnl-pos' : 'pnl-neg') + '">−' + sigStr() + 'σ ' + fmtSignedDollar(totalOneSigmaDown, 0) + '</span>';
-  $('sumDelta').className = 'stat-value mono';
-  $('sumTheta').textContent = fmtSignedDollar(totalTheta, 2);
-  $('sumTheta').className = 'stat-value mono ' + (totalTheta >= 0 ? 'pnl-pos' : 'pnl-neg');
-  $('sumVega').textContent = fmtSignedDollar(totalVega, 2);
+  // Combined scenario-risk box: own-vol ±σ (Greeks column) and index-β ±σ
+  // (beta column), plus the net Θ / Vega, all in one stat for the portfolio.
+  $('sumRiskLabel').innerHTML = 'Scenario P&L (&plusmn;' + sigStr() + '&sigma;)';
+  const cls = v => (v >= 0 ? 'pnl-pos' : 'pnl-neg');
+  const scen = (lbl, up, dn) =>
+    '<div class="rrow"><span class="rlbl">' + lbl + '</span>'
+    + '<span class="' + cls(up) + '">+' + sigStr() + 'σ ' + fmtSignedDollar(up, 0) + '</span>'
+    + '<span class="' + cls(dn) + '">−' + sigStr() + 'σ ' + fmtSignedDollar(dn, 0) + '</span></div>';
+  $('sumRisk').innerHTML =
+    scen('Own IV', totalOneSigmaPnl, totalOneSigmaDown)
+    + scen(idxSym + ' β', totalBetaUp, totalBetaDown)
+    + '<div class="rrow"><span class="rlbl">Θ / Vega</span>'
+      + '<span class="' + cls(totalTheta) + '">Θ ' + fmtSignedDollar(totalTheta, 2) + '/d</span>'
+      + '<span class="' + cls(totalVega) + '">V ' + fmtSignedDollar(totalVega, 2) + '/1%</span></div>';
 }
 
 async function loadPositions() {
@@ -2898,14 +2909,17 @@ function renderTable() {
   for (const p of lastQuotes) {
     const tr = document.createElement('tr');
     const dte = dteFromExp(p.expiration);
-    const legCell = (leg, strike) => {
-      if (!leg) return `<td class="err-row">missing</td>`;
+    // Both legs collapsed into one "Quote" column: long then short, one line
+    // each — side+strike, then bid / ask / last / vol / IV.
+    const legLine = (leg, side, strike) => {
+      if (!leg) return `<span><span class="strike">${side} ${strike}</span> <span class="quote err-row">missing</span></span>`;
       const ivStr = leg.iv !== null && leg.iv !== undefined ? leg.iv.toFixed(1) + '%' : '--';
-      return `<td><div class="leg-block">
-        <span class="strike">${strike}</span>
-        <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span>
-      </div></td>`;
+      return `<span><span class="strike">${side} ${strike}</span> <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span></span>`;
     };
+    const quoteCell = `<td><div class="leg-block">
+      ${legLine(p.long, 'L', p.longStrike)}
+      ${legLine(p.short, 'S', p.shortStrike)}
+    </div></td>`;
 
     // Own-vol ±1σ P&L (full BS reprice, ~30d tenor) — same engine as the β column,
     // so the two differ only by the shock source (own total vol vs β·index vol).
@@ -2992,26 +3006,32 @@ function renderTable() {
       <span class="mono">${es} <span class="tt-dim">entry</span></span>
       <span class="mono">${lq} <span class="tt-dim">liq</span></span>
     </div>`;
-    const curCell = p.currentValue !== null ? dollarFmt(p.currentValue, 0) : '--';
-    let entryCell = '--';
+    // Entry Cost and Current Value collapsed into one column: total premium paid
+    // over the current total value, with the entry commission as subtext.
+    const cv = (p.currentValue !== null && p.currentValue !== undefined) ? dollarFmt(p.currentValue, 0) : '--';
+    let costValCell = '<div class="pnl-block"><span class="dim">--</span></div>';
     if (p.entryCost !== null && p.entryCost !== undefined) {
       const entryComm = (p.entryCommission != null) ? p.entryCommission : 0;
-      entryCell = `<div class="pnl-block">
-        <span class="mono">${dollarFmt(p.entryCost, 0)}</span>
+      costValCell = `<div class="pnl-block">
+        <span class="mono">${dollarFmt(p.entryCost, 0)} <span class="tt-dim">cost</span></span>
+        <span class="mono">${cv} <span class="tt-dim">value</span></span>
         <span class="tt-dim">entry comm $${entryComm.toFixed(2)}</span>
       </div>`;
     }
 
+    // Label/Symbol, Expiration (DTE) and Spot collapsed into one "Position" cell.
+    const positionCell = `<td><div class="leg-block">
+      <span class="strike">${label}</span>
+      <span class="quote">${p.symbol} · ${p.expiration} <span class="dim">(${dte}d)</span></span>
+      <span class="quote">spot ${spotCell}</span>
+    </div></td>`;
+
     tr.innerHTML = `
-      <td><div class="leg-block"><span class="strike">${label}</span><span class="quote">${p.symbol}</span></div></td>
-      <td class="mono">${p.expiration} <span class="dim">(${dte}d)</span></td>
-      <td class="mono">${spotCell}</td>
-      ${legCell(p.long, p.longStrike)}
-      ${legCell(p.short, p.shortStrike)}
+      ${positionCell}
+      ${quoteCell}
       <td class="mono">${p.contracts}</td>
       <td class="mono">${entryLiqCell}</td>
-      <td class="mono">${entryCell}</td>
-      <td class="mono">${curCell}</td>
+      <td class="mono">${costValCell}</td>
       ${pnlCell}
       ${adjPnlCell}
       ${probCell}
@@ -3025,7 +3045,7 @@ function renderTable() {
     `;
     if (p.error) {
       const errTd = document.createElement('tr');
-      errTd.innerHTML = `<td colspan="16" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
+      errTd.innerHTML = `<td colspan="12" class="err-row dim">${p.symbol} ${p.longStrike}/${p.shortStrike}: ${p.error}</td>`;
       body.appendChild(tr);
       body.appendChild(errTd);
     } else {
