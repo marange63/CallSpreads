@@ -649,6 +649,8 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "pctOtmSell": round(pct_otm_sell, 2),
                         "rewardRisk": round(reward_risk, 2),
                         "rrPerSigma": round(rr_per_sigma, 2),
+                        "returnAtMove": round(pnl_1pct_total / total_premium * 100, 1) if total_premium else None,
+                        "oiMin": min(int(row_buy.get("openInterest", 0) or 0), int(row_sell.get("openInterest", 0) or 0)),
                         "probTarget": prob_target,
                         "volume_buy": int(row_buy.get("volume", 0) or 0),
                         "volume_sell": int(row_sell.get("volume", 0) or 0),
@@ -1801,25 +1803,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="pctOtmBuy" onclick="sortTable('pctOtmBuy')">% OTM</th>
         <th data-col="spreadWidth" onclick="sortTable('spreadWidth')">Width (pts)</th>
         <th data-col="netPremium" onclick="sortTable('netPremium')">Premium $</th>
-        <th data-col="midPremium" onclick="sortTable('midPremium')">Mid Prem $</th>
         <th data-col="maxProfit" onclick="sortTable('maxProfit')">Max Profit $</th>
         <th data-col="rewardRisk" onclick="sortTable('rewardRisk')">Reward/Risk</th>
-        <th data-col="rrPerSigma" onclick="sortTable('rrPerSigma')">R/R per &sigma;</th>
         <th data-col="leverage" onclick="sortTable('leverage')">Leverage</th>
+        <th data-col="returnAtMove" onclick="sortTable('returnAtMove')" id="rocMoveHeader" title="Return on net premium if the underlying makes the Recovery move % — the capital-efficiency of your bounce thesis.">Return @ +5%</th>
         <th data-col="probTarget" onclick="sortTable('probTarget')" id="probTargetHeader">P(+5%)</th>
         <th data-col="pnl1pct" onclick="sortTable('pnl1pct')" id="pnlMoveHeader">P&amp;L 1% $</th>
         <th data-col="pnl1sigma" onclick="sortTable('pnl1sigma')">P&amp;L 1&sigma; 1d $</th>
-        <th data-col="pnl2sigma" onclick="sortTable('pnl2sigma')">P&amp;L 2&sigma; 1d $</th>
         <th data-col="breakevenMovePct" onclick="sortTable('breakevenMovePct')">BE Move %</th>
         <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')">BE Move &sigma;</th>
-        <th data-col="netDelta" onclick="sortTable('netDelta')">Net Delta</th>
+        <th data-col="netDelta" onclick="sortTable('netDelta')" title="Position dollar delta: $ P&amp;L per 1% move in the underlying (first-order directional exposure).">$&Delta; /1%</th>
         <th data-col="netDeltaPer" onclick="sortTable('netDeltaPer')">&Delta;/Contract</th>
         <th data-col="gammaPer1pct" onclick="sortTable('gammaPer1pct')" title="Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Higher = more convex/punchy.">&Gamma; (&Delta;/1%)</th>
-        <th data-col="breakeven" onclick="sortTable('breakeven')">Breakeven</th>
-        <th data-col="ivBuy" onclick="sortTable('ivBuy')">IV Buy</th>
-        <th data-col="ivSell" onclick="sortTable('ivSell')">IV Sell</th>
-        <th data-col="oi_buy" onclick="sortTable('oi_buy')">OI Buy</th>
-        <th data-col="oi_sell" onclick="sortTable('oi_sell')">OI Sell</th>
+        <th data-col="ivBuy" onclick="sortTable('ivBuy')" title="Long-leg IV and the vertical skew (long IV − short IV).">IV / skew</th>
+        <th data-col="oiMin" onclick="sortTable('oiMin')" title="Worst-leg open interest = min(long OI, short OI) — the liquidity that gates execution.">Liq (OI)</th>
       </tr>
     </thead>
     <tbody id="resultsBody"></tbody>
@@ -2144,6 +2141,7 @@ async function doSearch() {
       const mp = Number(data.movePct);
       const label = (Number.isInteger(mp) ? mp.toFixed(0) : mp.toString()) + '%';
       document.getElementById('pnlMoveHeader').innerHTML = 'P&amp;L ' + label + ' $';
+      document.getElementById('rocMoveHeader').innerHTML = 'Return @ +' + label;
     }
     if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
       const pt = Number(data.profitTargetPct);
@@ -2488,25 +2486,20 @@ function renderTable() {
       <td class="dim">${s.pctOtmBuy.toFixed(1)}%</td>
       <td>${s.spreadWidth.toFixed(0)}</td>
       <td class="highlight">$${totalDollars}</td>
-      <td class="dim">$${(s.midPremium * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>$${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>${s.rewardRisk.toFixed(1)}x</td>
-      <td>${s.rrPerSigma.toFixed(2)}</td>
       <td class="highlight">${s.leverage.toFixed(1)}x</td>
+      <td class="highlight">${s.returnAtMove != null ? (s.returnAtMove >= 0 ? '+' : '') + s.returnAtMove + '%' : '--'}</td>
       <td>${(s.probTarget === null || s.probTarget === undefined) ? '<span class="dim">--</span>' : s.probTarget.toFixed(1) + '%'}</td>
       <td>$${(s.pnl1pct * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>$${(s.pnl1sigma * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
-      <td>$${(s.pnl2sigma * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>${s.breakevenMovePct >= 0 ? '+' : ''}${s.breakevenMovePct.toFixed(2)}%</td>
       <td>${s.breakevenMoveSigma >= 0 ? '+' : ''}${s.breakevenMoveSigma.toFixed(2)}σ</td>
-      <td>${s.netDelta.toFixed(4)}</td>
+      <td>$${(s.netDelta * (currentSpot || 0)).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>${s.netDeltaPer.toFixed(4)}</td>
       <td>${(s.gammaPer1pct >= 0 ? '+' : '') + (s.gammaPer1pct != null ? s.gammaPer1pct.toFixed(2) : '--')}</td>
-      <td>${s.breakeven.toFixed(0)}</td>
-      <td class="dim">${s.ivBuy.toFixed(1)}%</td>
-      <td class="dim">${s.ivSell.toFixed(1)}%</td>
-      <td class="dim">${s.oi_buy.toLocaleString()}</td>
-      <td class="dim">${s.oi_sell.toLocaleString()}</td>
+      <td class="dim">${s.ivBuy.toFixed(1)}% <span class="dim">(${(s.ivBuy - s.ivSell) >= 0 ? '+' : ''}${(s.ivBuy - s.ivSell).toFixed(1)})</span></td>
+      <td class="dim">${(s.oiMin != null ? s.oiMin : Math.min(s.oi_buy, s.oi_sell)).toLocaleString()}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -2516,7 +2509,7 @@ function renderTable() {
 
   if (display.length < spreads.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="22" style="text-align:center;color:var(--text-dim);padding:16px;">
+    tr.innerHTML = `<td colspan="22" style="text-align:center;color:var(--text-dim);padding:16px;"><!-- 22 cols -->
       Showing ${display.length} of ${spreads.length} results. Tighten your criteria to see fewer, more targeted spreads.
     </td>`;
     tbody.appendChild(tr);
