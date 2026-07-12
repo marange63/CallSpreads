@@ -1793,6 +1793,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="input-group">
     <label>Sort By</label>
     <select id="sortBy" onchange="applySortDropdown()">
+      <option value="score">Score (high first)</option>
       <option value="leverage">Leverage (high first)</option>
       <option value="probTarget">P(+X%) (high first)</option>
       <option value="totalPremium">Premium (low first)</option>
@@ -1857,6 +1858,44 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<style>
+  #scoreWeights { display:none; margin:0 0 8px; padding:6px 10px; background:var(--surface); border:1px solid var(--border); border-radius:8px; }
+  #scoreWeights .sw-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  #swToggle { background:transparent; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 10px; font-size:13px; font-weight:600; cursor:pointer; }
+  #swToggle:hover { border-color:var(--accent); color:var(--accent); }
+  #scoreWeights .sw-presets { display:flex; gap:6px; margin-left:auto; }
+  #scoreWeights .sw-preset { background:transparent; color:var(--text-dim); border:1px solid var(--border); border-radius:6px; padding:3px 9px; font-size:12px; cursor:pointer; }
+  #scoreWeights .sw-preset:hover { border-color:var(--accent); color:var(--accent); }
+  #swBody { display:none; margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
+  #swBody.open { display:flex; flex-wrap:wrap; gap:14px 22px; align-items:center; }
+  #scoreWeights .sw-item { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-dim); }
+  #scoreWeights .sw-item label { min-width:92px; }
+  #scoreWeights .sw-item input[type=range] { width:120px; accent-color:var(--accent); }
+  #scoreWeights .sw-item .sw-val { min-width:22px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
+  #scoreWeights .sw-oi { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-dim); }
+  #scoreWeights .sw-oi input { width:70px; }
+  #scoreWeights .sw-note { flex-basis:100%; font-size:11px; color:var(--text-dim); }
+</style>
+<div id="scoreWeights">
+  <div class="sw-head">
+    <button type="button" id="swToggle" onclick="toggleScoreWeights()">&#9881; Score weights &#9656;</button>
+    <span style="font-size:11px;color:var(--text-dim);">Drag to re-rank instantly — no new scan.</span>
+    <span class="sw-presets">
+      <button type="button" class="sw-preset" onclick="applyScorePreset('balanced')" title="Balanced default: 30 / 25 / 20 / 15 / 10.">Reset</button>
+      <button type="button" class="sw-preset" onclick="applyScorePreset('aggressive')" title="Tilt toward payoff &amp; convexity (leverage the bounce).">Aggressive</button>
+      <button type="button" class="sw-preset" onclick="applyScorePreset('conservative')" title="Tilt toward probability &amp; reward/risk (higher hit-rate).">Conservative</button>
+    </span>
+  </div>
+  <div id="swBody">
+    <div class="sw-item"><label>Return @ +X%</label><input type="range" id="sw_returnAtMove" min="0" max="50" step="1" value="30" oninput="scoreWeightsChanged()"><span class="sw-val" id="swv_returnAtMove">30</span></div>
+    <div class="sw-item"><label>P(+X%)</label><input type="range" id="sw_probTarget" min="0" max="50" step="1" value="25" oninput="scoreWeightsChanged()"><span class="sw-val" id="swv_probTarget">25</span></div>
+    <div class="sw-item"><label>&Gamma;/Prem (convexity)</label><input type="range" id="sw_gammaPrem" min="0" max="50" step="1" value="20" oninput="scoreWeightsChanged()"><span class="sw-val" id="swv_gammaPrem">20</span></div>
+    <div class="sw-item"><label>Reward/Risk</label><input type="range" id="sw_rewardRisk" min="0" max="50" step="1" value="15" oninput="scoreWeightsChanged()"><span class="sw-val" id="swv_rewardRisk">15</span></div>
+    <div class="sw-item"><label>&Theta;/Prem (less decay)</label><input type="range" id="sw_thetaPrem" min="0" max="50" step="1" value="10" oninput="scoreWeightsChanged()"><span class="sw-val" id="swv_thetaPrem">10</span></div>
+    <div class="sw-oi"><label>Liquidity target OI</label><input type="number" id="sw_oiTarget" min="0" step="50" value="500" onchange="scoreWeightsChanged()"><span title="Score is multiplied by min(1, worst-leg OI ÷ target), so thin spreads are discounted.">&#9432;</span></div>
+    <div class="sw-note">Weights are relative (auto-normalized to sum 1). Score = 100 × Σ(weightᵢ × percentile-rankᵢ) × min(1, OI÷target), ranked within this result set.</div>
+  </div>
+</div>
 <div class="table-wrapper" id="tableWrapper">
   <div class="empty-state" id="emptyState">
     <h2>Set your criteria and hit "Find Spreads"</h2>
@@ -1865,6 +1904,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <table id="resultsTable" style="display:none;">
     <thead>
       <tr>
+        <th data-col="score" onclick="sortTable('score')" title="Composite 0–100 score for risk-adjusted capital efficiency. Percentile-rank blend of Return@X%, P(+X%), Γ/Prem, Reward/Risk and Θ/Prem (weights below the form), discounted by a worst-leg liquidity gate. Ranks within the current result set. Drag the Score weights to re-rank instantly.">Score</th>
         <th data-col="expiration" onclick="sortTable('expiration')">Expiration</th>
         <th data-col="contracts" onclick="sortTable('contracts')">Contracts</th>
         <th data-col="buyStrike" onclick="sortTable('buyStrike')">Buy Strike</th>
@@ -1903,7 +1943,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 let allSpreads = [];
-let currentSort = { col: 'leverage', asc: false };
+let currentSort = { col: 'score', asc: false };
 let activeDteFilter = 'all';
 let currentSpot = null;
 let currentSymbol = '^SPX';
@@ -2282,6 +2322,8 @@ async function doSearch() {
     document.getElementById('statusBar').style.display = 'flex';
 
     allSpreads = data.spreads;
+    computeScores();
+    document.getElementById('scoreWeights').style.display = allSpreads.length ? 'block' : 'none';
     buildDteFilters();
     renderTable();
 
@@ -2373,6 +2415,119 @@ function applySortDropdown() {
   currentSort.asc = ['totalPremium', 'dte', 'pctOtmBuy'].includes(col);
   renderTable();
 }
+
+// ---- Composite Score: percentile-rank blend for risk-adjusted capital efficiency ----
+// All five metrics are framed "higher = better" (incl. thetaPrem, where a less-negative
+// decay ranks best), so every weight is positive. Ranks are within the current result set.
+const SCORE_METRICS = ['returnAtMove', 'probTarget', 'gammaPrem', 'rewardRisk', 'thetaPrem'];
+const SCORE_PRESETS = {
+  balanced:     { returnAtMove: 30, probTarget: 25, gammaPrem: 20, rewardRisk: 15, thetaPrem: 10 },
+  aggressive:   { returnAtMove: 40, probTarget: 15, gammaPrem: 25, rewardRisk: 10, thetaPrem: 10 },
+  conservative: { returnAtMove: 25, probTarget: 35, gammaPrem: 10, rewardRisk: 20, thetaPrem: 10 },
+};
+let scoreWeights = Object.assign({}, SCORE_PRESETS.balanced);
+let scoreOiTarget = 500;
+
+// Percentile rank in [0,1]; null/NaN sorts to the bottom (worst). rank 0 = worst.
+function pctRanks(vals) {
+  const n = vals.length;
+  if (n === 0) return [];
+  if (n === 1) return [1];
+  const idx = vals.map((v, i) => [i, (v == null || !isFinite(v)) ? -Infinity : v]);
+  idx.sort((a, b) => a[1] - b[1]);
+  const p = new Array(n);
+  for (let r = 0; r < n; r++) p[idx[r][0]] = r / (n - 1);
+  return p;
+}
+
+function computeScores() {
+  const n = allSpreads.length;
+  if (!n) return;
+  const ranks = {};
+  for (const mk of SCORE_METRICS) ranks[mk] = pctRanks(allSpreads.map(s => s[mk]));
+  let wsum = 0;
+  for (const mk of SCORE_METRICS) wsum += Math.max(0, scoreWeights[mk] || 0);
+  const oiTarget = scoreOiTarget > 0 ? scoreOiTarget : 1;
+  for (let i = 0; i < n; i++) {
+    const s = allSpreads[i];
+    let raw = 0;
+    if (wsum > 0) {
+      for (const mk of SCORE_METRICS) raw += (Math.max(0, scoreWeights[mk] || 0) / wsum) * ranks[mk][i];
+    }
+    const oi = (s.oiMin != null ? s.oiMin : Math.min(s.oi_buy || 0, s.oi_sell || 0)) || 0;
+    const gate = Math.min(1, oi / oiTarget);
+    s.score = Math.round(raw * gate * 1000) / 10; // 0-100, 1 decimal
+  }
+}
+
+function scoreColor(v) {
+  if (v == null) return 'var(--text-dim)';
+  if (v >= 66) return 'var(--green)';
+  if (v >= 33) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+function scoreWeightsChanged() {
+  for (const mk of SCORE_METRICS) {
+    const el = document.getElementById('sw_' + mk);
+    if (el) {
+      scoreWeights[mk] = Number(el.value);
+      const lab = document.getElementById('swv_' + mk);
+      if (lab) lab.textContent = el.value;
+    }
+  }
+  const oiEl = document.getElementById('sw_oiTarget');
+  if (oiEl) scoreOiTarget = Math.max(0, Number(oiEl.value) || 0);
+  saveScoreWeights();
+  if (allSpreads.length) { computeScores(); renderTable(); }
+}
+
+function applyScorePreset(name) {
+  const p = SCORE_PRESETS[name] || SCORE_PRESETS.balanced;
+  scoreWeights = Object.assign({}, p);
+  for (const mk of SCORE_METRICS) {
+    const el = document.getElementById('sw_' + mk); if (el) el.value = p[mk];
+    const lab = document.getElementById('swv_' + mk); if (lab) lab.textContent = p[mk];
+  }
+  scoreWeightsChanged();
+}
+
+function toggleScoreWeights() {
+  const body = document.getElementById('swBody');
+  const btn = document.getElementById('swToggle');
+  const open = body.classList.toggle('open');
+  btn.innerHTML = '&#9881; Score weights ' + (open ? '&#9662;' : '&#9656;');
+  try { localStorage.setItem('finderScoreOpen', open ? '1' : '0'); } catch (e) {}
+}
+
+function saveScoreWeights() {
+  try {
+    localStorage.setItem('finderScoreWeights', JSON.stringify(scoreWeights));
+    localStorage.setItem('finderScoreOiTarget', String(scoreOiTarget));
+  } catch (e) {}
+}
+
+function initScoreWeights() {
+  try {
+    const w = JSON.parse(localStorage.getItem('finderScoreWeights') || 'null');
+    if (w && typeof w === 'object') {
+      for (const mk of SCORE_METRICS) if (w[mk] != null && isFinite(Number(w[mk]))) scoreWeights[mk] = Number(w[mk]);
+    }
+    const oi = localStorage.getItem('finderScoreOiTarget');
+    if (oi != null && isFinite(Number(oi))) scoreOiTarget = Number(oi);
+  } catch (e) {}
+  for (const mk of SCORE_METRICS) {
+    const el = document.getElementById('sw_' + mk); if (el) el.value = scoreWeights[mk];
+    const lab = document.getElementById('swv_' + mk); if (lab) lab.textContent = scoreWeights[mk];
+  }
+  const oiEl = document.getElementById('sw_oiTarget'); if (oiEl) oiEl.value = scoreOiTarget;
+  if (localStorage.getItem('finderScoreOpen') === '1') {
+    const body = document.getElementById('swBody'); const btn = document.getElementById('swToggle');
+    if (body) body.classList.add('open');
+    if (btn) btn.innerHTML = '&#9881; Score weights &#9662;';
+  }
+}
+initScoreWeights();
 
 // Black-Scholes helpers for theoretical value curve
 function jsNormCdf(x) {
@@ -2577,6 +2732,7 @@ function renderTable() {
     const netEach = (s.netPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
     const totalDollars = (s.totalPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
     tr.innerHTML = `
+      <td class="score-cell" style="font-weight:700;color:${scoreColor(s.score)};">${s.score != null ? s.score.toFixed(0) : '--'}</td>
       <td>${s.expiration}
         <div class="row-tooltip">
           <div class="tt-header">Spread Detail — ${s.expiration} (${s.dte}d) — ${c} contract${c > 1 ? 's' : ''}</div>
@@ -2622,7 +2778,7 @@ function renderTable() {
 
   if (display.length < spreads.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="22" style="text-align:center;color:var(--text-dim);padding:16px;"><!-- 22 cols -->
+    tr.innerHTML = `<td colspan="23" style="text-align:center;color:var(--text-dim);padding:16px;"><!-- 23 cols -->
       Showing ${display.length} of ${spreads.length} results. Tighten your criteria to see fewer, more targeted spreads.
     </td>`;
     tbody.appendChild(tr);
@@ -3634,6 +3790,7 @@ try {
 // ---- plottable columns (mirror the results table) ----
 const mvLbl = (Number.isInteger(movePct) ? movePct : movePct) + '%';
 const COLS = [
+  {key:'score',        label:'Score (0-100)',      get:s=>s.score},
   {key:'leverage',     label:'Leverage (x)',       get:s=>s.leverage},
   {key:'returnAtMove', label:'Return @ +'+mvLbl,    get:s=>s.returnAtMove},
   {key:'rewardRisk',   label:'Reward/Risk',        get:s=>s.rewardRisk},
