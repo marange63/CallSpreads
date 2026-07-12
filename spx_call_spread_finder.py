@@ -1736,6 +1736,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div style="display:flex;align-items:flex-end;gap:12px;margin-left:auto;">
     <button type="button" class="primary" id="advancedToggle" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);" onclick="toggleAdvanced()">Model inputs ▸</button>
     <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
+    <button type="button" class="primary" id="scatterBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="openScatter()" title="Open a scatter plot of the current results in a new tab (pick any two columns for the axes).">&#128202; Scatter</button>
   </div>
 </div>
 <div class="controls collapsed" id="advancedFilters" style="border-top:none;padding-top:0;">
@@ -2051,6 +2052,19 @@ async function deleteSelectedTemplate() {
 }
 
 fetchTemplates();
+
+// Hand the current results to a new scatter-plot tab via localStorage (no re-fetch).
+function openScatter() {
+  if (!allSpreads || !allSpreads.length) { showError('Run a search first — no spreads to plot.'); return; }
+  const rf = parseFloat(document.getElementById('riskFreeRate').value) / 100;
+  const mp = parseFloat(document.getElementById('movePct').value) || 1;
+  const pt = parseFloat(document.getElementById('profitTarget').value) || 5;
+  const payload = { spreads: allSpreads, spot: currentSpot, symbol: currentSymbol,
+                    rfRate: rf, movePct: mp, profitTargetPct: pt, ts: Date.now() };
+  try { localStorage.setItem('finderScatterData', JSON.stringify(payload)); }
+  catch (e) { showError('Could not stash results for the scatter tab: ' + e.message); return; }
+  window.open('/scatter', '_blank');
+}
 
 async function doSearch() {
   const symbol = document.getElementById('ticker').value.trim().toUpperCase();
@@ -3262,6 +3276,378 @@ resetTimer();
 
 
 # ---------------------------------------------------------------------------
+# Scatter-plot page (/scatter) — plots the finder's last results, two columns
+# on the axes, one point per spread, with the SAME hover popup as the table.
+# Data is handed over from the finder via localStorage (no re-fetch). This page
+# is self-contained: it carries its own copy of the payoff chart + Spread Detail
+# popup so the finder's working popup is left untouched.
+# ---------------------------------------------------------------------------
+
+# Copy of the finder's payoff chart, with the risk-free rate taken from the
+# handed-over data (`rfRate`) instead of the finder's #riskFreeRate input.
+PNL_CHART_JS = r'''
+function buildPnlChart(s) {
+  const m = 100;
+  const c = s.contracts;
+  const K1 = s.buyStrike;
+  const K2 = s.sellStrike;
+  const prem = s.netPremium * m * c;
+  const totalComm = s.totalCommission;
+  const totalCost = prem + totalComm;
+  const maxProf = s.maxProfit * m;
+  const width = s.spreadWidth;
+  const maxLoss = -totalCost;
+  const maxGain = maxProf;
+  const be = s.breakeven;
+  const W = 320, H = 300;
+  const pad = {l: 55, r: 15, t: 15, b: 30};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const spot = currentSpot || K1;
+  const xPad = width * 0.3;
+  const xLo = Math.min(K1, spot) - xPad;
+  const xHi = K2 + xPad;
+  const xMid = (xLo + xHi) / 2;
+  const xHalf = (xHi - xLo) / 2 * 2;
+  const xMin = xMid - xHalf;
+  const xMax = xMid + xHalf;
+  const xScale = (v) => pad.l + (v - xMin) / (xMax - xMin) * cw;
+  const yPadding = Math.max(Math.abs(maxLoss), Math.abs(maxGain)) * 0.15;
+  const yMin = maxLoss - yPadding;
+  const yMax = maxGain + yPadding;
+  const yScale = (v) => pad.t + (1 - (v - yMin) / (yMax - yMin)) * ch;
+  const points = [
+    {x: xMin, y: maxLoss}, {x: K1, y: maxLoss}, {x: K2, y: maxGain}, {x: xMax, y: maxGain},
+  ];
+  const line = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xScale(p.x).toFixed(1)},${yScale(p.y).toFixed(1)}`).join(' ');
+  const zeroY = yScale(0).toFixed(1);
+  const lossFill = `M${xScale(xMin).toFixed(1)},${zeroY} ` +
+    points.filter(p => p.x <= be + 0.1).map(p => `L${xScale(p.x).toFixed(1)},${yScale(Math.min(p.y, 0)).toFixed(1)}`).join(' ') +
+    ` L${xScale(be).toFixed(1)},${zeroY} Z`;
+  const profFill = `M${xScale(be).toFixed(1)},${zeroY} ` +
+    `L${xScale(K2).toFixed(1)},${yScale(maxGain).toFixed(1)} ` +
+    `L${xScale(xMax).toFixed(1)},${yScale(maxGain).toFixed(1)} ` +
+    `L${xScale(xMax).toFixed(1)},${zeroY} Z`;
+  const r = rfRate;
+  const T = s.dte / 365;
+  const ivB = s.ivBuy / 100;
+  const ivS = s.ivSell / 100;
+  const nSteps = 60;
+  const theoPoints = [];
+  for (let i = 0; i <= nSteps; i++) {
+    const sx = xMin + (xMax - xMin) * i / nSteps;
+    const callBuy = jsBsCallPrice(sx, K1, T, r, ivB);
+    const callSell = jsBsCallPrice(sx, K2, T, r, ivS);
+    const spreadVal = (callBuy - callSell) * m * c;
+    const pnl = spreadVal - totalCost;
+    theoPoints.push({x: sx, y: pnl});
+  }
+  const theoLine = theoPoints.map((p, i) => `${i === 0 ? 'M' : 'L'}${xScale(p.x).toFixed(1)},${yScale(p.y).toFixed(1)}`).join(' ');
+  const spotCallBuy = jsBsCallPrice(spot, K1, T, r, ivB);
+  const spotCallSell = jsBsCallPrice(spot, K2, T, r, ivS);
+  const spotPnl = (spotCallBuy - spotCallSell) * m * c - totalCost;
+  const fmtK = (v) => v.toLocaleString('en-US', {maximumFractionDigits: 0});
+  const fmtD = (v) => (v >= 0 ? '+' : '') + '$' + Math.abs(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+  const yTicks = [maxLoss, 0, maxGain];
+  return `<svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg" style="display:block;margin-top:6px;">
+    <line x1="${pad.l}" y1="${zeroY}" x2="${W - pad.r}" y2="${zeroY}" stroke="#2e3348" stroke-width="1" stroke-dasharray="4,3"/>
+    <path d="${lossFill}" fill="rgba(248,113,113,0.15)"/>
+    <path d="${profFill}" fill="rgba(52,211,153,0.15)"/>
+    <path d="${line}" fill="none" stroke="#e4e6f0" stroke-width="1.5" stroke-opacity="0.5"/>
+    <path d="${theoLine}" fill="none" stroke="#c084fc" stroke-width="2"/>
+    <circle cx="${xScale(spot).toFixed(1)}" cy="${yScale(spotPnl).toFixed(1)}" r="3.5" fill="#c084fc"/>
+    <circle cx="${xScale(be).toFixed(1)}" cy="${zeroY}" r="3" fill="#fbbf24"/>
+    <text x="${xScale(be).toFixed(1)}" y="${parseFloat(zeroY) - 7}" text-anchor="middle" fill="#fbbf24" font-size="9" font-family="sans-serif">BE ${fmtK(be)}</text>
+    <text x="${xScale(K1).toFixed(1)}" y="${H - 5}" text-anchor="middle" fill="#8b8fa3" font-size="9" font-family="sans-serif">${fmtK(K1)}</text>
+    <text x="${xScale(K2).toFixed(1)}" y="${H - 5}" text-anchor="middle" fill="#8b8fa3" font-size="9" font-family="sans-serif">${fmtK(K2)}</text>
+    ${yTicks.map(v => `<text x="${pad.l - 5}" y="${(parseFloat(yScale(v)) + 3).toFixed(1)}" text-anchor="end" fill="${v > 0 ? '#34d399' : v < 0 ? '#f87171' : '#8b8fa3'}" font-size="9" font-family="sans-serif">${fmtD(v)}</text>`).join('')}
+    <line x1="${xScale(K1).toFixed(1)}" y1="${pad.t}" x2="${xScale(K1).toFixed(1)}" y2="${H - pad.b}" stroke="#2e3348" stroke-width="1" stroke-dasharray="2,2"/>
+    <line x1="${xScale(K2).toFixed(1)}" y1="${pad.t}" x2="${xScale(K2).toFixed(1)}" y2="${H - pad.b}" stroke="#2e3348" stroke-width="1" stroke-dasharray="2,2"/>
+    <line x1="${xScale(spot).toFixed(1)}" y1="${pad.t}" x2="${xScale(spot).toFixed(1)}" y2="${H - pad.b}" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="4,2"/>
+    <text x="${xScale(spot).toFixed(1)}" y="${H - 5}" text-anchor="middle" fill="#60a5fa" font-size="9" font-weight="600" font-family="sans-serif">${currentSymbol} ${fmtK(spot)}</text>
+    <line x1="${W - 130}" y1="8" x2="${W - 115}" y2="8" stroke="#e4e6f0" stroke-width="1.5" stroke-opacity="0.5"/>
+    <text x="${W - 112}" y="11" fill="#8b8fa3" font-size="8" font-family="sans-serif">At expiry</text>
+    <line x1="${W - 65}" y1="8" x2="${W - 50}" y2="8" stroke="#c084fc" stroke-width="2"/>
+    <text x="${W - 47}" y="11" fill="#c084fc" font-size="8" font-family="sans-serif">Now</text>
+  </svg>`;
+}
+'''
+
+# Copy of the finder's Spread Detail popup content (inner HTML only — the host
+# element already has the .row-tooltip styling).
+SPREAD_TOOLTIP_JS = r'''
+function buildSpreadTooltip(s) {
+  const m = 100, c = s.contracts;
+  const buyEach = (s.buyAsk * m).toLocaleString('en-US', {maximumFractionDigits: 0});
+  const sellEach = (s.sellBid * m).toLocaleString('en-US', {maximumFractionDigits: 0});
+  const netEach = (s.netPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
+  const totalDollars = (s.totalPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
+  return `<div class="tt-header">Spread Detail — ${s.expiration} (${s.dte}d) — ${c} contract${c > 1 ? 's' : ''}</div>
+    <span class="tt-buy">BUY</span>  ${s.buyStrike.toFixed(0)} call &nbsp;×${c} &nbsp;@ $${s.buyAsk.toFixed(2)} ask <span class="tt-dim">&nbsp; &Delta; ${s.deltaBuy != null ? s.deltaBuy.toFixed(3) : '--'} &nbsp; &Gamma; ${s.gammaBuy != null ? s.gammaBuy.toFixed(4) : '--'} &nbsp; Vol: ${s.volume_buy.toLocaleString()} &nbsp; OI: ${s.oi_buy.toLocaleString()}</span><br>
+    <span class="tt-sell">SELL</span> ${s.sellStrike.toFixed(0)} call ×${c} &nbsp;@ $${s.sellBid.toFixed(2)} bid <span class="tt-dim">&nbsp; &Delta; ${s.deltaSell != null ? s.deltaSell.toFixed(3) : '--'} &nbsp; &Gamma; ${s.gammaSell != null ? s.gammaSell.toFixed(4) : '--'} &nbsp; Vol: ${s.volume_sell.toLocaleString()} &nbsp; OI: ${s.oi_sell.toLocaleString()}</span>
+    <div class="tt-sep"></div>
+    <span class="tt-buy">Pay:</span> &nbsp;$${buyEach} × ${c} = $${(s.buyAsk * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
+    <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
+    <span class="tt-net">Net:&nbsp; $${netEach} × ${c} = $${totalDollars}</span><br>
+    <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span>
+    <div class="tt-sep"></div>
+    ${buildPnlChart(s)}`;
+}
+'''
+
+SCATTER_PAGE = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Spread Scatter</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface2: #242837; --border: #2e3348;
+    --text: #e4e6f0; --text-dim: #8b8fa3; --accent: #4f8ff7; --green: #34d399;
+    --red: #f87171; --yellow: #fbbf24;
+    --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text);
+         display: flex; flex-direction: column; overflow: hidden; }
+  .bar { background: var(--surface); border-bottom: 1px solid var(--border);
+         padding: 10px 20px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .bar h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  .bar .field { display: flex; flex-direction: column; gap: 3px; }
+  .bar label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+  .bar select { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+                font-family: var(--mono); font-size: 13px; padding: 5px 9px; border-radius: 5px; outline: none; }
+  .bar a { color: var(--accent); text-decoration: none; font-size: 13px; margin-left: auto; }
+  .bar a:hover { text-decoration: underline; }
+  .bar .meta { color: var(--text-dim); font-size: 12px; font-family: var(--mono); }
+  #plot { flex: 1 1 auto; min-height: 0; position: relative; }
+  #plot svg { display: block; }
+  .pt { cursor: pointer; transition: r 0.1s; }
+  .empty { display: flex; align-items: center; justify-content: center; height: 100%;
+           color: var(--text-dim); text-align: center; padding: 40px; }
+  .empty h2 { color: var(--text); font-weight: 600; }
+  /* --- Spread Detail popup (copied from the finder so it looks identical) --- */
+  .row-tooltip {
+    display: none; position: fixed; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 18px; z-index: 20; white-space: nowrap;
+    font-family: var(--mono); font-size: 13px; line-height: 1.7;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4); pointer-events: none;
+    max-height: calc(100vh - 16px); overflow: hidden;
+  }
+  .row-tooltip .tt-header { font-family: var(--font); font-weight: 600; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 6px; }
+  .row-tooltip .tt-buy { color: var(--green); }
+  .row-tooltip .tt-sell { color: var(--red); }
+  .row-tooltip .tt-net { color: var(--accent); font-weight: 600; }
+  .row-tooltip .tt-dim { color: var(--text-dim); }
+  .row-tooltip .tt-sep { border-top: 1px solid var(--border); margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1 id="title">Spread Scatter</h1>
+  <div class="field"><label for="xSel">X axis</label><select id="xSel"></select></div>
+  <div class="field"><label for="ySel">Y axis</label><select id="ySel"></select></div>
+  <div class="field"><label for="zSel">Color</label><select id="zSel"></select></div>
+  <span class="meta" id="meta"></span>
+  <a href="/">&larr; Back to Finder</a>
+</div>
+<div id="plot"><div class="empty" id="empty"><div><h2>No data to plot</h2>
+  <p>Run a search on the Finder, then click &ldquo;Scatter&rdquo;.</p></div></div></div>
+<div class="row-tooltip" id="tip"></div>
+<script>
+// ---- data handed over from the finder via localStorage ----
+let spreads = [], currentSpot = null, currentSymbol = '', rfRate = 0.045, movePct = 1, targetPct = 5;
+try {
+  const raw = localStorage.getItem('finderScatterData');
+  if (raw) {
+    const d = JSON.parse(raw);
+    spreads = d.spreads || [];
+    currentSpot = d.spot; currentSymbol = d.symbol || '';
+    rfRate = (d.rfRate != null ? d.rfRate : 0.045);
+    movePct = (d.movePct != null ? d.movePct : 1);
+    targetPct = (d.profitTargetPct != null ? d.profitTargetPct : 5);
+  }
+} catch (e) {}
+
+// ---- plottable columns (mirror the results table) ----
+const mvLbl = (Number.isInteger(movePct) ? movePct : movePct) + '%';
+const COLS = [
+  {key:'leverage',     label:'Leverage (x)',       get:s=>s.leverage},
+  {key:'returnAtMove', label:'Return @ +'+mvLbl,    get:s=>s.returnAtMove},
+  {key:'rewardRisk',   label:'Reward/Risk',        get:s=>s.rewardRisk},
+  {key:'probTarget',   label:'P(+'+targetPct+'%)',  get:s=>s.probTarget},
+  {key:'premium',      label:'Premium $',          get:s=>s.totalPremium*100},
+  {key:'maxProfit',    label:'Max Profit $',       get:s=>s.maxProfit*100},
+  {key:'pnlMove',      label:'P&L @'+mvLbl+' $',    get:s=>s.pnl1pct*100},
+  {key:'pnl1sigma',    label:'P&L 1σ 1d $',        get:s=>s.pnl1sigma*100},
+  {key:'beMovePct',    label:'BE Move %',          get:s=>s.breakevenMovePct},
+  {key:'beMoveSigma',  label:'BE Move σ',          get:s=>s.breakevenMoveSigma},
+  {key:'dollarDelta',  label:'$Δ /1%',             get:s=>s.netDelta*(currentSpot||0)},
+  {key:'netDeltaPer',  label:'Δ/Contract',         get:s=>s.netDeltaPer},
+  {key:'gammaPer1pct', label:'Γ (Δ/1%)',           get:s=>s.gammaPer1pct},
+  {key:'ivBuy',        label:'IV long %',          get:s=>s.ivBuy},
+  {key:'oiMin',        label:'Liq (min OI)',       get:s=>s.oiMin != null ? s.oiMin : Math.min(s.oi_buy, s.oi_sell)},
+  {key:'dte',          label:'DTE',                get:s=>s.dte},
+  {key:'pctOtmBuy',    label:'% OTM',              get:s=>s.pctOtmBuy},
+  {key:'spreadWidth',  label:'Width (pts)',        get:s=>s.spreadWidth},
+  {key:'buyStrike',    label:'Buy Strike',         get:s=>s.buyStrike},
+  {key:'sellStrike',   label:'Sell Strike',        get:s=>s.sellStrike},
+  {key:'contracts',    label:'Contracts',          get:s=>s.contracts},
+];
+const colByKey = {};
+COLS.forEach(c => colByKey[c.key] = c);
+
+// ---- BS helpers + payoff chart + popup (self-contained copy of the finder's) ----
+function jsNormCdf(x) {
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.sqrt(2);
+  const t = 1.0 / (1.0 + p * x);
+  const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t * Math.exp(-x*x);
+  return 0.5 * (1.0 + sign * y);
+}
+function jsBsCallPrice(S, K, T, r, sigma) {
+  if (T <= 0) return Math.max(S - K, 0);
+  if (sigma <= 0) return Math.max(S - K * Math.exp(-r * T), 0);
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  return S * jsNormCdf(d1) - K * Math.exp(-r * T) * jsNormCdf(d2);
+}
+__PNL_CHART__
+__SPREAD_TOOLTIP__
+
+// ---- scatter rendering ----
+const NF = (v, d=0) => (v==null||isNaN(v)) ? '--' : Number(v).toLocaleString('en-US', {maximumFractionDigits: d});
+function niceRange(vals) {
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.06;
+  return [lo - pad, hi + pad];
+}
+function render() {
+  const plot = document.getElementById('plot');
+  const empty = document.getElementById('empty');
+  if (!spreads.length) { empty.style.display = 'flex'; return; }
+  empty.style.display = 'none';
+  const xc = colByKey[document.getElementById('xSel').value];
+  const yc = colByKey[document.getElementById('ySel').value];
+  const pts = spreads.map(s => ({s, x: xc.get(s), y: yc.get(s)}))
+                     .filter(p => p.x != null && p.y != null && isFinite(p.x) && isFinite(p.y));
+  const W = plot.clientWidth, H = plot.clientHeight;
+  const pad = {l: 72, r: 24, t: 20, b: 46};
+  const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
+  const [xLo, xHi] = niceRange(pts.map(p => p.x));
+  const [yLo, yHi] = niceRange(pts.map(p => p.y));
+  const xS = v => pad.l + (v - xLo) / (xHi - xLo) * cw;
+  const yS = v => pad.t + (1 - (v - yLo) / (yHi - yLo)) * ch;
+  // Third axis = point color. Expiration keeps the DTE gradient; any numeric
+  // dimension is split into thirds of its range: low=red, mid=yellow, high=green.
+  const zKey = document.getElementById('zSel').value;
+  let colorFor, legendText;
+  if (zKey === '__dte__') {
+    const dtes = pts.map(p => p.s.dte);
+    const dLo = Math.min(...dtes), dHi = Math.max(...dtes);
+    colorFor = s => { const t = dHi > dLo ? (s.dte - dLo) / (dHi - dLo) : 0; return 'hsl(' + (210 + 90*t).toFixed(0) + ', 72%, 60%)'; };
+    legendText = 'color = DTE (' + dLo + 'd → ' + dHi + 'd)';
+  } else {
+    const zc = colByKey[zKey];
+    const zv = pts.map(p => zc.get(p.s)).filter(v => v != null && isFinite(v));
+    const zLo = Math.min(...zv), zHi = Math.max(...zv);
+    colorFor = s => {
+      const v = zc.get(s);
+      if (v == null || !isFinite(v) || zHi === zLo) return '#fbbf24';
+      const t = (v - zLo) / (zHi - zLo);
+      return t < 1/3 ? '#f87171' : t < 2/3 ? '#fbbf24' : '#34d399';
+    };
+    legendText = 'color = ' + zc.label + '  (red low · yellow mid · green high)';
+  }
+  const tick = (lo, hi, sc, axis) => {
+    let out = '';
+    for (let i = 0; i <= 4; i++) {
+      const v = lo + (hi - lo) * i / 4;
+      if (axis === 'x') { const x = sc(v); out += '<line x1="'+x+'" y1="'+pad.t+'" x2="'+x+'" y2="'+(pad.t+ch)+'" stroke="#242837"/>'
+        + '<text x="'+x+'" y="'+(pad.t+ch+16)+'" text-anchor="middle" fill="#8b8fa3" font-size="10">'+NF(v, Math.abs(hi-lo)<10?2:0)+'</text>'; }
+      else { const y = sc(v); out += '<line x1="'+pad.l+'" y1="'+y+'" x2="'+(pad.l+cw)+'" y2="'+y+'" stroke="#242837"/>'
+        + '<text x="'+(pad.l-8)+'" y="'+(y+3)+'" text-anchor="end" fill="#8b8fa3" font-size="10">'+NF(v, Math.abs(hi-lo)<10?2:0)+'</text>'; }
+    }
+    return out;
+  };
+  const circles = pts.map((p, i) =>
+    '<circle class="pt" data-i="'+spreads.indexOf(p.s)+'" cx="'+xS(p.x).toFixed(1)+'" cy="'+yS(p.y).toFixed(1)+'" r="5" fill="'+colorFor(p.s)+'" fill-opacity="0.75" stroke="#0f1117" stroke-width="0.5"/>'
+  ).join('');
+  plot.querySelectorAll('svg').forEach(el => el.remove());
+  const svg = '<svg width="'+W+'" height="'+H+'">'
+    + tick(xLo, xHi, xS, 'x') + tick(yLo, yHi, yS, 'y')
+    + '<text x="'+(pad.l+cw/2)+'" y="'+(H-8)+'" text-anchor="middle" fill="#e4e6f0" font-size="12" font-weight="600">'+xc.label+'</text>'
+    + '<text transform="translate(16,'+(pad.t+ch/2)+') rotate(-90)" text-anchor="middle" fill="#e4e6f0" font-size="12" font-weight="600">'+yc.label+'</text>'
+    + '<text x="'+(pad.l+cw)+'" y="'+(pad.t+2)+'" text-anchor="end" fill="#8b8fa3" font-size="10">'+legendText+'</text>'
+    + circles + '</svg>';
+  plot.insertAdjacentHTML('beforeend', svg);
+}
+
+// ---- hover popup (single shared tooltip, positioned near the mouse) ----
+const tip = document.getElementById('tip');
+function positionTip(clientX, clientY) {
+  const pad = 12;
+  const r = tip.getBoundingClientRect();
+  let left = clientX + 16;
+  left = Math.max(pad, Math.min(left, window.innerWidth - r.width - pad));
+  let top = clientY + 16;
+  top = Math.min(top, window.innerHeight - r.height - pad);
+  top = Math.max(pad, top);
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+document.getElementById('plot').addEventListener('mouseover', (e) => {
+  if (!e.target.classList || !e.target.classList.contains('pt')) return;
+  const i = parseInt(e.target.dataset.i, 10);
+  const s = spreads[i];
+  if (!s) return;
+  e.target.setAttribute('r', '7');
+  tip.innerHTML = buildSpreadTooltip(s);
+  tip.style.display = 'block';
+  positionTip(e.clientX, e.clientY);
+});
+document.getElementById('plot').addEventListener('mousemove', (e) => {
+  if (tip.style.display === 'block') positionTip(e.clientX, e.clientY);
+});
+document.getElementById('plot').addEventListener('mouseout', (e) => {
+  if (e.target.classList && e.target.classList.contains('pt')) {
+    e.target.setAttribute('r', '5');
+    tip.style.display = 'none';
+  }
+});
+
+// ---- init ----
+function initSelects() {
+  const x = document.getElementById('xSel'), y = document.getElementById('ySel'), z = document.getElementById('zSel');
+  z.insertAdjacentHTML('beforeend', '<option value="__dte__">Expiration (DTE)</option>');
+  COLS.forEach(c => {
+    x.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
+    y.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
+    z.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
+  });
+  x.value = 'leverage'; y.value = 'returnAtMove'; z.value = '__dte__';
+  x.addEventListener('change', render);
+  y.addEventListener('change', render);
+  z.addEventListener('change', render);
+}
+document.getElementById('title').textContent = 'Spread Scatter' + (currentSymbol ? ' — ' + currentSymbol : '');
+document.getElementById('meta').textContent = spreads.length ? (spreads.length + ' spreads' + (currentSpot ? ' · spot ' + currentSpot : '')) : '';
+initSelects();
+render();
+window.addEventListener('resize', render);
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
 
@@ -3319,6 +3705,15 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(POSITIONS_PAGE.encode("utf-8"))
+
+        elif parsed.path == "/scatter":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            page = (SCATTER_PAGE
+                    .replace("__PNL_CHART__", PNL_CHART_JS)
+                    .replace("__SPREAD_TOOLTIP__", SPREAD_TOOLTIP_JS))
+            self.wfile.write(page.encode("utf-8"))
 
         elif parsed.path == "/api/positions":
             self._send_json(load_positions())
