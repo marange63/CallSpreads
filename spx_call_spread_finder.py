@@ -305,7 +305,43 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 # Data fetching & spread finding
 # ---------------------------------------------------------------------------
 
-def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0, min_short_leg_delta=0.08):
+# Test-mode option-chain cache — when Test mode is toggled on in the UI, each
+# underlying's option chain and expiration list are fetched once and reused, so
+# repeated searches against a static (after-hours) market don't re-hit Yahoo or
+# trip its rate limits. In-memory; emptied via the "Clear cache" button.
+_TEST_CHAIN_CACHE = {}   # (symbol, exp) -> option_chain result
+_TEST_EXP_CACHE = {}     # symbol -> expirations tuple
+
+
+def get_option_chain(ticker, symbol, exp, test_mode=False):
+    if test_mode:
+        key = (symbol, exp)
+        oc = _TEST_CHAIN_CACHE.get(key)
+        if oc is None:
+            oc = ticker.option_chain(exp)
+            _TEST_CHAIN_CACHE[key] = oc
+        return oc
+    return ticker.option_chain(exp)
+
+
+def get_expirations(ticker, symbol, test_mode=False):
+    if test_mode:
+        exps = _TEST_EXP_CACHE.get(symbol)
+        if exps is None:
+            exps = ticker.options
+            _TEST_EXP_CACHE[symbol] = exps
+        return exps
+    return ticker.options
+
+
+def clear_test_cache():
+    n = len(_TEST_CHAIN_CACHE) + len(_TEST_EXP_CACHE)
+    _TEST_CHAIN_CACHE.clear()
+    _TEST_EXP_CACHE.clear()
+    return n
+
+
+def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0, min_short_leg_delta=0.08, min_return_1sigma=0.0, test_mode=False):
     if risk_free_rate is None:
         risk_free_rate = RISK_FREE_RATE_PCT / 100.0
     """
@@ -322,7 +358,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
     spot = float(info["Close"].iloc[-1])
 
     # Get all expiration dates
-    expirations = ticker.options
+    expirations = get_expirations(ticker, symbol, test_mode)
     if not expirations:
         raise ValueError("No option expiration dates available.")
 
@@ -365,10 +401,10 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
     atm_iv = None
     near_atm_exp = None
     try:
-        all_exps = ticker.options
+        all_exps = get_expirations(ticker, symbol, test_mode)
         if all_exps:
             near_atm_exp = all_exps[0]
-            nc = ticker.option_chain(near_atm_exp).calls
+            nc = get_option_chain(ticker, symbol, near_atm_exp, test_mode).calls
             nc = nc[nc["impliedVolatility"] > 0]
             if not nc.empty:
                 idx = (nc["strike"] - spot).abs().idxmin()
@@ -400,7 +436,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                 continue
             T = dte / 365.0
 
-            chain = ticker.option_chain(exp_date_str)
+            chain = get_option_chain(ticker, symbol, exp_date_str, test_mode)
             calls = chain.calls
 
             if calls.empty:
@@ -450,6 +486,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
             skipped_leverage = 0
             skipped_delta = 0
             skipped_gamma = 0
+            skipped_ret1s = 0
             skipped_rr = 0
             found = 0
 
@@ -524,6 +561,10 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     gamma_sell = bs_gamma(spot, K2, T, risk_free_rate, iv_sell)
                     net_gamma = gamma_buy - gamma_sell
 
+                    theta_buy = bs_call_theta(spot, K1, T, risk_free_rate, iv_buy)
+                    theta_sell = bs_call_theta(spot, K2, T, risk_free_rate, iv_sell)
+                    net_theta = theta_buy - theta_sell  # annualized, per share
+
                     # 2nd-order P&L for a 1% move (per contract): delta*ΔS + ½*gamma*ΔS²
                     move_frac = move_pct / 100.0
                     ds_1 = spot * move_frac
@@ -536,9 +577,16 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         pnl_1sigma_per = net_delta * one_sigma_dS + 0.5 * net_gamma * one_sigma_dS * one_sigma_dS
                         two_sigma_dS = 2 * one_sigma_dS
                         pnl_2sigma_per = net_delta * two_sigma_dS + 0.5 * net_gamma * two_sigma_dS * two_sigma_dS
+                        # Per-premium greek contributions over a 1-day / 1σ move (% of premium),
+                        # on a shared basis so they're comparable and additive:
+                        #   deltaPrem + gammaPrem == return1sigma ; thetaPrem = one day's decay.
+                        delta_prem = net_delta * one_sigma_dS / net_premium * 100
+                        gamma_prem = 0.5 * net_gamma * one_sigma_dS * one_sigma_dS / net_premium * 100
+                        theta_prem = (net_theta / 365.0) / net_premium * 100
                     else:
                         pnl_1sigma_per = 0.0
                         pnl_2sigma_per = 0.0
+                        delta_prem = gamma_prem = theta_prem = None
 
                     # Leverage: normalized to a 1% move so it stays comparable regardless of move_pct.
                     leverage = (pnl_1pct_per / net_premium) / move_frac if net_premium > 0 and move_frac > 0 else 0
@@ -560,6 +608,13 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     gamma_per_1pct = net_gamma * (spot * 0.01) * contracts
                     if gamma_per_1pct < min_gamma:
                         skipped_gamma += 1
+                        continue
+
+                    # Return on a +1σ one-day move, as a % of premium paid (the
+                    # "Return 1σ 1d %" column). Per-contract ratio, size-independent.
+                    return_1sigma = (pnl_1sigma_per / net_premium * 100) if net_premium > 0 else 0
+                    if return_1sigma < min_return_1sigma:
+                        skipped_ret1s += 1
                         continue
 
                     # Max profit & other metrics (per contract in quoted points)
@@ -650,6 +705,10 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "rewardRisk": round(reward_risk, 2),
                         "rrPerSigma": round(rr_per_sigma, 2),
                         "returnAtMove": round(pnl_1pct_total / total_premium * 100, 1) if total_premium else None,
+                        "return1sigma": round(pnl_1sigma_total / total_premium * 100, 1) if total_premium else None,
+                        "deltaPrem": round(delta_prem, 1) if delta_prem is not None else None,
+                        "gammaPrem": round(gamma_prem, 1) if gamma_prem is not None else None,
+                        "thetaPrem": round(theta_prem, 1) if theta_prem is not None else None,
                         "oiMin": min(int(row_buy.get("openInterest", 0) or 0), int(row_sell.get("openInterest", 0) or 0)),
                         "probTarget": prob_target,
                         "volume_buy": int(row_buy.get("volume", 0) or 0),
@@ -660,7 +719,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "totalCommission": round(commission * contracts, 2),
                     })
 
-            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
+            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_ret1s} under min 1σ return, {skipped_rr} under min R/R")
 
         except Exception as e:
             print(f"  Skipping {exp_date_str}: {e}")
@@ -787,7 +846,7 @@ def get_betas(symbols, index_symbol):
     return {s: betas.get(s, 1.0) for s in wanted}
 
 
-def get_index_sigma_1d(index_symbol):
+def get_index_sigma_1d(index_symbol, test_mode=False):
     """Return (sigma_1d, annual_iv_pct): the index's option-implied one-day return
     sigma and the annualized IV it came from. Prefers the mapped volatility index
     (e.g. ^GSPC -> ^VIX) as a single quote; falls back to the index's own ATM
@@ -804,9 +863,9 @@ def get_index_sigma_1d(index_symbol):
     if annual_iv is None:
         try:
             tk = yf.Ticker(index_symbol)
-            exps = tk.options
+            exps = get_expirations(tk, index_symbol, test_mode)
             if exps:
-                oc = tk.option_chain(exps[0])
+                oc = get_option_chain(tk, index_symbol, exps[0], test_mode)
                 spot = _underlying_spot_and_time(oc, tk)[0]
                 valid = oc.calls[oc.calls["impliedVolatility"] > 0]
                 if spot and not valid.empty:
@@ -819,19 +878,19 @@ def get_index_sigma_1d(index_symbol):
     return annual_iv * math.sqrt(1.0 / TRADING_DAYS), round(annual_iv * 100, 2)
 
 
-def get_atm_iv_30d(symbol, target_days=30):
+def get_atm_iv_30d(symbol, target_days=30, test_mode=False):
     """~30-day constant-maturity ATM implied vol (annualized fraction) for a
     symbol. Picks the listed expiration nearest target_days and reads the ATM
     IV (nearest-to-spot strike). Used to put the own-vol 1σ shock on the same
     ~30-day tenor as the index's VIX-based 1σ. Returns None if unavailable."""
     try:
         tk = yf.Ticker(symbol)
-        exps = tk.options
+        exps = get_expirations(tk, symbol, test_mode)
         if not exps:
             return None
         now = datetime.now()
         best = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - now).days - target_days))
-        oc = tk.option_chain(best)
+        oc = get_option_chain(tk, symbol, best, test_mode)
         spot = _underlying_spot_and_time(oc, tk)[0]
         valid = oc.calls[oc.calls["impliedVolatility"] > 0]
         if spot and not valid.empty:
@@ -946,7 +1005,7 @@ def _underlying_spot_and_time(oc, tk):
 
 
 def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
-                          index_symbol=DEFAULT_INDEX, n_sigma=1.0):
+                          index_symbol=DEFAULT_INDEX, n_sigma=1.0, test_mode=False):
     """Fetch live leg data for every saved position, batching chain calls.
 
     haircut_pct: multiplier applied to (raw P&L − entry commission − exit commission)
@@ -968,7 +1027,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
     # for the whole batch — not per position and not on the hot per-refresh path.
     index_symbol = (index_symbol or DEFAULT_INDEX).strip() or DEFAULT_INDEX
     betas = get_betas([p["symbol"] for p in positions], index_symbol)
-    index_sigma_1d, index_iv_pct = get_index_sigma_1d(index_symbol)
+    index_sigma_1d, index_iv_pct = get_index_sigma_1d(index_symbol, test_mode)
 
     for p in positions:
         symbol = p["symbol"]
@@ -1025,7 +1084,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
             key = (symbol, exp)
             if key not in chain_cache:
                 tk = yf.Ticker(symbol)
-                oc = tk.option_chain(exp)
+                oc = get_option_chain(tk, symbol, exp, test_mode)
                 chain_cache[key] = oc.calls
                 if symbol not in spot_cache:
                     # Spot from the chain's own underlying snapshot => time-aligned
@@ -1111,7 +1170,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                     # taken at a ~30-day tenor to match the index's VIX-based 1σ. Falls
                     # back to this expiration's ATM IV, then the leg-IV average.
                     if symbol not in iv30_cache:
-                        iv30_cache[symbol] = get_atm_iv_30d(symbol)
+                        iv30_cache[symbol] = get_atm_iv_30d(symbol, test_mode=test_mode)
                     sigma_own = iv30_cache[symbol] or (atm_iv if atm_iv and atm_iv > 0 else (iv_l + iv_s) / 2.0)
                     one_sigma_dS = spot * sigma_own * math.sqrt(1 / 252) * n_sigma
                     up_own, dn_own = spread_shock_pnl(spot, one_sigma_dS, K1, K2, T, r, iv_l, iv_s, contracts)
@@ -1468,7 +1527,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     white-space: nowrap;
     font-family: var(--mono);
     font-size: 13px;
-    line-height: 1.7;
+    line-height: 1.45;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     pointer-events: none;
     max-height: calc(100vh - 16px);   /* never taller than the viewport */
@@ -1623,8 +1682,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <h1>Call Spread Finder <span class="tag">LIVE</span></h1>
+  <h1>Call Spread Finder <span class="tag" id="modeTag">LIVE</span></h1>
   <a href="/positions" target="_blank" class="positions-link">My Positions &rarr;</a>
+  <label id="testToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so repeated searches (e.g. after hours) don't re-fetch from Yahoo. Data stays frozen until you Clear cache or turn Test off.">
+    <input type="checkbox" id="testMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
+  </label>
+  <button type="button" id="clearCacheBtn" class="primary" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);padding:5px 10px;font-size:12px;font-weight:500;" onclick="clearChainCache()">Clear cache</button>
   <div class="spot-display">
     <span class="label" id="spotLabel">SPX Last:</span>
     <span id="spotPrice">--</span>
@@ -1658,6 +1721,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <input type="number" id="minLeverage" value="2" min="0.1" step="0.5">
     <span class="hint">Profit / premium for 1% move</span>
     <span class="tooltip-text">Minimum ratio of dollar profit from a 1% up move to premium paid — your P&amp;L per 1% recovery, per dollar risked.</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min Return 1&sigma; (%)</label>
+    <input type="number" id="minReturn1sigma" value="0" step="5">
+    <span class="hint">Return on a 1-day 1&sigma; move</span>
+    <span class="tooltip-text">Minimum "Return 1&sigma; 1d %" — the P&amp;L for a +1&sigma; one-day move in the underlying, as a % of premium paid. Screens for spreads that pop meaningfully on a normal daily move. Set 0 to disable.</span>
   </div>
   <div class="input-group tooltip-container">
     <label>Min Reward/Risk</label>
@@ -1797,7 +1866,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <thead>
       <tr>
         <th data-col="expiration" onclick="sortTable('expiration')">Expiration</th>
-        <th data-col="dte" onclick="sortTable('dte')">DTE</th>
         <th data-col="contracts" onclick="sortTable('contracts')">Contracts</th>
         <th data-col="buyStrike" onclick="sortTable('buyStrike')">Buy Strike</th>
         <th data-col="sellStrike" onclick="sortTable('sellStrike')">Sell Strike</th>
@@ -1809,14 +1877,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="leverage" onclick="sortTable('leverage')">Leverage</th>
         <th data-col="returnAtMove" onclick="sortTable('returnAtMove')" id="rocMoveHeader" title="Return on net premium if the underlying makes the Recovery move % — the capital-efficiency of your bounce thesis.">Return @ +5%</th>
         <th data-col="probTarget" onclick="sortTable('probTarget')" id="probTargetHeader">P(+5%)</th>
-        <th data-col="pnl1pct" onclick="sortTable('pnl1pct')" id="pnlMoveHeader">P&amp;L 1% $</th>
-        <th data-col="pnl1sigma" onclick="sortTable('pnl1sigma')">P&amp;L 1&sigma; 1d $</th>
+        <th data-col="return1sigma" onclick="sortTable('return1sigma')" title="P&amp;L for a +1&sigma; one-day move in the underlying, as a % return on the premium paid.">Return 1&sigma; 1d %</th>
         <th data-col="breakevenMovePct" onclick="sortTable('breakevenMovePct')">BE Move %</th>
         <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')">BE Move &sigma;</th>
         <th data-col="netDelta" onclick="sortTable('netDelta')" title="Position dollar delta: $ P&amp;L per 1% move in the underlying (first-order directional exposure).">$&Delta; /1%</th>
         <th data-col="netDeltaPer" onclick="sortTable('netDeltaPer')">&Delta;/Contract</th>
         <th data-col="gammaPer1pct" onclick="sortTable('gammaPer1pct')" title="Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Higher = more convex/punchy.">&Gamma; (&Delta;/1%)</th>
-        <th data-col="ivBuy" onclick="sortTable('ivBuy')" title="Long-leg IV and the vertical skew (long IV − short IV).">IV / skew</th>
+        <th data-col="deltaPrem" onclick="sortTable('deltaPrem')" title="Delta contribution to a +1&sigma; one-day move, as a % of premium paid. On the same 1-day/1&sigma; basis as &Gamma;/Prem and &Theta;/Prem; &Delta;/Prem + &Gamma;/Prem = Return 1&sigma;.">&Delta;/Prem %</th>
+        <th data-col="gammaPrem" onclick="sortTable('gammaPrem')" title="Gamma (convexity) contribution to a +1&sigma; one-day move, as a % of premium paid. Same 1-day/1&sigma; basis as &Delta;/Prem and &Theta;/Prem.">&Gamma;/Prem %</th>
+        <th data-col="thetaPrem" onclick="sortTable('thetaPrem')" title="One day's time decay as a % of premium paid (usually negative for a debit spread). Same per-premium, 1-day basis as &Delta;/Prem and &Gamma;/Prem.">&Theta;/Prem %</th>
         <th data-col="oiMin" onclick="sortTable('oiMin')" title="Worst-leg open interest = min(long OI, short OI) — the liquidity that gates execution.">Liq (OI)</th>
       </tr>
     </thead>
@@ -1924,7 +1993,7 @@ function applyDipBuyPreset() {
 
 // Input IDs to capture in a template (order matters for restoring)
 const TEMPLATE_INPUT_IDS = [
-  'ticker','maxPremium','minLeverage','maxWidth','maxOtm','movePct',
+  'ticker','maxPremium','minLeverage','minReturn1sigma','maxWidth','maxOtm','movePct',
   'profitTarget','riskFreeRate','minNetDelta','minGamma','minRewardRisk','commission','maxLegPremium',
   'minShortLegDelta','minDte','sortBy'
 ];
@@ -2053,6 +2122,33 @@ async function deleteSelectedTemplate() {
 
 fetchTemplates();
 
+// ---- Test mode: cache each underlying's option chain so repeated searches
+// (e.g. after hours) don't re-fetch from Yahoo. Toggle is sent as ?test=1. ----
+function updateModeTag() {
+  const t = document.getElementById('testMode').checked;
+  const tag = document.getElementById('modeTag');
+  tag.textContent = t ? 'TEST · cached' : 'LIVE';
+  tag.style.background = t ? 'var(--yellow)' : 'var(--accent)';
+  tag.style.color = t ? '#0f1117' : '#fff';
+}
+function clearChainCache() {
+  fetch('/api/clear_cache').then(r => r.json()).then(d => {
+    const btn = document.getElementById('clearCacheBtn');
+    const old = btn.textContent;
+    btn.textContent = 'Cleared (' + (d.cleared || 0) + ')';
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  }).catch(() => {});
+}
+(function initTestMode() {
+  const cb = document.getElementById('testMode');
+  if (localStorage.getItem('finderTestMode') === '1') cb.checked = true;
+  updateModeTag();
+  cb.addEventListener('change', () => {
+    localStorage.setItem('finderTestMode', cb.checked ? '1' : '0');
+    updateModeTag();
+  });
+})();
+
 // Hand the current results to a new scatter-plot tab via localStorage (no re-fetch).
 function openScatter() {
   if (!allSpreads || !allSpreads.length) { showError('Run a search first — no spreads to plot.'); return; }
@@ -2071,6 +2167,7 @@ async function doSearch() {
   if (!symbol) { showError('Please enter a ticker symbol.'); return; }
   const maxPremiumDollars = parseFloat(document.getElementById('maxPremium').value);
   const minLeverage = parseFloat(document.getElementById('minLeverage').value);
+  const minReturn1sigma = parseFloat(document.getElementById('minReturn1sigma').value) || 0;
   const maxWidth = parseFloat(document.getElementById('maxWidth').value);
   const maxOtm = parseFloat(document.getElementById('maxOtm').value);
   const riskFreeRate = parseFloat(document.getElementById('riskFreeRate').value) / 100;
@@ -2122,6 +2219,7 @@ async function doSearch() {
       min_premium: minPremium,
       max_premium: maxPremium,
       min_leverage: minLeverage,
+      min_return_1sigma: minReturn1sigma,
       max_width: maxWidth,
       max_otm: maxOtm,
       risk_free_rate: riskFreeRate,
@@ -2134,7 +2232,8 @@ async function doSearch() {
       min_dte: minDte,
       move_pct: movePct,
       profit_target_pct: profitTarget,
-      expiration: expiration
+      expiration: expiration,
+      test: (document.getElementById('testMode').checked ? 1 : 0)
     });
 
     const resp = await fetch(`/api/spreads?${params}`);
@@ -2154,7 +2253,6 @@ async function doSearch() {
     if (data.movePct !== undefined && data.movePct !== null) {
       const mp = Number(data.movePct);
       const label = (Number.isInteger(mp) ? mp.toFixed(0) : mp.toString()) + '%';
-      document.getElementById('pnlMoveHeader').innerHTML = 'P&amp;L ' + label + ' $';
       document.getElementById('rocMoveHeader').innerHTML = 'Return @ +' + label;
     }
     if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
@@ -2488,12 +2586,12 @@ function renderTable() {
           <span class="tt-buy">Pay:</span> &nbsp;$${buyEach} × ${c} = $${(s.buyAsk * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
           <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
           <span class="tt-net">Net:&nbsp; $${netEach} × ${c} = $${totalDollars}</span><br>
-          <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span>
+          <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span><br>
+          <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x
           <div class="tt-sep"></div>
           ${buildPnlChart(s)}
         </div>
       </td>
-      <td>${s.dte}</td>
       <td>${c}</td>
       <td>${s.buyStrike.toFixed(0)}</td>
       <td>${s.sellStrike.toFixed(0)}</td>
@@ -2505,14 +2603,15 @@ function renderTable() {
       <td class="highlight">${s.leverage.toFixed(1)}x</td>
       <td class="highlight">${s.returnAtMove != null ? (s.returnAtMove >= 0 ? '+' : '') + s.returnAtMove + '%' : '--'}</td>
       <td>${(s.probTarget === null || s.probTarget === undefined) ? '<span class="dim">--</span>' : s.probTarget.toFixed(1) + '%'}</td>
-      <td>$${(s.pnl1pct * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
-      <td>$${(s.pnl1sigma * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
+      <td>${s.return1sigma != null ? (s.return1sigma >= 0 ? '+' : '') + s.return1sigma + '%' : '--'}</td>
       <td>${s.breakevenMovePct >= 0 ? '+' : ''}${s.breakevenMovePct.toFixed(2)}%</td>
       <td>${s.breakevenMoveSigma >= 0 ? '+' : ''}${s.breakevenMoveSigma.toFixed(2)}σ</td>
       <td>$${(s.netDelta * (currentSpot || 0)).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>${s.netDeltaPer.toFixed(4)}</td>
       <td>${(s.gammaPer1pct >= 0 ? '+' : '') + (s.gammaPer1pct != null ? s.gammaPer1pct.toFixed(2) : '--')}</td>
-      <td class="dim">${s.ivBuy.toFixed(1)}% <span class="dim">(${(s.ivBuy - s.ivSell) >= 0 ? '+' : ''}${(s.ivBuy - s.ivSell).toFixed(1)})</span></td>
+      <td>${s.deltaPrem != null ? (s.deltaPrem >= 0 ? '+' : '') + s.deltaPrem + '%' : '--'}</td>
+      <td>${s.gammaPrem != null ? (s.gammaPrem >= 0 ? '+' : '') + s.gammaPrem + '%' : '--'}</td>
+      <td>${s.thetaPrem != null ? (s.thetaPrem >= 0 ? '+' : '') + s.thetaPrem + '%' : '--'}</td>
       <td class="dim">${(s.oiMin != null ? s.oiMin : Math.min(s.oi_buy, s.oi_sell)).toLocaleString()}</td>
     `;
     tbody.appendChild(tr);
@@ -2722,8 +2821,12 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <h1>My Positions <span class="tag">WATCH</span></h1>
+  <h1>My Positions <span class="tag" id="posModeTag">LIVE</span></h1>
   <div class="right">
+    <label id="posTestToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so the 30s auto-refresh (e.g. after hours) doesn't re-fetch from Yahoo. Quotes stay frozen until you Clear cache or turn Test off.">
+      <input type="checkbox" id="posTestMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
+    </label>
+    <button type="button" id="posClearCacheBtn" class="secondary" style="padding:4px 9px;font-size:12px;" onclick="clearChainCache()">Clear cache</button>
     <span class="timestamp">Updated: <span id="lastUpdate">--</span></span>
     <span class="timestamp">Next refresh in: <span id="countdown">--</span>s</span>
     <a class="back" href="/">&larr; Spread Finder</a>
@@ -2963,10 +3066,12 @@ async function refreshQuotes() {
     const idx = ($('indexSymbol').value || '^GSPC').trim() || '^GSPC';
     const sg = parseFloat($('sigmaMult').value);
     const sgParam = (isFinite(sg) && sg > 0) ? sg : 1;
+    const testOn = $('posTestMode') && $('posTestMode').checked;
     const r = await fetch('/api/positions/quotes?haircut=' + encodeURIComponent(hc)
       + '&target=' + encodeURIComponent(tgtParam)
       + '&index=' + encodeURIComponent(idx)
-      + '&sigmas=' + encodeURIComponent(sgParam));
+      + '&sigmas=' + encodeURIComponent(sgParam)
+      + '&test=' + (testOn ? 1 : 0));
     const data = await r.json();
     if (data.error) { showErr(data.error); return; }
     lastQuotes = data.positions;
@@ -3249,6 +3354,35 @@ $('sigmaMult').addEventListener('change', () => {
   refreshQuotes();
 });
 
+// Test/Live mode: in Test mode the server caches each underlying's option chain,
+// so the 30s auto-refresh reuses frozen quotes instead of re-fetching from Yahoo.
+function updateModeTag() {
+  const t = $('posTestMode').checked;
+  const tag = $('posModeTag');
+  tag.textContent = t ? 'TEST · cached' : 'LIVE';
+  tag.style.background = t ? 'var(--yellow)' : '';
+  tag.style.color = t ? '#0f1117' : '';
+}
+function clearChainCache() {
+  fetch('/api/clear_cache').then(r => r.json()).then(d => {
+    const btn = $('posClearCacheBtn');
+    const old = btn.textContent;
+    btn.textContent = 'Cleared (' + (d.cleared || 0) + ')';
+    setTimeout(() => { btn.textContent = old; }, 1500);
+    refreshQuotes();
+  }).catch(() => {});
+}
+(function initTestMode() {
+  const cb = $('posTestMode');
+  if (localStorage.getItem('posTestMode') === '1') cb.checked = true;
+  updateModeTag();
+  cb.addEventListener('change', () => {
+    localStorage.setItem('posTestMode', cb.checked ? '1' : '0');
+    updateModeTag();
+    refreshQuotes();
+  });
+})();
+
 function resetTimer() {
   if (refreshTimer) clearInterval(refreshTimer);
   if (countdownTimer) clearInterval(countdownTimer);
@@ -3389,7 +3523,8 @@ function buildSpreadTooltip(s) {
     <span class="tt-buy">Pay:</span> &nbsp;$${buyEach} × ${c} = $${(s.buyAsk * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
     <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
     <span class="tt-net">Net:&nbsp; $${netEach} × ${c} = $${totalDollars}</span><br>
-    <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span>
+    <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span><br>
+    <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x
     <div class="tt-sep"></div>
     ${buildPnlChart(s)}`;
 }
@@ -3422,17 +3557,26 @@ SCATTER_PAGE = r"""<!DOCTYPE html>
   .bar a { color: var(--accent); text-decoration: none; font-size: 13px; margin-left: auto; }
   .bar a:hover { text-decoration: underline; }
   .bar .meta { color: var(--text-dim); font-size: 12px; font-family: var(--mono); }
-  #plot { flex: 1 1 auto; min-height: 0; position: relative; }
-  #plot svg { display: block; }
+  #panels { flex: 1 1 auto; min-height: 0; display: flex; }
+  .panel { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; }
+  .panel + .panel { border-left: 1px solid var(--border); }
+  .pctl { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+          padding: 7px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .pctl .field { display: flex; flex-direction: column; gap: 3px; }
+  .pctl label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+  .pctl select { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+                 font-family: var(--mono); font-size: 13px; padding: 4px 8px; border-radius: 5px; outline: none; }
+  .plot { flex: 1 1 auto; min-height: 0; position: relative; }
+  .plot svg { display: block; }
   .pt { cursor: pointer; transition: r 0.1s; }
-  .empty { display: flex; align-items: center; justify-content: center; height: 100%;
+  .empty { display: flex; align-items: center; justify-content: center; flex: 1 1 auto;
            color: var(--text-dim); text-align: center; padding: 40px; }
   .empty h2 { color: var(--text); font-weight: 600; }
   /* --- Spread Detail popup (copied from the finder so it looks identical) --- */
   .row-tooltip {
     display: none; position: fixed; background: var(--surface); border: 1px solid var(--border);
     border-radius: 8px; padding: 14px 18px; z-index: 20; white-space: nowrap;
-    font-family: var(--mono); font-size: 13px; line-height: 1.7;
+    font-family: var(--mono); font-size: 13px; line-height: 1.45;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4); pointer-events: none;
     max-height: calc(100vh - 16px); overflow: hidden;
   }
@@ -3448,14 +3592,29 @@ SCATTER_PAGE = r"""<!DOCTYPE html>
 <body>
 <div class="bar">
   <h1 id="title">Spread Scatter</h1>
-  <div class="field"><label for="xSel">X axis</label><select id="xSel"></select></div>
-  <div class="field"><label for="ySel">Y axis</label><select id="ySel"></select></div>
-  <div class="field"><label for="zSel">Color</label><select id="zSel"></select></div>
   <span class="meta" id="meta"></span>
   <a href="/">&larr; Back to Finder</a>
 </div>
-<div id="plot"><div class="empty" id="empty"><div><h2>No data to plot</h2>
-  <p>Run a search on the Finder, then click &ldquo;Scatter&rdquo;.</p></div></div></div>
+<div class="empty" id="empty" style="display:none;"><div><h2>No data to plot</h2>
+  <p>Run a search on the Finder, then click &ldquo;Scatter&rdquo;.</p></div></div>
+<div id="panels">
+  <div class="panel">
+    <div class="pctl">
+      <div class="field"><label>X axis</label><select id="x0"></select></div>
+      <div class="field"><label>Y axis</label><select id="y0"></select></div>
+      <div class="field"><label>Color</label><select id="z0"></select></div>
+    </div>
+    <div class="plot" id="plot0"></div>
+  </div>
+  <div class="panel">
+    <div class="pctl">
+      <div class="field"><label>X axis</label><select id="x1"></select></div>
+      <div class="field"><label>Y axis</label><select id="y1"></select></div>
+      <div class="field"><label>Color</label><select id="z1"></select></div>
+    </div>
+    <div class="plot" id="plot1"></div>
+  </div>
+</div>
 <div class="row-tooltip" id="tip"></div>
 <script>
 // ---- data handed over from the finder via localStorage ----
@@ -3482,12 +3641,15 @@ const COLS = [
   {key:'premium',      label:'Premium $',          get:s=>s.totalPremium*100},
   {key:'maxProfit',    label:'Max Profit $',       get:s=>s.maxProfit*100},
   {key:'pnlMove',      label:'P&L @'+mvLbl+' $',    get:s=>s.pnl1pct*100},
-  {key:'pnl1sigma',    label:'P&L 1σ 1d $',        get:s=>s.pnl1sigma*100},
+  {key:'return1sigma', label:'Return 1σ 1d %',      get:s=>s.return1sigma},
   {key:'beMovePct',    label:'BE Move %',          get:s=>s.breakevenMovePct},
   {key:'beMoveSigma',  label:'BE Move σ',          get:s=>s.breakevenMoveSigma},
   {key:'dollarDelta',  label:'$Δ /1%',             get:s=>s.netDelta*(currentSpot||0)},
   {key:'netDeltaPer',  label:'Δ/Contract',         get:s=>s.netDeltaPer},
   {key:'gammaPer1pct', label:'Γ (Δ/1%)',           get:s=>s.gammaPer1pct},
+  {key:'deltaPrem',    label:'Δ/Prem %',            get:s=>s.deltaPrem},
+  {key:'gammaPrem',    label:'Γ/Prem %',            get:s=>s.gammaPrem},
+  {key:'thetaPrem',    label:'Θ/Prem %',            get:s=>s.thetaPrem},
   {key:'ivBuy',        label:'IV long %',          get:s=>s.ivBuy},
   {key:'oiMin',        label:'Liq (min OI)',       get:s=>s.oiMin != null ? s.oiMin : Math.min(s.oi_buy, s.oi_sell)},
   {key:'dte',          label:'DTE',                get:s=>s.dte},
@@ -3528,13 +3690,11 @@ function niceRange(vals) {
   const pad = (hi - lo) * 0.06;
   return [lo - pad, hi + pad];
 }
-function render() {
-  const plot = document.getElementById('plot');
-  const empty = document.getElementById('empty');
-  if (!spreads.length) { empty.style.display = 'flex'; return; }
-  empty.style.display = 'none';
-  const xc = colByKey[document.getElementById('xSel').value];
-  const yc = colByKey[document.getElementById('ySel').value];
+function render(idx) {
+  if (!spreads.length) return;
+  const plot = document.getElementById('plot'+idx);
+  const xc = colByKey[document.getElementById('x'+idx).value];
+  const yc = colByKey[document.getElementById('y'+idx).value];
   const pts = spreads.map(s => ({s, x: xc.get(s), y: yc.get(s)}))
                      .filter(p => p.x != null && p.y != null && isFinite(p.x) && isFinite(p.y));
   const W = plot.clientWidth, H = plot.clientHeight;
@@ -3546,7 +3706,7 @@ function render() {
   const yS = v => pad.t + (1 - (v - yLo) / (yHi - yLo)) * ch;
   // Third axis = point color. Expiration keeps the DTE gradient; any numeric
   // dimension is split into thirds of its range: low=red, mid=yellow, high=green.
-  const zKey = document.getElementById('zSel').value;
+  const zKey = document.getElementById('z'+idx).value;
   let colorFor, legendText;
   if (zKey === '__dte__') {
     const dtes = pts.map(p => p.s.dte);
@@ -3588,6 +3748,7 @@ function render() {
     + circles + '</svg>';
   plot.insertAdjacentHTML('beforeend', svg);
 }
+function renderAll() { render(0); render(1); }
 
 // ---- hover popup (single shared tooltip, positioned near the mouse) ----
 const tip = document.getElementById('tip');
@@ -3602,45 +3763,52 @@ function positionTip(clientX, clientY) {
   tip.style.left = left + 'px';
   tip.style.top = top + 'px';
 }
-document.getElementById('plot').addEventListener('mouseover', (e) => {
-  if (!e.target.classList || !e.target.classList.contains('pt')) return;
-  const i = parseInt(e.target.dataset.i, 10);
-  const s = spreads[i];
-  if (!s) return;
-  e.target.setAttribute('r', '7');
-  tip.innerHTML = buildSpreadTooltip(s);
-  tip.style.display = 'block';
-  positionTip(e.clientX, e.clientY);
-});
-document.getElementById('plot').addEventListener('mousemove', (e) => {
-  if (tip.style.display === 'block') positionTip(e.clientX, e.clientY);
-});
-document.getElementById('plot').addEventListener('mouseout', (e) => {
-  if (e.target.classList && e.target.classList.contains('pt')) {
-    e.target.setAttribute('r', '5');
-    tip.style.display = 'none';
-  }
-});
+function wireHover(plot) {
+  plot.addEventListener('mouseover', (e) => {
+    if (!e.target.classList || !e.target.classList.contains('pt')) return;
+    const s = spreads[parseInt(e.target.dataset.i, 10)];
+    if (!s) return;
+    e.target.setAttribute('r', '7');
+    tip.innerHTML = buildSpreadTooltip(s);
+    tip.style.display = 'block';
+    positionTip(e.clientX, e.clientY);
+  });
+  plot.addEventListener('mousemove', (e) => {
+    if (tip.style.display === 'block') positionTip(e.clientX, e.clientY);
+  });
+  plot.addEventListener('mouseout', (e) => {
+    if (e.target.classList && e.target.classList.contains('pt')) {
+      e.target.setAttribute('r', '5');
+      tip.style.display = 'none';
+    }
+  });
+}
 
 // ---- init ----
-function initSelects() {
-  const x = document.getElementById('xSel'), y = document.getElementById('ySel'), z = document.getElementById('zSel');
-  z.insertAdjacentHTML('beforeend', '<option value="__dte__">Expiration (DTE)</option>');
-  COLS.forEach(c => {
-    x.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
-    y.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
-    z.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>');
-  });
-  x.value = 'leverage'; y.value = 'returnAtMove'; z.value = '__dte__';
-  x.addEventListener('change', render);
-  y.addEventListener('change', render);
-  z.addEventListener('change', render);
+function fillSelect(el, withDte) {
+  if (withDte) el.insertAdjacentHTML('beforeend', '<option value="__dte__">Expiration (DTE)</option>');
+  COLS.forEach(c => el.insertAdjacentHTML('beforeend', '<option value="'+c.key+'">'+c.label+'</option>'));
+}
+function initPanel(idx, defs) {
+  const x = document.getElementById('x'+idx), y = document.getElementById('y'+idx), z = document.getElementById('z'+idx);
+  fillSelect(x, false); fillSelect(y, false); fillSelect(z, true);
+  x.value = defs.x; y.value = defs.y; z.value = defs.z;
+  x.addEventListener('change', () => render(idx));
+  y.addEventListener('change', () => render(idx));
+  z.addEventListener('change', () => render(idx));
+  wireHover(document.getElementById('plot'+idx));
 }
 document.getElementById('title').textContent = 'Spread Scatter' + (currentSymbol ? ' — ' + currentSymbol : '');
 document.getElementById('meta').textContent = spreads.length ? (spreads.length + ' spreads' + (currentSpot ? ' · spot ' + currentSpot : '')) : '';
-initSelects();
-render();
-window.addEventListener('resize', render);
+if (!spreads.length) {
+  document.getElementById('empty').style.display = 'flex';
+  document.getElementById('panels').style.display = 'none';
+} else {
+  initPanel(0, {x:'leverage', y:'returnAtMove', z:'__dte__'});
+  initPanel(1, {x:'rewardRisk', y:'probTarget', z:'__dte__'});
+  renderAll();
+}
+window.addEventListener('resize', renderAll);
 </script>
 </body>
 </html>
@@ -3681,12 +3849,14 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             move_pct = float(params.get("move_pct", [1.0])[0])
             profit_target_pct = float(params.get("profit_target_pct", [5.0])[0])
             min_gamma = float(params.get("min_gamma", [0.0])[0])
+            min_return_1sigma = float(params.get("min_return_1sigma", [0.0])[0])
+            test_mode = params.get("test", ["0"])[0].lower() in ("1", "true", "test", "on")
 
             try:
                 print(f"\n{'='*60}")
                 print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_short_leg_delta=${min_short_leg_delta}, move_pct={move_pct}%, expiration={expiration_filter}")
                 print(f"{'='*60}")
-                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta)
+                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta, min_return_1sigma, test_mode)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
 
                 self.send_response(200)
@@ -3740,10 +3910,12 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 except ValueError:
                     n_sigma = 1.0
                 n_sigma = max(0.1, min(n_sigma, 10.0))
+                test_mode = params.get("test", ["0"])[0].lower() in ("1", "true", "test", "on")
                 positions = load_positions()
                 quotes = fetch_position_quotes(positions, haircut_pct=haircut_pct,
                                                profit_target_pct=target_pct,
-                                               index_symbol=index_symbol, n_sigma=n_sigma)
+                                               index_symbol=index_symbol, n_sigma=n_sigma,
+                                               test_mode=test_mode)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3757,6 +3929,10 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/templates":
             self._send_json(load_templates())
+
+        elif parsed.path == "/api/clear_cache":
+            n = clear_test_cache()
+            self._send_json({"cleared": n})
 
         else:
             self.send_response(404)
