@@ -25,6 +25,7 @@ import socketserver
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1167,100 @@ def _record_pnl(position_id, pnl):
     hist.append([ts_ms, round(pnl, 2)])
     if len(hist) > _HISTORY_MAX:
         del hist[:len(hist) - _HISTORY_MAX]
+
+
+# ---- Adjusted-P&L threshold alerts (ntfy.sh phone push) ----
+# Each live /positions refresh checks every position's Adjusted P&L % against
+# the configured thresholds and fires ONE push per (position, threshold) per
+# calendar day via ntfy.sh — subscribe the ntfy phone app to the topic printed
+# at startup. Config + latch state live in alerts.json (gitignored); the topic
+# is a random secret generated on first run, since ntfy topics are
+# world-readable by name.
+ALERTS_FILE = Path(__file__).parent / "alerts.json"
+DEFAULT_ALERT_THRESHOLDS_PCT = [2.5, 5.0]
+_alerts_lock = threading.Lock()
+
+
+def _load_alerts():
+    state = {}
+    if ALERTS_FILE.exists():
+        try:
+            state = json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state = {}
+    if not state.get("topic"):
+        state["topic"] = "callspreads-" + uuid.uuid4().hex[:10]
+    state.setdefault("thresholds", list(DEFAULT_ALERT_THRESHOLDS_PCT))
+    state.setdefault("date", "")
+    state.setdefault("sent", [])
+    return state
+
+
+def _save_alerts(state):
+    tmp = ALERTS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp, ALERTS_FILE)
+
+
+def get_alert_topic():
+    """The ntfy topic, creating alerts.json on first call — for the banner."""
+    with _alerts_lock:
+        state = _load_alerts()
+        _save_alerts(state)
+        return state["topic"]
+
+
+def _send_ntfy(topic, title, body):
+    """POST one push to ntfy.sh. Best-effort — alert delivery must never break
+    a quotes refresh, and a failed send is dropped, not retried (the latch is
+    taken before sending, so a flaky network can't cause duplicate pushes)."""
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}", data=body.encode("utf-8"),
+            headers={"Title": title, "Priority": "high",
+                     "Tags": "chart_with_upwards_trend"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        print(f"  Alert pushed: {body}")
+    except Exception as e:
+        print(f"  Alert push failed ({e}): {body}")
+
+
+def _position_name(q):
+    return q.get("label") or (
+        f"{q.get('symbol')} {q.get('longStrike'):g}/{q.get('shortStrike'):g}"
+        f" {q.get('expiration')}")
+
+
+def check_pnl_alerts(quotes):
+    """Push-alert the first time a position's Adjusted P&L % rises above each
+    threshold. One push per (position, threshold) per calendar day — dipping
+    back below and re-crossing doesn't re-fire until the date rolls over — so
+    a spread can never send more than len(thresholds) pushes in a day. Called
+    from /api/positions/quotes on live refreshes only (test-mode data is
+    frozen, so a "crossing" there would be stale, not actionable)."""
+    to_send = []
+    with _alerts_lock:
+        state = _load_alerts()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if state["date"] != today:
+            state["date"] = today
+            state["sent"] = []
+        for q in quotes:
+            pct, pid = q.get("adjPnlPct"), q.get("id")
+            if pct is None or not pid:
+                continue
+            for thr in state["thresholds"]:
+                key = f"{pid}|{thr:g}"
+                if pct > thr and key not in state["sent"]:
+                    state["sent"].append(key)
+                    body = (f"{_position_name(q)}: Adj P&L crossed +{thr:g}% "
+                            f"(now {pct:+.2f}%, ${q.get('adjPnl') or 0:+,.0f})")
+                    to_send.append((state["topic"], body))
+        _save_alerts(state)
+    for topic, body in to_send:
+        threading.Thread(target=_send_ntfy, daemon=True,
+                         args=(topic, "Call spread P&L alert", body)).start()
 
 
 def _underlying_spot_and_time(oc, tk):
@@ -4376,6 +4471,8 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                                                profit_target_pct=target_pct,
                                                index_symbol=index_symbol, n_sigma=n_sigma,
                                                test_mode=test_mode)
+                if not test_mode:
+                    check_pnl_alerts(quotes)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4609,6 +4706,9 @@ def main():
     httpd, port = start_server(PORT)
 
     _print_banner(port)
+    topic = get_alert_topic()
+    print(f"  Adj P&L alerts -> ntfy topic: {topic}")
+    print(f"    (subscribe in the ntfy phone app, or watch https://ntfy.sh/{topic})")
 
     with httpd:
         httpd.allow_reuse_address = True

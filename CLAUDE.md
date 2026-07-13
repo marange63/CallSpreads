@@ -30,6 +30,7 @@ A personal tool for finding and monitoring **call debit spreads** on US equity/i
 - `templates.json` — saved Finder parameter sets.
 - `beta_cache.json` — per-day beta cache for the monitor's beta column.
 - `chain_cache.pkl` — disk mirror of the Test-mode option-chain cache (pickled chain snapshots + expiration lists), loaded at startup, deleted by "Clear cache".
+- `alerts.json` — Adj P&L alert config (secret random ntfy topic + thresholds) and the once-per-day sent latches; auto-created on first run.
 
 ## Conventions & gotchas
 - **`HTML_PAGE` is a raw string**; `{RISK_FREE_RATE_PCT}` is substituted with `.replace()` at serve time — it is *not* an f-string, so literal `{}` in the page's JS is safe.
@@ -52,6 +53,7 @@ A personal tool for finding and monitoring **call debit spreads** on US equity/i
 - Compact detail table (merged columns: Position, Quote, Entry/Liq, Cost/Value) + Portfolio Summary.
 - **Adj P&L** = haircut on gains + round-trip commission. **Daily Theo P&L** = BS reprice for the underlying's 1-day move. **Own-vol ±Nσ** and **β·index ±Nσ** columns use one shared reprice engine; **beta** is a 2yr daily regression vs. the index (default `^GSPC`), cached daily, with the index's σ from its VIX-family implied vol. The **Scenario P&L** summary box combines these, plus a **β-wtd Δ** row = Σ per-position `betaDollarDeltaPer1Pct` (theoretical $ P&L for a +1% index move) — the portfolio's aggregate calibrated leverage in index terms.
 - Global controls: refresh interval, Adj P&L haircut %, profit target %, beta index, **Std devs** (σ multiplier driving all ±σ columns).
+- **Adj P&L push alerts** (`check_pnl_alerts`): every live (non-test) `/api/positions/quotes` refresh sends an ntfy.sh phone push the first time a position's Adj P&L % rises above each threshold in `alerts.json` (default +2.5%, +5%) — latched once per (position, threshold) per calendar day, so re-crossings don't re-fire until the date rolls. The ntfy topic is a gitignored random secret printed in the startup banner; alerts only fire while something is polling the quotes endpoint (i.e. a monitor tab is open).
 
 ## Scatter (`/scatter`)
 - Two side-by-side, independently-configurable panels; each point is one spread, with the same row-hover popup as the Finder. Axes/color come from a shared `COLS` list (mirrors the results-table columns, incl. `score`).

@@ -18,6 +18,7 @@ positions.json
 templates.json
 beta_cache.json
 chain_cache.pkl
+alerts.json
 *.tmp
 
 # Generated chart output
