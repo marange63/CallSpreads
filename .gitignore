@@ -17,6 +17,7 @@ env/
 positions.json
 templates.json
 beta_cache.json
+chain_cache.pkl
 *.tmp
 
 # Generated chart output

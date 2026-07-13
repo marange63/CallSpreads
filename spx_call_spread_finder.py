@@ -15,6 +15,7 @@ import http.server
 import json
 import math
 import os
+import pickle
 import sys
 import subprocess
 import threading
@@ -23,6 +24,7 @@ import webbrowser
 import socketserver
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
@@ -169,7 +171,7 @@ def implied_vol(price, S, K, T, r, max_iter=50, tol=1e-6):
 #
 # Estimates P[ a spread's Adjusted P&L touches a profit target at any point before
 # expiry ]. This is a first-passage problem: the target is a *constant* barrier in
-# spread-VALUE space (V*, see spread_prob_target) but a *moving* barrier in underlying
+# spread-VALUE space (V*, see spread_mc_stats) but a *moving* barrier in underlying
 # space because the spread reprices as theta decays. We simulate zero-drift GBM paths
 # for the underlying ONCE per expiration, invert V* into a per-timestep critical
 # underlying level, then test how many paths ever cross it. Assumptions: zero drift
@@ -267,10 +269,22 @@ def critical_levels(K1, K2, iv_l, iv_s, r, T_remaining, V_star, width):
     return S_star
 
 
-def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
-                       entry_debit, contracts, target_frac,
-                       total_commission, haircut, width, value_offset=0.0):
-    """Probability (percent, 1 dp) the spread's Adjusted P&L touches its profit target.
+def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
+                    entry_debit, contracts, target_frac,
+                    total_commission, haircut, width, value_offset=0.0):
+    """Monte-Carlo statistics for a spread, all from the shared per-expiration paths.
+
+    Returns None for degenerate inputs, else a dict:
+      probTarget         — % of paths whose Adjusted P&L touches the profit target
+                           before expiry (first-passage / early-exit probability).
+      medianDaysToTarget — median first-touch day among the hitting paths (None if 0%).
+      retVelocity        — target %-of-cost per day at the median touch (None if 0%).
+      evPrem             — expected Adjusted P&L as a % of entry cost under the
+                           exit-at-target strategy: hitting paths bank the target,
+                           the rest hold to expiry at terminal intrinsic value.
+      probProfitExp      — % of paths whose *terminal* Adjusted P&L is positive
+                           (commission- and haircut-aware P(profit at expiration)).
+      probLoss50         — % of paths whose terminal Adjusted P&L <= -50% of cost.
 
     target_frac is the target as a fraction of entry cost (e.g. 0.05 for 5%). Adjusted P&L
     is (liquidation - entry)*mult, haircut on gains, minus commission (the exact formula
@@ -281,8 +295,7 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
     quoted liquidation (BS-vs-market model error plus the bid/ask crossing). `value_offset`
     = BS_mid(spot, T) - current_liquidation calibrates that gap so the barrier is anchored
     to the real current value the user sees: the underlying barrier is where
-    BS_mid(S, t) reaches L* + value_offset. Returns None for degenerate inputs, 0.0 when
-    the target is unreachable.
+    BS_mid(S, t) reaches L* + value_offset.
     """
     if S_paths is None or T <= 0 or not iv_l or not iv_s or contracts <= 0 or entry_debit <= 0:
         return None
@@ -294,11 +307,45 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
     # Liquidation-space barrier, then shift into BS-mid space via the calibration offset.
     L_star = entry_debit + (target_dollars + total_commission) / (haircut * mult)
     V_star = L_star + value_offset
-    if V_star > width:
-        return 0.0
-    S_star = critical_levels(K1, K2, iv_l, iv_s, r, T_remaining, V_star, width)
-    hit = (np.asarray(S_paths) >= S_star[None, :]).any(axis=1)
-    return round(float(hit.mean()) * 100.0, 1)
+
+    S = np.asarray(S_paths)
+
+    # First-passage (touch) stats. V_star > width means the target is unreachable.
+    prob_target = 0.0
+    median_days = None
+    ret_velocity = None
+    hit = None
+    if V_star <= width:
+        S_star = critical_levels(K1, K2, iv_l, iv_s, r, T_remaining, V_star, width)
+        touched = S >= S_star[None, :]
+        hit = touched.any(axis=1)
+        prob_target = float(hit.mean()) * 100.0
+        if hit.any():
+            # Step k is (k+1) days ahead (see simulate_paths).
+            first_day = np.argmax(touched, axis=1)[hit] + 1
+            median_days = float(np.median(first_day))
+            if median_days > 0:
+                ret_velocity = target_frac * 100.0 / median_days
+
+    # Terminal (hold-to-expiry) stats: Adjusted P&L at expiration, same formula as
+    # the position table — haircut on gains only, commissions netted in full.
+    intrinsic = np.clip(S[:, -1] - K1, 0.0, width)
+    raw_pnl = (intrinsic - entry_debit) * mult
+    adj_pnl = np.where(raw_pnl > 0, raw_pnl * haircut, raw_pnl) - total_commission
+    prob_profit_exp = float((adj_pnl > 0).mean()) * 100.0
+    prob_loss50 = float((adj_pnl <= -0.5 * entry_cost).mean()) * 100.0
+    # Exit-at-target expectancy: hitting paths bank the target, others ride to expiry.
+    strat_pnl = adj_pnl if hit is None else np.where(hit, target_dollars, adj_pnl)
+    ev_prem = float(strat_pnl.mean()) / entry_cost * 100.0
+
+    return {
+        "probTarget": round(prob_target, 1),
+        "medianDaysToTarget": round(median_days, 1) if median_days is not None else None,
+        "retVelocity": round(ret_velocity, 2) if ret_velocity is not None else None,
+        "evPrem": round(ev_prem, 1),
+        "probProfitExp": round(prob_profit_exp, 1),
+        "probLoss50": round(prob_loss50, 1),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +355,92 @@ def spread_prob_target(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 # Test-mode option-chain cache — when Test mode is toggled on in the UI, each
 # underlying's option chain and expiration list are fetched once and reused, so
 # repeated searches against a static (after-hours) market don't re-hit Yahoo or
-# trip its rate limits. In-memory; emptied via the "Clear cache" button.
-_TEST_CHAIN_CACHE = {}   # (symbol, exp) -> option_chain result
+# trip its rate limits. Mirrored to disk (CHAIN_CACHE_FILE): chains with live
+# two-sided quotes are persisted as they're fetched and reloaded at startup, so
+# a Friday-session cache survives restarts and powers weekend Test-mode scans.
+# Emptied (memory AND disk) only via the "Clear cache" button.
+_TEST_CHAIN_CACHE = {}   # (symbol, exp) -> chain snapshot (SimpleNamespace)
 _TEST_EXP_CACHE = {}     # symbol -> expirations tuple
+
+CHAIN_CACHE_FILE = Path(__file__).parent / "chain_cache.pkl"
+
+
+def _snap_chain(raw):
+    """Freeze a yfinance option_chain result into a plain, picklable snapshot.
+
+    Keeps exactly the attributes the app reads (.calls, .puts, .underlying) and
+    stamps the fetch time, decoupled from yfinance's own result class so the
+    disk cache survives yfinance upgrades.
+    """
+    return SimpleNamespace(
+        calls=raw.calls,
+        puts=getattr(raw, "puts", None),
+        underlying=getattr(raw, "underlying", None),
+        fetched_at=datetime.now().timestamp())
+
+
+def _chain_has_live_quotes(oc):
+    """True if at least one call row shows a two-sided market (bid & ask > 0).
+
+    Yahoo zeroes bids/asks outside market hours (worst on weekends); such a
+    chain is useless for spread-building and must not overwrite a good cache.
+    """
+    try:
+        c = oc.calls
+        return bool(((c["bid"] > 0) & (c["ask"] > 0)).any())
+    except Exception:
+        return False
+
+
+def _save_chain_cache():
+    """Persist live-quality cached chains + expiration lists to disk, atomically."""
+    try:
+        payload = {
+            "chains": {k: v for k, v in _TEST_CHAIN_CACHE.items()
+                       if _chain_has_live_quotes(v)},
+            "exps": dict(_TEST_EXP_CACHE),
+        }
+        tmp = CHAIN_CACHE_FILE.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f)
+        os.replace(tmp, CHAIN_CACHE_FILE)
+    except Exception as e:
+        print(f"  Warning: could not save chain cache ({e})")
+
+
+def _load_chain_cache():
+    """Load the disk chain cache into memory (startup). Returns chains loaded."""
+    if not CHAIN_CACHE_FILE.exists():
+        return 0
+    try:
+        with open(CHAIN_CACHE_FILE, "rb") as f:
+            payload = pickle.load(f)
+        _TEST_CHAIN_CACHE.update(payload.get("chains", {}))
+        _TEST_EXP_CACHE.update(payload.get("exps", {}))
+        return len(payload.get("chains", {}))
+    except Exception as e:
+        print(f"  Warning: could not load chain cache ({e}) — starting empty")
+        return 0
+
+# A leg whose last trade is older than this (relative to the scan / quote snapshot)
+# gets a staleness flag in the UI — its bid/ask may not reflect a tradable market.
+# One calendar day keeps legs traded during the most recent session "fresh" even
+# when scanning after hours.
+STALE_TRADE_AGE_SECS = 86400
+
+
+def _last_trade_epoch(row):
+    """Epoch seconds of a chain row's lastTradeDate, or None if missing/NaT."""
+    try:
+        ts = row.get("lastTradeDate")
+        if ts is None or not hasattr(ts, "timestamp"):
+            return None
+        epoch = ts.timestamp()  # NaT raises ValueError -> caught below
+        if math.isnan(epoch):
+            return None
+        return int(epoch)
+    except Exception:
+        return None
 
 
 def get_option_chain(ticker, symbol, exp, test_mode=False):
@@ -318,8 +448,13 @@ def get_option_chain(ticker, symbol, exp, test_mode=False):
         key = (symbol, exp)
         oc = _TEST_CHAIN_CACHE.get(key)
         if oc is None:
-            oc = ticker.option_chain(exp)
+            oc = _snap_chain(ticker.option_chain(exp))
             _TEST_CHAIN_CACHE[key] = oc
+            # Persist only chains with a live two-sided market so a weekend /
+            # after-hours fetch (zeroed bid/ask) can't poison the disk cache.
+            # Dead chains still cache in memory to spare Yahoo within a session.
+            if _chain_has_live_quotes(oc):
+                _save_chain_cache()
         return oc
     return ticker.option_chain(exp)
 
@@ -330,6 +465,7 @@ def get_expirations(ticker, symbol, test_mode=False):
         if exps is None:
             exps = ticker.options
             _TEST_EXP_CACHE[symbol] = exps
+            _save_chain_cache()
         return exps
     return ticker.options
 
@@ -338,6 +474,10 @@ def clear_test_cache():
     n = len(_TEST_CHAIN_CACHE) + len(_TEST_EXP_CACHE)
     _TEST_CHAIN_CACHE.clear()
     _TEST_EXP_CACHE.clear()
+    try:
+        CHAIN_CACHE_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"  Warning: could not delete chain cache file ({e})")
     return n
 
 
@@ -565,31 +705,40 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     theta_sell = bs_call_theta(spot, K2, T, risk_free_rate, iv_sell)
                     net_theta = theta_buy - theta_sell  # annualized, per share
 
-                    # 2nd-order P&L for a 1% move (per contract): delta*ΔS + ½*gamma*ΔS²
-                    move_frac = move_pct / 100.0
-                    ds_1 = spot * move_frac
-                    pnl_1pct_per = net_delta * ds_1 + 0.5 * net_gamma * ds_1 * ds_1
+                    # Full Black-Scholes reprice of the spread at a shocked underlying
+                    # (leg IVs and T held fixed). Exact, so it respects the value cap at
+                    # width — the old local delta+gamma Taylor expansion overstated P&L
+                    # on tight/near-cap spreads once a large move carried the short
+                    # strike ITM.
+                    def spread_value_at(S):
+                        return (bs_call_price(S, K1, T, risk_free_rate, iv_buy)
+                                - bs_call_price(S, K2, T, risk_free_rate, iv_sell))
 
-                    # P&L for a ±1σ / ±2σ *one-day* underlying move using the expiration's ATM IV.
+                    value_now = spread_value_at(spot)
+                    move_frac = move_pct / 100.0
+                    pnl_move_per = spread_value_at(spot * (1.0 + move_frac)) - value_now
+
+                    # P&L for a +1σ *one-day* underlying move using the expiration's ATM IV.
                     # Daily σ = spot * IV * sqrt(1/252) (trading-day convention).
                     if exp_atm_iv and T > 0:
                         one_sigma_dS = spot * exp_atm_iv * math.sqrt(1 / 252)
-                        pnl_1sigma_per = net_delta * one_sigma_dS + 0.5 * net_gamma * one_sigma_dS * one_sigma_dS
-                        two_sigma_dS = 2 * one_sigma_dS
-                        pnl_2sigma_per = net_delta * two_sigma_dS + 0.5 * net_gamma * two_sigma_dS * two_sigma_dS
+                        pnl_1sigma_per = spread_value_at(spot + one_sigma_dS) - value_now
                         # Per-premium greek contributions over a 1-day / 1σ move (% of premium),
                         # on a shared basis so they're comparable and additive:
                         #   deltaPrem + gammaPrem == return1sigma ; thetaPrem = one day's decay.
+                        # deltaPrem is the linear part; gammaPrem is the full convexity
+                        # residual of the exact reprice (not just ½Γ·ΔS²), so it too
+                        # knows about the spread's value cap.
                         delta_prem = net_delta * one_sigma_dS / net_premium * 100
-                        gamma_prem = 0.5 * net_gamma * one_sigma_dS * one_sigma_dS / net_premium * 100
+                        gamma_prem = pnl_1sigma_per / net_premium * 100 - delta_prem
                         theta_prem = (net_theta / 365.0) / net_premium * 100
                     else:
                         pnl_1sigma_per = 0.0
-                        pnl_2sigma_per = 0.0
                         delta_prem = gamma_prem = theta_prem = None
 
-                    # Leverage: normalized to a 1% move so it stays comparable regardless of move_pct.
-                    leverage = (pnl_1pct_per / net_premium) / move_frac if net_premium > 0 and move_frac > 0 else 0
+                    # Leverage: exact reprice for a +1% move, per unit of premium, so it
+                    # stays comparable regardless of move_pct.
+                    leverage = ((spread_value_at(spot * 1.01) - value_now) / net_premium) / 0.01 if net_premium > 0 else 0
 
                     if leverage < min_leverage:
                         skipped_leverage += 1
@@ -639,10 +788,6 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     mid_sell = (sell_price + float(row_sell["ask"])) / 2
                     mid_premium = mid_buy - mid_sell
 
-                    # Scale by contracts for total position
-                    pnl_1pct_total = pnl_1pct_per * contracts
-                    pnl_1sigma_total = pnl_1sigma_per * contracts
-                    pnl_2sigma_total = pnl_2sigma_per * contracts
                     breakeven_move_pct = (breakeven - spot) / spot * 100
                     iv_avg = (iv_buy + iv_sell) / 2
                     # Use ATM IV as the sigma yardstick so BE distance is comparable across strikes
@@ -655,19 +800,27 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                     )
                     rr_per_sigma = reward_risk / be_move_sigma if be_move_sigma > 0 else 0
 
-                    # Path-aware probability of the Adjusted P&L touching profit_target_pct
-                    # of entry cost before expiry. Round-trip commission = commission x
-                    # contracts (finder `commission` is per-contract round-trip). Calibrate
-                    # BS-mid to the freshly-entered spread's liquidation (sell long at bid,
-                    # buy back short at ask) so the barrier is anchored to real quotes.
+                    # Path-aware MC stats: probability of the Adjusted P&L touching
+                    # profit_target_pct of entry cost before expiry, plus expectancy /
+                    # tail / time-to-target stats from the same paths. Round-trip
+                    # commission = commission x contracts (finder `commission` is
+                    # per-contract round-trip). Calibrate BS-mid to the freshly-entered
+                    # spread's liquidation (sell long at bid, buy back short at ask) so
+                    # the barrier is anchored to real quotes.
                     liq_now = float(row_buy["bid"]) - float(row_sell["ask"])
-                    bs_mid_now = (bs_call_price(spot, K1, T, risk_free_rate, iv_buy)
-                                  - bs_call_price(spot, K2, T, risk_free_rate, iv_sell))
-                    prob_target = spread_prob_target(
+                    mc = spread_mc_stats(
                         target_paths, target_T_remaining, K1, K2, iv_buy, iv_sell,
                         risk_free_rate, T, net_premium, contracts,
                         profit_target_pct / 100.0, commission * contracts,
-                        FINDER_HAIRCUT_PCT, spread_width, value_offset=bs_mid_now - liq_now)
+                        FINDER_HAIRCUT_PCT, spread_width, value_offset=value_now - liq_now)
+                    mc = mc or {}
+
+                    # Per-leg last-trade timestamps -> staleness flags (see
+                    # STALE_TRADE_AGE_SECS). A leg that hasn't traded in over a day may
+                    # be quoting a market you can't actually hit.
+                    lt_buy = _last_trade_epoch(row_buy)
+                    lt_sell = _last_trade_epoch(row_sell)
+                    scan_epoch = now.timestamp()
 
                     spreads.append({
                         "expiration": exp_date_str,
@@ -684,9 +837,6 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "maxProfit": round(max_profit * contracts, 2),
                         "breakeven": round(breakeven, 2),
                         "leverage": round(leverage, 2),
-                        "pnl1pct": round(pnl_1pct_total, 4),
-                        "pnl1sigma": round(pnl_1sigma_total, 4),
-                        "pnl2sigma": round(pnl_2sigma_total, 4),
                         "expAtmIv": round(exp_atm_iv * 100, 1) if exp_atm_iv else None,
                         "breakevenMovePct": round(breakeven_move_pct, 2),
                         "breakevenMoveSigma": round(be_move_sigma, 2),
@@ -704,13 +854,22 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "pctOtmSell": round(pct_otm_sell, 2),
                         "rewardRisk": round(reward_risk, 2),
                         "rrPerSigma": round(rr_per_sigma, 2),
-                        "returnAtMove": round(pnl_1pct_total / total_premium * 100, 1) if total_premium else None,
-                        "return1sigma": round(pnl_1sigma_total / total_premium * 100, 1) if total_premium else None,
+                        "returnAtMove": round(pnl_move_per / net_premium * 100, 1) if net_premium else None,
+                        "return1sigma": round(return_1sigma, 1),
                         "deltaPrem": round(delta_prem, 1) if delta_prem is not None else None,
                         "gammaPrem": round(gamma_prem, 1) if gamma_prem is not None else None,
                         "thetaPrem": round(theta_prem, 1) if theta_prem is not None else None,
                         "oiMin": min(int(row_buy.get("openInterest", 0) or 0), int(row_sell.get("openInterest", 0) or 0)),
-                        "probTarget": prob_target,
+                        "probTarget": mc.get("probTarget"),
+                        "medianDaysToTarget": mc.get("medianDaysToTarget"),
+                        "retVelocity": mc.get("retVelocity"),
+                        "evPrem": mc.get("evPrem"),
+                        "probProfitExp": mc.get("probProfitExp"),
+                        "probLoss50": mc.get("probLoss50"),
+                        "lastTradeBuy": lt_buy,
+                        "lastTradeSell": lt_sell,
+                        "staleBuy": bool(lt_buy is not None and scan_epoch - lt_buy > STALE_TRADE_AGE_SECS),
+                        "staleSell": bool(lt_sell is not None and scan_epoch - lt_sell > STALE_TRADE_AGE_SECS),
                         "volume_buy": int(row_buy.get("volume", 0) or 0),
                         "volume_sell": int(row_sell.get("volume", 0) or 0),
                         "oi_buy": int(row_buy.get("openInterest", 0) or 0),
@@ -951,6 +1110,7 @@ def _leg_snapshot(row):
             "mid": round(mid, 2), "volume": vol,
             "prevClose": prev_close, "quotedMid": quoted_mid,
             "iv": round(iv * 100, 1) if iv is not None else None,
+            "lastTrade": _last_trade_epoch(row),
             "_iv_raw": iv}
 
 
@@ -1071,6 +1231,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["dailyTheoPnl"] = None
         result["dailyTheoMove"] = None
         result["beta"] = None
+        result["betaDollarDeltaPer1Pct"] = None
         result["betaIndexMove"] = None
         result["betaIndexUpPnl"] = None
         result["betaIndexDownPnl"] = None
@@ -1198,10 +1359,17 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                     # spot±ΔS vs. spot (IV and time held constant). Up and down
                     # differ in magnitude because of gamma.
                     beta = betas.get(symbol)
+                    if beta is not None:
+                        result["beta"] = round(beta, 3)
+                        # Portfolio building block: this position's $ P&L for a +1% move
+                        # in the reference index = position delta (per $1 of underlying)
+                        # × spot × 1% × beta. Summed client-side into the β-weighted
+                        # portfolio net delta in the summary.
+                        result["betaDollarDeltaPer1Pct"] = round(
+                            net_delta_per * 100 * contracts * spot * 0.01 * beta, 2)
                     if beta is not None and index_sigma_1d:
                         dS_beta = spot * beta * index_sigma_1d * n_sigma
                         up_beta, dn_beta = spread_shock_pnl(spot, dS_beta, K1, K2, T, r, iv_l, iv_s, contracts)
-                        result["beta"] = round(beta, 3)
                         result["betaIndexMove"] = round(dS_beta, 2)
                         result["betaIndexUpPnl"] = up_beta
                         result["betaIndexDownPnl"] = dn_beta
@@ -1222,11 +1390,12 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                     bs_mid_now = (bs_call_price(spot, K1, T, r, iv_l)
                                   - bs_call_price(spot, K2, T, r, iv_s))
                     value_offset = bs_mid_now - result["spreadLiquidation"]
-                    result["probTarget"] = spread_prob_target(
+                    mc = spread_mc_stats(
                         tgt_paths, tgt_T_remaining, K1, K2, iv_l, iv_s, r, T,
                         long_entry - short_entry, contracts,
                         profit_target_pct / 100.0, result["totalCommission"],
                         haircut_pct, K2 - K1, value_offset=value_offset)
+                    result["probTarget"] = mc.get("probTarget") if mc else None
 
                 # Strip internal keys before returning
                 long_leg.pop("_iv_raw", None)
@@ -1552,6 +1721,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-top: 1px solid var(--border);
     margin: 6px 0;
   }
+
+  .stale-flag { color: #fbbf24; margin-left: 4px; cursor: help; }
 
   /* tooltip shown/positioned via JS */
 
@@ -1917,6 +2088,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="leverage" onclick="sortTable('leverage')">Leverage</th>
         <th data-col="returnAtMove" onclick="sortTable('returnAtMove')" id="rocMoveHeader" title="Return on net premium if the underlying makes the Recovery move % — the capital-efficiency of your bounce thesis.">Return @ +5%</th>
         <th data-col="probTarget" onclick="sortTable('probTarget')" id="probTargetHeader">P(+5%)</th>
+        <th data-col="probProfitExp" onclick="sortTable('probProfitExp')" title="Monte-Carlo probability the Adjusted P&amp;L (haircut on gains, commissions netted) is positive if held to expiration. Compare with P(+X%), the path-aware early-exit probability.">P(prof exp)</th>
+        <th data-col="medianDaysToTarget" onclick="sortTable('medianDaysToTarget')" title="Median days until the profit target is first touched, among the Monte-Carlo paths that hit it. Lower = faster capital recycling.">Med d&rarr;tgt</th>
+        <th data-col="evPrem" onclick="sortTable('evPrem')" title="Expected Adjusted P&amp;L as a % of premium under the exit-at-target strategy: paths that touch the target bank it, the rest hold to expiry. Zero-drift (no-edge) paths, so this is a conservative floor.">EV %</th>
         <th data-col="return1sigma" onclick="sortTable('return1sigma')" title="P&amp;L for a +1&sigma; one-day move in the underlying, as a % return on the premium paid.">Return 1&sigma; 1d %</th>
         <th data-col="breakevenMovePct" onclick="sortTable('breakevenMovePct')">BE Move %</th>
         <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')">BE Move &sigma;</th>
@@ -2190,15 +2364,29 @@ function clearChainCache() {
 })();
 
 // Hand the current results to a new scatter-plot tab via localStorage (no re-fetch).
-function openScatter() {
-  if (!allSpreads || !allSpreads.length) { showError('Run a search first — no spreads to plot.'); return; }
+// Stash the current results (incl. live Score) to localStorage. Writing this key
+// fires a 'storage' event in any open /scatter tab, which re-reads and re-renders —
+// so an open scatter tab tracks the finder as you re-search or re-weight. The ts
+// field guarantees the value changes every write so the event always fires.
+function stashScatterData() {
+  if (!allSpreads || !allSpreads.length) return false;
   const rf = parseFloat(document.getElementById('riskFreeRate').value) / 100;
   const mp = parseFloat(document.getElementById('movePct').value) || 1;
   const pt = parseFloat(document.getElementById('profitTarget').value) || 5;
   const payload = { spreads: allSpreads, spot: currentSpot, symbol: currentSymbol,
                     rfRate: rf, movePct: mp, profitTargetPct: pt, ts: Date.now() };
-  try { localStorage.setItem('finderScatterData', JSON.stringify(payload)); }
-  catch (e) { showError('Could not stash results for the scatter tab: ' + e.message); return; }
+  try { localStorage.setItem('finderScatterData', JSON.stringify(payload)); return true; }
+  catch (e) { return false; }
+}
+let _scatterStashTimer = null;
+function stashScatterDataSoon() {
+  clearTimeout(_scatterStashTimer);
+  _scatterStashTimer = setTimeout(stashScatterData, 200);
+}
+
+function openScatter() {
+  if (!allSpreads || !allSpreads.length) { showError('Run a search first — no spreads to plot.'); return; }
+  if (!stashScatterData()) { showError('Could not stash results for the scatter tab.'); return; }
   window.open('/scatter', '_blank');
 }
 
@@ -2326,6 +2514,7 @@ async function doSearch() {
     document.getElementById('scoreWeights').style.display = allSpreads.length ? 'block' : 'none';
     buildDteFilters();
     renderTable();
+    stashScatterData();  // keep any open scatter tab in sync with this search
 
     if (allSpreads.length === 0) {
       document.getElementById('emptyState').innerHTML = '<h2>No spreads found</h2><p>Try increasing the max premium or decreasing the min leverage.</p>';
@@ -2479,7 +2668,7 @@ function scoreWeightsChanged() {
   const oiEl = document.getElementById('sw_oiTarget');
   if (oiEl) scoreOiTarget = Math.max(0, Number(oiEl.value) || 0);
   saveScoreWeights();
-  if (allSpreads.length) { computeScores(); renderTable(); }
+  if (allSpreads.length) { computeScores(); renderTable(); stashScatterDataSoon(); }
 }
 
 function applyScorePreset(name) {
@@ -2699,6 +2888,15 @@ function buildPnlChart(s) {
   </svg>`;
 }
 
+// Compact "how long ago" label for a last-trade epoch (seconds).
+function tradeAgeStr(epoch) {
+  if (!epoch) return 'n/a';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
+  if (secs < 3600) return Math.floor(secs / 60) + 'm';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+  return Math.floor(secs / 86400) + 'd';
+}
+
 function renderTable() {
   const spreads = getFilteredSpreads();
   const col = currentSort.col;
@@ -2731,6 +2929,8 @@ function renderTable() {
     const sellEach = (s.sellBid * m).toLocaleString('en-US', {maximumFractionDigits: 0});
     const netEach = (s.netPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
     const totalDollars = (s.totalPremium * m).toLocaleString('en-US', {maximumFractionDigits: 0});
+    const staleFlag = (s.staleBuy || s.staleSell)
+      ? `<span class="stale-flag" title="Stale quote risk — last trade: long ${tradeAgeStr(s.lastTradeBuy)} ago, short ${tradeAgeStr(s.lastTradeSell)} ago">&#9888;</span>` : '';
     tr.innerHTML = `
       <td class="score-cell" style="font-weight:700;color:${scoreColor(s.score)};">${s.score != null ? s.score.toFixed(0) : '--'}</td>
       <td>${s.expiration}
@@ -2743,7 +2943,9 @@ function renderTable() {
           <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
           <span class="tt-net">Net:&nbsp; $${netEach} × ${c} = $${totalDollars}</span><br>
           <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span><br>
-          <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x
+          <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x<br>
+          <span class="tt-dim">EV</span> ${s.evPrem != null ? (s.evPrem >= 0 ? '+' : '') + s.evPrem.toFixed(1) + '%' : '--'} &nbsp;·&nbsp; <span class="tt-dim">P(prof exp)</span> ${s.probProfitExp != null ? s.probProfitExp.toFixed(1) + '%' : '--'} &nbsp;·&nbsp; <span class="tt-dim">P(&minus;50%)</span> ${s.probLoss50 != null ? s.probLoss50.toFixed(1) + '%' : '--'}<br>
+          <span class="tt-dim">Med d&rarr;tgt</span> ${s.medianDaysToTarget != null ? s.medianDaysToTarget.toFixed(0) + 'd' : '--'} &nbsp;·&nbsp; <span class="tt-dim">Velocity</span> ${s.retVelocity != null ? s.retVelocity.toFixed(2) + '%/d' : '--'} &nbsp;·&nbsp; <span class="tt-dim">Last trade</span> L ${tradeAgeStr(s.lastTradeBuy)} / S ${tradeAgeStr(s.lastTradeSell)}
           <div class="tt-sep"></div>
           ${buildPnlChart(s)}
         </div>
@@ -2753,12 +2955,15 @@ function renderTable() {
       <td>${s.sellStrike.toFixed(0)}</td>
       <td class="dim">${s.pctOtmBuy.toFixed(1)}%</td>
       <td>${s.spreadWidth.toFixed(0)}</td>
-      <td class="highlight">$${totalDollars}</td>
+      <td class="highlight">$${totalDollars}${staleFlag}</td>
       <td>$${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
       <td>${s.rewardRisk.toFixed(1)}x</td>
       <td class="highlight">${s.leverage.toFixed(1)}x</td>
       <td class="highlight">${s.returnAtMove != null ? (s.returnAtMove >= 0 ? '+' : '') + s.returnAtMove + '%' : '--'}</td>
       <td>${(s.probTarget === null || s.probTarget === undefined) ? '<span class="dim">--</span>' : s.probTarget.toFixed(1) + '%'}</td>
+      <td>${(s.probProfitExp === null || s.probProfitExp === undefined) ? '<span class="dim">--</span>' : s.probProfitExp.toFixed(1) + '%'}</td>
+      <td>${(s.medianDaysToTarget === null || s.medianDaysToTarget === undefined) ? '<span class="dim">--</span>' : s.medianDaysToTarget.toFixed(0) + 'd'}</td>
+      <td>${(s.evPrem === null || s.evPrem === undefined) ? '<span class="dim">--</span>' : (s.evPrem >= 0 ? '+' : '') + s.evPrem.toFixed(1) + '%'}</td>
       <td>${s.return1sigma != null ? (s.return1sigma >= 0 ? '+' : '') + s.return1sigma + '%' : '--'}</td>
       <td>${s.breakevenMovePct >= 0 ? '+' : ''}${s.breakevenMovePct.toFixed(2)}%</td>
       <td>${s.breakevenMoveSigma >= 0 ? '+' : ''}${s.breakevenMoveSigma.toFixed(2)}σ</td>
@@ -2778,7 +2983,7 @@ function renderTable() {
 
   if (display.length < spreads.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="23" style="text-align:center;color:var(--text-dim);padding:16px;"><!-- 23 cols -->
+    tr.innerHTML = `<td colspan="26" style="text-align:center;color:var(--text-dim);padding:16px;"><!-- 26 cols -->
       Showing ${display.length} of ${spreads.length} results. Tighten your criteria to see fewer, more targeted spreads.
     </td>`;
     tbody.appendChild(tr);
@@ -2954,6 +3159,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   .pnl-block { display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); }
   .pnl-block .pct { font-size: 11px; }
   .pnl-block .tt-dim { font-size: 10px; color: var(--text-dim); font-family: var(--mono); }
+  .stale-flag { color: #fbbf24; margin-left: 4px; cursor: help; }
 
   .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
   .stat { background: var(--surface2); border-radius: 6px; padding: 12px 14px;
@@ -3147,6 +3353,7 @@ function updateSummary(rows) {
   const totalVega = withData.reduce((s, r) => s + (r.netVega || 0), 0);
   const totalBetaUp = withData.reduce((s, r) => s + (r.betaIndexUpPnl || 0), 0);
   const totalBetaDown = withData.reduce((s, r) => s + (r.betaIndexDownPnl || 0), 0);
+  const totalBetaDelta = withData.reduce((s, r) => s + (r.betaDollarDeltaPer1Pct || 0), 0);
   const idxSym = (withData.find(r => r.indexSymbol) || {}).indexSymbol || '^GSPC';
 
   const setPnlText = (id, val, dp=0) => {
@@ -3188,7 +3395,10 @@ function updateSummary(rows) {
     + scen(idxSym + ' β', totalBetaUp, totalBetaDown)
     + '<div class="rrow"><span class="rlbl">Θ / Vega</span>'
       + '<span class="' + cls(totalTheta) + '">Θ ' + fmtSignedDollar(totalTheta, 2) + '/d</span>'
-      + '<span class="' + cls(totalVega) + '">V ' + fmtSignedDollar(totalVega, 2) + '/1%</span></div>';
+      + '<span class="' + cls(totalVega) + '">V ' + fmtSignedDollar(totalVega, 2) + '/1%</span></div>'
+    + '<div class="rrow" title="Portfolio beta-weighted net delta: total theoretical $ P&L for a +1% move in the reference index (Σ per-position $Δ × β). Your aggregate calibrated leverage in index terms.">'
+      + '<span class="rlbl">β-wtd Δ</span>'
+      + '<span class="' + cls(totalBetaDelta) + '">' + fmtSignedDollar(totalBetaDelta, 0) + ' /+1% ' + idxSym + '</span></div>';
 }
 
 async function loadPositions() {
@@ -3264,11 +3474,19 @@ function renderTable() {
     const tr = document.createElement('tr');
     const dte = dteFromExp(p.expiration);
     // Both legs collapsed into one "Quote" column: long then short, one line
-    // each — side+strike, then bid / ask / last / vol / IV.
+    // each — side+strike, then bid / ask / last / vol / IV. A leg whose last
+    // trade predates the quote snapshot by more than a day gets a staleness
+    // flag — its bid/ask may not reflect a tradable market.
+    const legStale = (leg) => {
+      if (!leg || !leg.lastTrade || !p.quoteTime) return '';
+      const age = p.quoteTime - leg.lastTrade;
+      if (age <= 86400) return '';
+      return `<span class="stale-flag" title="Last trade ${Math.floor(age / 86400)}d before this quote snapshot — bid/ask may be stale">&#9888;</span>`;
+    };
     const legLine = (leg, side, strike) => {
       if (!leg) return `<span><span class="strike">${side} ${strike}</span> <span class="quote err-row">missing</span></span>`;
       const ivStr = leg.iv !== null && leg.iv !== undefined ? leg.iv.toFixed(1) + '%' : '--';
-      return `<span><span class="strike">${side} ${strike}</span> <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span></span>`;
+      return `<span><span class="strike">${side} ${strike}</span> <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span>${legStale(leg)}</span>`;
     };
     const quoteCell = `<td><div class="leg-block">
       ${legLine(p.long, 'L', p.longStrike)}
@@ -3666,6 +3884,15 @@ function buildPnlChart(s) {
 # Copy of the finder's Spread Detail popup content (inner HTML only — the host
 # element already has the .row-tooltip styling).
 SPREAD_TOOLTIP_JS = r'''
+// Compact "how long ago" label for a last-trade epoch (seconds).
+function tradeAgeStr(epoch) {
+  if (!epoch) return 'n/a';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
+  if (secs < 3600) return Math.floor(secs / 60) + 'm';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+  return Math.floor(secs / 86400) + 'd';
+}
+
 function buildSpreadTooltip(s) {
   const m = 100, c = s.contracts;
   const buyEach = (s.buyAsk * m).toLocaleString('en-US', {maximumFractionDigits: 0});
@@ -3680,7 +3907,9 @@ function buildSpreadTooltip(s) {
     <span class="tt-sell">Recv:</span> $${sellEach} × ${c} = $${(s.sellBid * m * c).toLocaleString('en-US', {maximumFractionDigits: 0})}<br>
     <span class="tt-net">Net:&nbsp; $${netEach} × ${c} = $${totalDollars}</span><br>
     <span class="tt-dim">Comm: $${s.commissionPerSpread.toFixed(2)} × ${c} = $${s.totalCommission.toFixed(2)} RT</span><br>
-    <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x
+    <span class="tt-dim">Max Profit</span> $${(s.maxProfit * m).toLocaleString('en-US', {maximumFractionDigits: 0})} &nbsp;·&nbsp; <span class="tt-dim">R/R</span> ${s.rewardRisk.toFixed(1)}x &nbsp;·&nbsp; <span class="tt-dim">Lev</span> ${s.leverage.toFixed(1)}x<br>
+    <span class="tt-dim">EV</span> ${s.evPrem != null ? (s.evPrem >= 0 ? '+' : '') + s.evPrem.toFixed(1) + '%' : '--'} &nbsp;·&nbsp; <span class="tt-dim">P(prof exp)</span> ${s.probProfitExp != null ? s.probProfitExp.toFixed(1) + '%' : '--'} &nbsp;·&nbsp; <span class="tt-dim">P(&minus;50%)</span> ${s.probLoss50 != null ? s.probLoss50.toFixed(1) + '%' : '--'}<br>
+    <span class="tt-dim">Med d&rarr;tgt</span> ${s.medianDaysToTarget != null ? s.medianDaysToTarget.toFixed(0) + 'd' : '--'} &nbsp;·&nbsp; <span class="tt-dim">Velocity</span> ${s.retVelocity != null ? s.retVelocity.toFixed(2) + '%/d' : '--'} &nbsp;·&nbsp; <span class="tt-dim">Last trade</span> L ${tradeAgeStr(s.lastTradeBuy)} / S ${tradeAgeStr(s.lastTradeSell)}
     <div class="tt-sep"></div>
     ${buildPnlChart(s)}`;
 }
@@ -3775,17 +4004,21 @@ SCATTER_PAGE = r"""<!DOCTYPE html>
 <script>
 // ---- data handed over from the finder via localStorage ----
 let spreads = [], currentSpot = null, currentSymbol = '', rfRate = 0.045, movePct = 1, targetPct = 5;
-try {
-  const raw = localStorage.getItem('finderScatterData');
-  if (raw) {
-    const d = JSON.parse(raw);
-    spreads = d.spreads || [];
-    currentSpot = d.spot; currentSymbol = d.symbol || '';
-    rfRate = (d.rfRate != null ? d.rfRate : 0.045);
-    movePct = (d.movePct != null ? d.movePct : 1);
-    targetPct = (d.profitTargetPct != null ? d.profitTargetPct : 5);
-  }
-} catch (e) {}
+let panelsReady = false;
+function loadScatterData() {
+  try {
+    const raw = localStorage.getItem('finderScatterData');
+    if (raw) {
+      const d = JSON.parse(raw);
+      spreads = d.spreads || [];
+      currentSpot = d.spot; currentSymbol = d.symbol || '';
+      rfRate = (d.rfRate != null ? d.rfRate : 0.045);
+      movePct = (d.movePct != null ? d.movePct : 1);
+      targetPct = (d.profitTargetPct != null ? d.profitTargetPct : 5);
+    }
+  } catch (e) {}
+}
+loadScatterData();
 
 // ---- plottable columns (mirror the results table) ----
 const mvLbl = (Number.isInteger(movePct) ? movePct : movePct) + '%';
@@ -3795,9 +4028,13 @@ const COLS = [
   {key:'returnAtMove', label:'Return @ +'+mvLbl,    get:s=>s.returnAtMove},
   {key:'rewardRisk',   label:'Reward/Risk',        get:s=>s.rewardRisk},
   {key:'probTarget',   label:'P(+'+targetPct+'%)',  get:s=>s.probTarget},
+  {key:'probProfitExp', label:'P(profit @exp)',     get:s=>s.probProfitExp},
+  {key:'medianDaysToTarget', label:'Median days→target', get:s=>s.medianDaysToTarget},
+  {key:'retVelocity',  label:'Velocity %/day',     get:s=>s.retVelocity},
+  {key:'evPrem',       label:'EV % of prem',       get:s=>s.evPrem},
   {key:'premium',      label:'Premium $',          get:s=>s.totalPremium*100},
   {key:'maxProfit',    label:'Max Profit $',       get:s=>s.maxProfit*100},
-  {key:'pnlMove',      label:'P&L @'+mvLbl+' $',    get:s=>s.pnl1pct*100},
+  {key:'pnlMove',      label:'P&L @'+mvLbl+' $',    get:s=>s.returnAtMove != null ? s.returnAtMove / 100 * s.totalPremium * 100 : null},
   {key:'return1sigma', label:'Return 1σ 1d %',      get:s=>s.return1sigma},
   {key:'beMovePct',    label:'BE Move %',          get:s=>s.breakevenMovePct},
   {key:'beMoveSigma',  label:'BE Move σ',          get:s=>s.breakevenMoveSigma},
@@ -3955,17 +4192,47 @@ function initPanel(idx, defs) {
   z.addEventListener('change', () => render(idx));
   wireHover(document.getElementById('plot'+idx));
 }
-document.getElementById('title').textContent = 'Spread Scatter' + (currentSymbol ? ' — ' + currentSymbol : '');
-document.getElementById('meta').textContent = spreads.length ? (spreads.length + ' spreads' + (currentSpot ? ' · spot ' + currentSpot : '')) : '';
-if (!spreads.length) {
-  document.getElementById('empty').style.display = 'flex';
-  document.getElementById('panels').style.display = 'none';
-} else {
-  initPanel(0, {x:'leverage', y:'returnAtMove', z:'__dte__'});
-  initPanel(1, {x:'rewardRisk', y:'probTarget', z:'__dte__'});
-  renderAll();
+// Recovery-move % and profit-target % are baked into a few axis labels; refresh
+// them (and the already-rendered <option> text) whenever fresh data arrives.
+function updateDynamicLabels() {
+  const mv = movePct + '%';
+  colByKey.returnAtMove.label = 'Return @ +' + mv;
+  colByKey.pnlMove.label = 'P&L @' + mv + ' $';
+  colByKey.probTarget.label = 'P(+' + targetPct + '%)';
+  ['x0','y0','z0','x1','y1','z1'].forEach(id => {
+    const el = document.getElementById(id); if (!el) return;
+    [...el.options].forEach(o => { if (colByKey[o.value]) o.textContent = colByKey[o.value].label; });
+  });
 }
+// Render/refresh the page from the current `spreads`. Safe to call repeatedly: the
+// panels initialize once, then subsequent calls just re-render (preserving axis picks).
+function applyData() {
+  document.getElementById('title').textContent = 'Spread Scatter' + (currentSymbol ? ' — ' + currentSymbol : '');
+  document.getElementById('meta').textContent = spreads.length ? (spreads.length + ' spreads' + (currentSpot ? ' · spot ' + currentSpot : '')) : '';
+  if (spreads.length) {
+    document.getElementById('empty').style.display = 'none';
+    document.getElementById('panels').style.display = '';
+    if (!panelsReady) {
+      initPanel(0, {x:'leverage', y:'returnAtMove', z:'__dte__'});
+      initPanel(1, {x:'rewardRisk', y:'probTarget', z:'__dte__'});
+      panelsReady = true;
+    }
+    updateDynamicLabels();
+    renderAll();
+  } else {
+    document.getElementById('empty').style.display = 'flex';
+    document.getElementById('panels').style.display = 'none';
+  }
+}
+applyData();
 window.addEventListener('resize', renderAll);
+// Live sync: the finder re-stashes results (with a fresh ts) on every search and
+// weight change, which fires this 'storage' event in this tab — re-read & re-render.
+window.addEventListener('storage', (e) => {
+  if (e.key && e.key !== 'finderScatterData') return;
+  loadScatterData();
+  applyData();
+});
 </script>
 </body>
 </html>
@@ -4295,6 +4562,13 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+    # Rehydrate the Test-mode chain cache from disk so a cache captured while
+    # quotes were live (e.g. Friday's session) survives restarts. Cleared only
+    # via the "Clear cache" button.
+    n_cached = _load_chain_cache()
+    if n_cached:
+        print(f"  Chain cache: {n_cached} chain(s) loaded from {CHAIN_CACHE_FILE.name}")
 
     httpd, port = start_server(PORT)
 
