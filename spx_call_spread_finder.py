@@ -428,6 +428,32 @@ def _load_chain_cache():
 # when scanning after hours.
 STALE_TRADE_AGE_SECS = 86400
 
+# Yahoo reports a near-zero impliedVolatility for contracts with no live
+# two-sided quote (market open, after hours, weekends). IVs below this floor
+# are presumed bogus: ATM-IV selection prefers live-quoted strikes above it,
+# and the monitor swaps untrusted leg IVs for a fallback (see _trusted_leg_iv).
+MIN_TRUSTED_IV = 0.05
+
+
+def _atm_iv_from_calls(calls, spot):
+    """ATM IV from a calls DataFrame: the IV of the nearest-to-spot strike.
+
+    Restricted to strikes with a live two-sided quote and an IV above
+    MIN_TRUSTED_IV when any exist, so an unquoted contract sitting closest to
+    spot can't hand back a bogus near-zero vol; falls back to any positive IV,
+    else None.
+    """
+    if spot is None or calls is None or calls.empty:
+        return None
+    valid = calls[calls["impliedVolatility"] > 0]
+    if valid.empty:
+        return None
+    live = valid[(valid["bid"] > 0) & (valid["ask"] > 0) &
+                 (valid["impliedVolatility"] >= MIN_TRUSTED_IV)]
+    pool = live if not live.empty else valid
+    idx = (pool["strike"] - spot).abs().idxmin()
+    return float(pool.loc[idx, "impliedVolatility"])
+
 
 def _last_trade_epoch(row):
     """Epoch seconds of a chain row's lastTradeDate, or None if missing/NaT."""
@@ -545,10 +571,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
         if all_exps:
             near_atm_exp = all_exps[0]
             nc = get_option_chain(ticker, symbol, near_atm_exp, test_mode).calls
-            nc = nc[nc["impliedVolatility"] > 0]
-            if not nc.empty:
-                idx = (nc["strike"] - spot).abs().idxmin()
-                atm_iv = float(nc.loc[idx, "impliedVolatility"])
+            atm_iv = _atm_iv_from_calls(nc, spot)
     except Exception:
         pass
 
@@ -583,12 +606,9 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                 print(f"  {exp_date_str}: skipped (empty chain)")
                 continue
 
-            # ATM IV for this expiration: pick the call strike closest to spot with a valid IV.
-            exp_atm_iv = None
-            valid_iv_calls = calls[calls["impliedVolatility"] > 0]
-            if not valid_iv_calls.empty:
-                idx = (valid_iv_calls["strike"] - spot).abs().idxmin()
-                exp_atm_iv = float(valid_iv_calls.loc[idx, "impliedVolatility"])
+            # ATM IV for this expiration: nearest-to-spot strike with a
+            # trustworthy IV (live-quoted strikes preferred).
+            exp_atm_iv = _atm_iv_from_calls(calls, spot)
 
             # Simulate underlying paths once per expiration; every spread below reuses
             # them for its profit-target probability (P(+X%)).
@@ -1026,10 +1046,7 @@ def get_index_sigma_1d(index_symbol, test_mode=False):
             if exps:
                 oc = get_option_chain(tk, index_symbol, exps[0], test_mode)
                 spot = _underlying_spot_and_time(oc, tk)[0]
-                valid = oc.calls[oc.calls["impliedVolatility"] > 0]
-                if spot and not valid.empty:
-                    i = (valid["strike"] - spot).abs().idxmin()
-                    annual_iv = float(valid.loc[i, "impliedVolatility"])
+                annual_iv = _atm_iv_from_calls(oc.calls, spot)
         except Exception:
             annual_iv = None
     if not annual_iv or annual_iv <= 0:
@@ -1051,14 +1068,9 @@ def get_atm_iv_30d(symbol, target_days=30, test_mode=False):
         best = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - now).days - target_days))
         oc = get_option_chain(tk, symbol, best, test_mode)
         spot = _underlying_spot_and_time(oc, tk)[0]
-        valid = oc.calls[oc.calls["impliedVolatility"] > 0]
-        if spot and not valid.empty:
-            i = (valid["strike"] - spot).abs().idxmin()
-            iv = float(valid.loc[i, "impliedVolatility"])
-            return iv if iv > 0 else None
+        return _atm_iv_from_calls(oc.calls, spot)
     except Exception:
         return None
-    return None
 
 
 def spread_shock_pnl(spot, dS, K1, K2, T, r, iv_l, iv_s, contracts):
@@ -1112,6 +1124,30 @@ def _leg_snapshot(row):
             "iv": round(iv * 100, 1) if iv is not None else None,
             "lastTrade": _last_trade_epoch(row),
             "_iv_raw": iv}
+
+
+def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
+    """Best-usable IV for one leg of a monitored spread.
+
+    Yahoo reports a near-zero impliedVolatility for contracts with no live
+    two-sided quote (market open, after hours, weekends); fed straight into
+    Black-Scholes it prices the leg as worthless and zeroes every derived
+    column (Net Delta, Daily Theo P&L, ±σ shocks, P(+X%)). Trust the leg's
+    quoted IV only when it comes with a live two-sided market and clears
+    MIN_TRUSTED_IV; otherwise fall back to the expiration's ATM IV, then to
+    the IV re-implied from the leg's own mark, then to the raw value.
+    """
+    iv = leg.get("_iv_raw")
+    if iv and iv >= MIN_TRUSTED_IV and leg.get("quotedMid"):
+        return iv
+    if atm_iv and atm_iv >= MIN_TRUSTED_IV:
+        return atm_iv
+    mark = leg.get("mid")
+    if spot and mark and mark > 0 and T > 0:
+        implied = implied_vol(mark, spot, strike, T, r)
+        if implied and implied >= MIN_TRUSTED_IV:
+            return implied
+    return iv
 
 
 # ---- P&L history (in-memory, per-server-session) ----
@@ -1298,16 +1334,16 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                 T = dte / 365.0
                 result["dte"] = dte
                 r = RISK_FREE_RATE_PCT / 100.0
-                iv_l = long_leg.get("_iv_raw")
-                iv_s = short_leg.get("_iv_raw")
 
-                # ATM IV for this expiration: nearest-to-spot strike with a valid IV.
-                # Used both for the 1σ greeks below and to diffuse the P(+X%) paths.
-                atm_iv = None
-                valid_iv_calls = calls[calls["impliedVolatility"] > 0]
-                if not valid_iv_calls.empty:
-                    idx = (valid_iv_calls["strike"] - spot).abs().idxmin()
-                    atm_iv = float(valid_iv_calls.loc[idx, "impliedVolatility"])
+                # ATM IV for this expiration: used for the 1σ greeks below, to
+                # diffuse the P(+X%) paths, and as the fallback for untrusted
+                # leg IVs.
+                atm_iv = _atm_iv_from_calls(calls, spot)
+
+                # Leg IVs for every BS-derived column, distrusting Yahoo's
+                # bogus near-zero IVs on unquoted contracts (see _trusted_leg_iv).
+                iv_l = _trusted_leg_iv(long_leg, spot, float(p["longStrike"]), T, r, atm_iv)
+                iv_s = _trusted_leg_iv(short_leg, spot, float(p["shortStrike"]), T, r, atm_iv)
 
                 if iv_l and iv_s and T > 0:
                     K1 = float(p["longStrike"])
