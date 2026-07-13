@@ -1289,7 +1289,7 @@ def check_pnl_alerts(quotes):
                 key = f"{pid}|{thr:g}"
                 if pct > thr and key not in state["sent"]:
                     state["sent"].append(key)
-                    body = (f"{_position_name(q)}: Adj P&L crossed +{thr:g}% "
+                    body = (f"{_position_name(q)}: Adj P&L (mid) crossed +{thr:g}% "
                             f"(now {pct:+.2f}%, ${q.get('adjPnl') or 0:+,.0f})")
                     to_send.append((state["topic"], body))
         _save_alerts(state)
@@ -1335,8 +1335,15 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                           index_symbol=DEFAULT_INDEX, n_sigma=1.0, test_mode=False):
     """Fetch live leg data for every saved position, batching chain calls.
 
-    haircut_pct: multiplier applied to (raw P&L − entry commission − exit commission)
-    to produce Adjusted P&L. Exit commission is assumed equal to entry commission.
+    P&L comes in best/worst pairs per exit assumption: `pnl`/`adjPnl` (+pcts)
+    are the BEST case — both legs closed at their bid/ask mid — and drive the
+    ntfy alerts, the P(+X%) calibration, and the P&L history; `pnlWorst`/
+    `adjPnlWorst` (+pcts) are the WORST case — pure market liquidation, long
+    sold at bid, short bought back at ask.
+
+    haircut_pct: multiplier applied to positive raw P&L (then commissions are
+    netted) to produce Adjusted P&L. Exit commission is assumed equal to entry
+    commission.
     profit_target_pct: profit target (as a % of entry cost) for the path-aware P(+X%)
     probability that the Adjusted P&L touches it before expiry.
     index_symbol: reference index for the beta-scaled Nσ index-move P&L column.
@@ -1388,6 +1395,10 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["pnlPct"] = None
         result["adjPnl"] = None
         result["adjPnlPct"] = None
+        result["pnlWorst"] = None
+        result["pnlWorstPct"] = None
+        result["adjPnlWorst"] = None
+        result["adjPnlWorstPct"] = None
         result["netDelta"] = None
         result["netThetaPerDay"] = None
         result["netVega"] = None
@@ -1433,12 +1444,20 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                 result["long"] = long_leg
                 result["short"] = short_leg
 
+                # Two exit assumptions, commission-free values:
+                #   best  — both legs at mid (spread_mid); on a leg with no live
+                #           two-sided quote _leg_snapshot's mid falls back to
+                #           max(bid, ask, last), so best ≈ stale last there (the
+                #           staleness ⚠ already flags those rows);
+                #   worst — pure market liquidation: sell long at bid, buy short
+                #           at ask (spread_liq).
+                # pnl/adjPnl are the BEST (mid) figures — they drive the ntfy
+                # alerts, the P(+X%) calibration, and the P&L history; the
+                # *Worst twins are the liquidation floor shown alongside.
                 spread_mid = long_leg["mid"] - short_leg["mid"]
                 spread_liq = long_leg["bid"] - short_leg["ask"]
-                # currentValue is the pure market liquidation (sell long at bid, buy short at ask),
-                # commission-free. Commissions and haircut are applied only to adjPnl.
-                current_value = round(spread_liq * 100 * contracts, 2)
-                liquidation_value = current_value
+                current_value = round(spread_mid * 100 * contracts, 2)
+                liquidation_value = round(spread_liq * 100 * contracts, 2)
 
                 result["spreadMid"] = round(spread_mid, 2)
                 result["spreadLiquidation"] = round(spread_liq, 2)
@@ -1446,17 +1465,24 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                 result["liquidationValue"] = liquidation_value
 
                 if result["entryCost"]:
-                    result["pnl"] = round(current_value - result["entryCost"], 2)
-                    result["pnlPct"] = round(result["pnl"] / abs(result["entryCost"]) * 100, 2)
+                    entry_cost = result["entryCost"]
                     total_comm = entry_commission * 2  # exit assumed equal to entry
-                    # Haircut applied only when raw P&L is positive (models exit slippage on gains);
-                    # losses pass through untouched. Commissions are then netted in full.
-                    if result["pnl"] > 0:
-                        after_haircut = result["pnl"] * haircut_pct
-                    else:
-                        after_haircut = result["pnl"]
-                    result["adjPnl"] = round(after_haircut - total_comm, 2)
-                    result["adjPnlPct"] = round(result["adjPnl"] / abs(result["entryCost"]) * 100, 2)
+
+                    def pnl_pair(value):
+                        """(raw, raw%, adj, adj%) for one exit-value assumption.
+                        Haircut applies only when raw P&L is positive (models exit
+                        slippage on gains); losses pass through untouched.
+                        Commissions are then netted in full."""
+                        raw = round(value - entry_cost, 2)
+                        after_haircut = raw * haircut_pct if raw > 0 else raw
+                        adj = round(after_haircut - total_comm, 2)
+                        return (raw, round(raw / abs(entry_cost) * 100, 2),
+                                adj, round(adj / abs(entry_cost) * 100, 2))
+
+                    (result["pnl"], result["pnlPct"],
+                     result["adjPnl"], result["adjPnlPct"]) = pnl_pair(current_value)
+                    (result["pnlWorst"], result["pnlWorstPct"],
+                     result["adjPnlWorst"], result["adjPnlWorstPct"]) = pnl_pair(liquidation_value)
 
                 # Greeks — use both leg IVs; skip if either IV missing
                 exp_dt = datetime.strptime(exp, "%Y-%m-%d")
@@ -1543,7 +1569,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                 # Path-aware P(+X%): probability the Adjusted P&L touches profit_target_pct
                 # of entry cost before expiry. Paths are simulated once per (symbol, exp).
                 if (iv_l and iv_s and atm_iv and T > 0 and result["entryCost"]
-                        and result["spreadLiquidation"] is not None):
+                        and result["spreadMid"] is not None):
                     if key not in paths_cache:
                         paths_cache[key] = simulate_paths(
                             spot, atm_iv, T, MC_PATHS_MONITOR, max(1, dte),
@@ -1551,11 +1577,11 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                     tgt_paths, tgt_T_remaining = paths_cache[key]
                     K1 = float(p["longStrike"])
                     K2 = float(p["shortStrike"])
-                    # Calibrate BS-mid to the current quoted liquidation (the value the
-                    # Adj P&L column is based on) so the barrier is anchored to reality.
+                    # Calibrate BS-mid to the current quoted mid (the best-case value
+                    # the Adj P&L column is based on) so the barrier is anchored to reality.
                     bs_mid_now = (bs_call_price(spot, K1, T, r, iv_l)
                                   - bs_call_price(spot, K2, T, r, iv_s))
-                    value_offset = bs_mid_now - result["spreadLiquidation"]
+                    value_offset = bs_mid_now - result["spreadMid"]
                     mc = spread_mc_stats(
                         tgt_paths, tgt_T_remaining, K1, K2, iv_l, iv_s, r, T,
                         long_entry - short_entry, contracts,
@@ -3459,11 +3485,11 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
   <div class="summary-grid">
     <div class="stat"><div class="stat-label">Positions</div><div class="stat-value mono" id="sumCount">0</div></div>
     <div class="stat"><div class="stat-label">Entry Cost</div><div class="stat-value mono" id="sumEntry">--</div></div>
-    <div class="stat"><div class="stat-label">Current Value</div><div class="stat-value mono" id="sumCurrent">--</div></div>
-    <div class="stat"><div class="stat-label">Total P&amp;L</div><div class="stat-value mono" id="sumPnl">--</div></div>
+    <div class="stat"><div class="stat-label">Current Value (mid)</div><div class="stat-value mono" id="sumCurrent">--</div><div class="stat-sub mono" id="sumCurrentLiq">--</div></div>
+    <div class="stat"><div class="stat-label">Total P&amp;L (best)</div><div class="stat-value mono" id="sumPnl">--</div><div class="stat-sub mono" id="sumPnlWorst">--</div></div>
     <div class="stat-highlight">
-      <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
-      <div class="stat"><div class="stat-label">Total Return</div><div class="stat-value mono" id="sumRet">--</div></div>
+      <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlWorst">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
+      <div class="stat"><div class="stat-label">Total Return (best)</div><div class="stat-value mono" id="sumRet">--</div><div class="stat-sub mono" id="sumRetWorst">--</div></div>
     </div>
     <div class="stat stat-risk">
       <div class="stat-label" id="sumRiskLabel">Scenario P&amp;L (&plusmn;1&sigma;)</div>
@@ -3481,9 +3507,9 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th title="Both legs — L = long, S = short — with strike, then bid / ask / last / vol / IV.">Quote</th>
         <th>Contracts</th>
         <th title="Per-spread prices: net premium paid at entry (long entry − short entry) over the current liquidation (long bid − short ask).">Entry / Liq</th>
-        <th title="Total premium paid at entry (top) over the current total value / liquidation (bottom), with entry commission as subtext.">Cost / Value</th>
-        <th>P&amp;L</th>
-        <th id="colAdjPnlLabel" class="adj-col">Adj P&amp;L (80%)</th>
+        <th title="Total premium paid at entry (top), then the current total value at mid (best: both legs at bid/ask midpoint) and at liquidation (worst: long sold at bid, short bought at ask), with entry commission as subtext.">Cost / Value</th>
+        <th title="Raw P&amp;L vs entry cost. best = exit both legs at mid; worst = liquidation (long @ bid, short @ ask).">P&amp;L</th>
+        <th id="colAdjPnlLabel" class="adj-col" title="Adjusted P&amp;L: haircut on gains, then round-trip commission. best = mid exit (drives alerts and P(+X%)); worst = liquidation exit.">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+15%)</th>
         <th>Daily Theo P&amp;L</th>
         <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
@@ -3547,10 +3573,14 @@ function updateSummary(rows) {
 
   const totalEntry = withData.reduce((s, r) => s + r.entryCost, 0);
   const totalCurrent = withData.reduce((s, r) => s + (r.currentValue || 0), 0);
+  const totalLiq = withData.reduce((s, r) => s + (r.liquidationValue || 0), 0);
   const totalPnl = withData.reduce((s, r) => s + r.pnl, 0);
+  const totalPnlWorst = withData.reduce((s, r) => s + (r.pnlWorst || 0), 0);
   const totalAdjPnl = withData.reduce((s, r) => s + (r.adjPnl || 0), 0);
+  const totalAdjPnlWorst = withData.reduce((s, r) => s + (r.adjPnlWorst || 0), 0);
   const totalDailyTheoPnl = withData.reduce((s, r) => s + (r.dailyTheoPnl || 0), 0);
   const totalRet = totalEntry ? (totalAdjPnl / Math.abs(totalEntry)) * 100 : 0;
+  const totalRetWorst = totalEntry ? (totalAdjPnlWorst / Math.abs(totalEntry)) * 100 : 0;
   const totalDailyTheoPct = totalEntry ? (totalDailyTheoPnl / Math.abs(totalEntry)) * 100 : 0;
   const totalDelta = withData.reduce((s, r) => s + (r.netDelta || 0), 0);
   const totalOneSigmaPnl = withData.reduce((s, r) => s + (r.oneSigmaPnl || 0), 0);
@@ -3568,14 +3598,26 @@ function updateSummary(rows) {
     el.className = 'stat-value mono ' + (val >= 0 ? 'pnl-pos' : 'pnl-neg');
   };
 
+  // Worst (liquidation-exit) counterparts render as dim-sized sublines,
+  // colored by their own sign, under each best-based tile.
+  const setWorstSub = (id, text, val) => {
+    const el = $(id);
+    el.textContent = text;
+    el.className = 'stat-sub mono ' + (val >= 0 ? 'pnl-pos' : 'pnl-neg');
+  };
+
   $('sumCount').textContent = rows.length;
   $('sumEntry').textContent = '$' + totalEntry.toLocaleString('en-US', {maximumFractionDigits: 0});
   $('sumCurrent').textContent = '$' + totalCurrent.toLocaleString('en-US', {maximumFractionDigits: 0});
+  $('sumCurrentLiq').textContent = 'liq $' + totalLiq.toLocaleString('en-US', {maximumFractionDigits: 0});
   setPnlText('sumPnl', totalPnl);
+  setWorstSub('sumPnlWorst', 'worst ' + fmtSignedDollar(totalPnlWorst, 0), totalPnlWorst);
   const retEl = $('sumRet');
   retEl.textContent = (totalRet >= 0 ? '+' : '') + totalRet.toFixed(2) + '%';
   retEl.className = 'stat-value mono ' + (totalRet >= 0 ? 'pnl-pos' : 'pnl-neg');
+  setWorstSub('sumRetWorst', 'worst ' + sign(totalRetWorst) + totalRetWorst.toFixed(2) + '%', totalRetWorst);
   setPnlText('sumAdjPnl', totalAdjPnl);
+  setWorstSub('sumAdjPnlWorst', 'worst ' + fmtSignedDollar(totalAdjPnlWorst, 0), totalAdjPnlWorst);
   // Daily theoretical P&L: sum of each position's BS reprice for the underlying's
   // one-day move (spot vs. prior close). Independent of the stale option quotes.
   const dayEl = $('sumAdjPnlDay');
@@ -3717,26 +3759,35 @@ function renderTable() {
       </div></td>`;
     }
 
+    // Best (mid) / worst (liq) P&L stacked in one cell, each line colored by
+    // its own sign, percent inline.
+    const bwLine = (lbl, v, pct) => {
+      const cls = v >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const pctStr = (pct !== null && pct !== undefined) ? ` ${sign(pct)}${pct.toFixed(2)}%` : '';
+      return `<span class="${cls}"><span class="tt-dim">${lbl}</span> ${sign(v)}${dollarFmt(v, 0)}${pctStr}</span>`;
+    };
     let pnlCell = '<td class="dim">--</td>';
     if (p.pnl !== null && p.pnl !== undefined) {
-      const cls = p.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const worst = (p.pnlWorst !== null && p.pnlWorst !== undefined)
+        ? bwLine('worst', p.pnlWorst, p.pnlWorstPct) : '';
       pnlCell = `<td><div class="pnl-block">
-        <span class="${cls}">${sign(p.pnl)}${dollarFmt(p.pnl, 0)}</span>
-        <span class="${cls} pct">${sign(p.pnlPct)}${p.pnlPct.toFixed(2)}%</span>
+        ${bwLine('best', p.pnl, p.pnlPct)}
+        ${worst}
       </div></td>`;
     }
 
     let adjPnlCell = '<td class="dim adj-col">--</td>';
     if (p.adjPnl !== null && p.adjPnl !== undefined) {
-      const cls = p.adjPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
       const totalComm = (p.totalCommission != null) ? p.totalCommission : 0;
       const hcLabel = (p.haircutPct != null) ? p.haircutPct.toFixed(0) : '80';
       const derivation = (p.pnl > 0)
         ? `pnl × ${hcLabel}% − $${totalComm.toFixed(2)} comm`
         : `pnl − $${totalComm.toFixed(2)} comm (no haircut on loss)`;
+      const worst = (p.adjPnlWorst !== null && p.adjPnlWorst !== undefined)
+        ? bwLine('worst', p.adjPnlWorst, p.adjPnlWorstPct) : '';
       adjPnlCell = `<td class="adj-col"><div class="pnl-block">
-        <span class="${cls}">${sign(p.adjPnl)}${dollarFmt(p.adjPnl, 0)}</span>
-        <span class="${cls} pct">${sign(p.adjPnlPct)}${p.adjPnlPct.toFixed(2)}%</span>
+        ${bwLine('best', p.adjPnl, p.adjPnlPct)}
+        ${worst}
         <span class="tt-dim">${derivation}</span>
       </div></td>`;
     }
@@ -3785,14 +3836,17 @@ function renderTable() {
       <span class="mono">${lq} <span class="tt-dim">liq</span></span>
     </div>`;
     // Entry Cost and Current Value collapsed into one column: total premium paid
-    // over the current total value, with the entry commission as subtext.
+    // over the current total value at mid (best) and at liquidation (worst),
+    // with the entry commission as subtext.
     const cv = (p.currentValue !== null && p.currentValue !== undefined) ? dollarFmt(p.currentValue, 0) : '--';
+    const lv = (p.liquidationValue !== null && p.liquidationValue !== undefined) ? dollarFmt(p.liquidationValue, 0) : '--';
     let costValCell = '<div class="pnl-block"><span class="dim">--</span></div>';
     if (p.entryCost !== null && p.entryCost !== undefined) {
       const entryComm = (p.entryCommission != null) ? p.entryCommission : 0;
       costValCell = `<div class="pnl-block">
         <span class="mono">${dollarFmt(p.entryCost, 0)} <span class="tt-dim">cost</span></span>
-        <span class="mono">${cv} <span class="tt-dim">value</span></span>
+        <span class="mono">${cv} <span class="tt-dim">value(mid)</span></span>
+        <span class="mono">${lv} <span class="tt-dim">value(liq)</span></span>
         <span class="tt-dim">entry comm $${entryComm.toFixed(2)}</span>
       </div>`;
     }
