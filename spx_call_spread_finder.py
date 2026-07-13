@@ -17,26 +17,22 @@ import math
 import os
 import pickle
 import sys
-import subprocess
 import threading
 import uuid
 import webbrowser
 import socketserver
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
-# Auto-install yfinance if missing
+# Market data: all vendor access goes through the pluggable PriceSource layer
+# (price_sources.py, which also owns the yfinance import + auto-install).
+# This file must contain no direct yf.* calls.
 # ---------------------------------------------------------------------------
-try:
-    import yfinance as yf
-except ImportError:
-    print("Installing yfinance...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "yfinance", "-q"])
-    import yfinance as yf
+from price_sources import (_YAHOO_SOURCE, SOURCES, get_source,
+                           set_active_source, register_sources)
 
 import numpy as np  # ships with pandas/yfinance; used for the Monte Carlo path engine
 import pandas as pd  # ships with yfinance; used for the beta regression on daily returns
@@ -49,12 +45,15 @@ PORT = 8765
 
 def fetch_risk_free_rate():
     """Fetch the current 3-month T-bill rate from Yahoo Finance (^IRX).
-    Returns the rate as a percentage (e.g. 4.5 for 4.5%). Falls back to 4.5 on failure."""
+    Returns the rate as a percentage (e.g. 4.5 for 4.5%). Falls back to 4.5 on failure.
+
+    Deliberately pinned to _YAHOO_SOURCE, not get_source(): this runs at module
+    import, before sources.json is loaded, and the T-bill rate is reference
+    data where Yahoo's delay is irrelevant."""
     try:
-        irx = yf.Ticker("^IRX")
-        hist = irx.history(period="5d")
+        hist = _YAHOO_SOURCE.get_daily_closes("^IRX", "5d")
         if not hist.empty:
-            rate = float(hist['Close'].iloc[-1])
+            rate = float(hist.iloc[-1])
             print(f"  Risk-free rate (3-mo T-bill): {rate:.2f}%")
             return round(rate, 2)
     except Exception as e:
@@ -355,29 +354,18 @@ def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 
 # Test-mode option-chain cache — when Test mode is toggled on in the UI, each
 # underlying's option chain and expiration list are fetched once and reused, so
-# repeated searches against a static (after-hours) market don't re-hit Yahoo or
-# trip its rate limits. Mirrored to disk (CHAIN_CACHE_FILE): chains with live
+# repeated searches against a static (after-hours) market don't re-hit the
+# vendor or trip its rate limits. Keys are qualified by the active source's
+# name, so frozen Yahoo data is never served while another source is active
+# (and vice versa). Mirrored to disk (CHAIN_CACHE_FILE): chains with live
 # two-sided quotes are persisted as they're fetched and reloaded at startup, so
 # a Friday-session cache survives restarts and powers weekend Test-mode scans.
 # Emptied (memory AND disk) only via the "Clear cache" button.
-_TEST_CHAIN_CACHE = {}   # (symbol, exp) -> chain snapshot (SimpleNamespace)
-_TEST_EXP_CACHE = {}     # symbol -> expirations tuple
+_TEST_CHAIN_CACHE = {}   # (source, symbol, exp) -> chain snapshot (SimpleNamespace)
+_TEST_EXP_CACHE = {}     # (source, symbol) -> expirations tuple
 
 CHAIN_CACHE_FILE = Path(__file__).parent / "chain_cache.pkl"
-
-
-def _snap_chain(raw):
-    """Freeze a yfinance option_chain result into a plain, picklable snapshot.
-
-    Keeps exactly the attributes the app reads (.calls, .puts, .underlying) and
-    stamps the fetch time, decoupled from yfinance's own result class so the
-    disk cache survives yfinance upgrades.
-    """
-    return SimpleNamespace(
-        calls=raw.calls,
-        puts=getattr(raw, "puts", None),
-        underlying=getattr(raw, "underlying", None),
-        fetched_at=datetime.now().timestamp())
+CHAIN_CACHE_VERSION = 2   # v1 keys had no source prefix (pre-PriceSource, all Yahoo)
 
 
 def _chain_has_live_quotes(oc):
@@ -397,6 +385,7 @@ def _save_chain_cache():
     """Persist live-quality cached chains + expiration lists to disk, atomically."""
     try:
         payload = {
+            "version": CHAIN_CACHE_VERSION,
             "chains": {k: v for k, v in _TEST_CHAIN_CACHE.items()
                        if _chain_has_live_quotes(v)},
             "exps": dict(_TEST_EXP_CACHE),
@@ -416,9 +405,17 @@ def _load_chain_cache():
     try:
         with open(CHAIN_CACHE_FILE, "rb") as f:
             payload = pickle.load(f)
-        _TEST_CHAIN_CACHE.update(payload.get("chains", {}))
-        _TEST_EXP_CACHE.update(payload.get("exps", {}))
-        return len(payload.get("chains", {}))
+        chains = payload.get("chains", {})
+        exps = payload.get("exps", {})
+        if payload.get("version", 1) < 2:
+            # v1 predates the PriceSource layer: keys were (symbol, exp) /
+            # symbol and all data was Yahoo's by construction. Prefix in place
+            # so a captured Friday cache survives the upgrade.
+            chains = {("yahoo",) + k: v for k, v in chains.items()}
+            exps = {("yahoo", k): v for k, v in exps.items()}
+        _TEST_CHAIN_CACHE.update(chains)
+        _TEST_EXP_CACHE.update(exps)
+        return len(chains)
     except Exception as e:
         print(f"  Warning: could not load chain cache ({e}) — starting empty")
         return 0
@@ -470,31 +467,34 @@ def _last_trade_epoch(row):
         return None
 
 
-def get_option_chain(ticker, symbol, exp, test_mode=False):
+def get_option_chain(symbol, exp, test_mode=False):
+    src = get_source()
     if test_mode:
-        key = (symbol, exp)
+        key = (src.name, symbol, exp)
         oc = _TEST_CHAIN_CACHE.get(key)
         if oc is None:
-            oc = _snap_chain(ticker.option_chain(exp))
+            oc = src.get_option_chain(symbol, exp)
             _TEST_CHAIN_CACHE[key] = oc
             # Persist only chains with a live two-sided market so a weekend /
             # after-hours fetch (zeroed bid/ask) can't poison the disk cache.
-            # Dead chains still cache in memory to spare Yahoo within a session.
+            # Dead chains still cache in memory to spare the vendor in-session.
             if _chain_has_live_quotes(oc):
                 _save_chain_cache()
         return oc
-    return ticker.option_chain(exp)
+    return src.get_option_chain(symbol, exp)
 
 
-def get_expirations(ticker, symbol, test_mode=False):
+def get_expirations(symbol, test_mode=False):
+    src = get_source()
     if test_mode:
-        exps = _TEST_EXP_CACHE.get(symbol)
+        key = (src.name, symbol)
+        exps = _TEST_EXP_CACHE.get(key)
         if exps is None:
-            exps = ticker.options
-            _TEST_EXP_CACHE[symbol] = exps
+            exps = src.get_expirations(symbol)
+            _TEST_EXP_CACHE[key] = exps
             _save_chain_cache()
         return exps
-    return ticker.options
+    return src.get_expirations(symbol)
 
 
 def clear_test_cache():
@@ -516,16 +516,16 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
 
     Returns dict with 'spot', 'spreads', and metadata.
     """
-    ticker = yf.Ticker(symbol)
+    src = get_source()  # captured once so a mid-scan toggle can't mix sources
 
     # Get current price
-    info = ticker.history(period="1d")
+    info = src.get_daily_closes(symbol, "1d")
     if info.empty:
-        raise ValueError(f"Could not fetch {symbol} price. Market may be closed or Yahoo Finance unavailable.")
-    spot = float(info["Close"].iloc[-1])
+        raise ValueError(f"Could not fetch {symbol} price. Market may be closed or the data source unavailable.")
+    spot = float(info.iloc[-1])
 
     # Get all expiration dates
-    expirations = get_expirations(ticker, symbol, test_mode)
+    expirations = get_expirations(symbol, test_mode)
     if not expirations:
         raise ValueError("No option expiration dates available.")
 
@@ -553,14 +553,12 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
     spreads = []
 
     # Previous close (for day move)
-    prev_close = None
-    try:
-        prev_close = float(ticker.fast_info.previous_close)
-    except Exception:
+    prev_close = src.get_previous_close(symbol)
+    if prev_close is None:
         try:
-            hist = ticker.history(period="5d", interval="1d")
+            hist = src.get_daily_closes(symbol, "5d")
             if len(hist) >= 2:
-                prev_close = float(hist["Close"].iloc[-2])
+                prev_close = float(hist.iloc[-2])
         except Exception:
             pass
 
@@ -568,10 +566,10 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
     atm_iv = None
     near_atm_exp = None
     try:
-        all_exps = get_expirations(ticker, symbol, test_mode)
+        all_exps = get_expirations(symbol, test_mode)
         if all_exps:
             near_atm_exp = all_exps[0]
-            nc = get_option_chain(ticker, symbol, near_atm_exp, test_mode).calls
+            nc = get_option_chain(symbol, near_atm_exp, test_mode).calls
             atm_iv = _atm_iv_from_calls(nc, spot)
     except Exception:
         pass
@@ -600,7 +598,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                 continue
             T = dte / 365.0
 
-            chain = get_option_chain(ticker, symbol, exp_date_str, test_mode)
+            chain = get_option_chain(symbol, exp_date_str, test_mode)
             calls = chain.calls
 
             if calls.empty:
@@ -986,13 +984,55 @@ def _save_json_dict(path, obj):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Price-source config (sources.json, gitignored — holds vendor API keys).
+# The PriceSource classes/registry live in price_sources.py; this file owns
+# the config file and the server-global toggle persistence.
+# ---------------------------------------------------------------------------
+SOURCES_CONFIG_FILE = Path(__file__).parent / "sources.json"
+
+
+def _load_sources_config():
+    cfg = _load_json_dict(SOURCES_CONFIG_FILE)
+    cfg.setdefault("active", "yahoo")
+    cfg.setdefault("sources", {"yahoo": {}})
+    return cfg
+
+
+def init_sources():
+    """Load sources.json, build the source registry, and activate the saved
+    source (unknown/unusable names fall back to Yahoo with a warning).
+    Called from main(); plain module import stays Yahoo-only with no config."""
+    cfg = _load_sources_config()
+    register_sources(cfg)
+    name = cfg.get("active", "yahoo")
+    try:
+        return set_active_source(name)
+    except KeyError:
+        print(f"  Warning: configured data source '{name}' unavailable — using Yahoo")
+        return set_active_source("yahoo")
+
+
+def source_status():
+    """Payload for GET /api/source: the active source + all usable sources,
+    Yahoo first."""
+    ordered = sorted(SOURCES.values(), key=lambda s: (s.name != "yahoo", s.name))
+    return {
+        "active": get_source().name,
+        "sources": [{"name": s.name, "label": s.label, "realtime": s.realtime}
+                    for s in ordered],
+    }
+
+
 def get_betas(symbols, index_symbol):
     """Return {symbol: beta} vs. index_symbol from BETA_LOOKBACK daily returns.
 
     Beta is slow-moving, so results are cached per calendar day on disk (keyed by
     index) — the 30s quote-refresh loop then does a pure dict lookup. Only symbols
-    missing from today's cache trigger a *single batched* yfinance download of all
-    stale tickers plus the index. Symbols with insufficient history default to 1.0.
+    missing from today's cache trigger a *single batched* download of all stale
+    tickers plus the index. Symbols with insufficient history default to 1.0.
+    Cache stays keyed by index/day only (not by source): betas are statistical,
+    not quote-fresh, so cross-source sharing is intentional.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     wanted = [s for s in dict.fromkeys(symbols) if s and s != index_symbol]
@@ -1004,10 +1044,7 @@ def get_betas(symbols, index_symbol):
     if missing:
         try:
             tickers = list(dict.fromkeys(missing + [index_symbol]))
-            data = yf.download(tickers, period=BETA_LOOKBACK, interval="1d",
-                               auto_adjust=True, progress=False)["Close"]
-            if isinstance(data, pd.Series):        # single-ticker frame -> promote
-                data = data.to_frame(tickers[0])
+            data = get_source().get_daily_closes_batch(tickers, BETA_LOOKBACK)
             idx_ret = data[index_symbol].pct_change()
             var_idx = float(idx_ret.var())
             for s in missing:
@@ -1035,18 +1072,17 @@ def get_index_sigma_1d(index_symbol, test_mode=False):
     vol_ticker = VOL_INDEX_MAP.get(index_symbol.upper())
     if vol_ticker:
         try:
-            h = yf.Ticker(vol_ticker).history(period="5d")
+            h = get_source().get_daily_closes(vol_ticker, "5d")
             if not h.empty:
-                annual_iv = float(h["Close"].iloc[-1]) / 100.0
+                annual_iv = float(h.iloc[-1]) / 100.0
         except Exception:
             annual_iv = None
     if annual_iv is None:
         try:
-            tk = yf.Ticker(index_symbol)
-            exps = get_expirations(tk, index_symbol, test_mode)
+            exps = get_expirations(index_symbol, test_mode)
             if exps:
-                oc = get_option_chain(tk, index_symbol, exps[0], test_mode)
-                spot = _underlying_spot_and_time(oc, tk)[0]
+                oc = get_option_chain(index_symbol, exps[0], test_mode)
+                spot = _underlying_spot_and_time(oc, index_symbol)[0]
                 annual_iv = _atm_iv_from_calls(oc.calls, spot)
         except Exception:
             annual_iv = None
@@ -1061,14 +1097,13 @@ def get_atm_iv_30d(symbol, target_days=30, test_mode=False):
     IV (nearest-to-spot strike). Used to put the own-vol 1σ shock on the same
     ~30-day tenor as the index's VIX-based 1σ. Returns None if unavailable."""
     try:
-        tk = yf.Ticker(symbol)
-        exps = get_expirations(tk, symbol, test_mode)
+        exps = get_expirations(symbol, test_mode)
         if not exps:
             return None
         now = datetime.now()
         best = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - now).days - target_days))
-        oc = get_option_chain(tk, symbol, best, test_mode)
-        spot = _underlying_spot_and_time(oc, tk)[0]
+        oc = get_option_chain(symbol, best, test_mode)
+        spot = _underlying_spot_and_time(oc, symbol)[0]
         return _atm_iv_from_calls(oc.calls, spot)
     except Exception:
         return None
@@ -1263,14 +1298,15 @@ def check_pnl_alerts(quotes):
                          args=(topic, "Call spread P&L alert", body)).start()
 
 
-def _underlying_spot_and_time(oc, tk):
-    """Return (spot, quote_epoch_seconds, prev_close) for an option_chain result.
+def _underlying_spot_and_time(oc, symbol):
+    """Return (spot, quote_epoch_seconds, prev_close) for a chain snapshot.
 
     Prefers the underlying quote bundled with the chain (`oc.underlying`) because
-    it comes from the *same* HTTP response as the option quotes, so spot is
+    it comes from the *same* vendor response as the option quotes, so spot is
     time-aligned with the bids/asks/IVs used for P&L and greeks. Falls back
     through post/pre-market price, a bid/ask mid, and finally a separate daily
-    history close (which is NOT time-aligned, so quote_time is reported as None).
+    close from the active source (which is NOT time-aligned, so quote_time is
+    reported as None).
 
     prev_close is the underlying's official prior-day close (for the one-day
     theoretical P&L); may be None if the chain snapshot doesn't carry it.
@@ -1292,7 +1328,7 @@ def _underlying_spot_and_time(oc, tk):
     if bid and ask:
         return (float(bid) + float(ask)) / 2, u.get("regularMarketTime"), prev_close
     # Last resort: a separate daily-close fetch, not aligned with the chain.
-    return float(tk.history(period="1d")["Close"].iloc[-1]), None, prev_close
+    return float(get_source().get_daily_closes(symbol, "1d").iloc[-1]), None, prev_close
 
 
 def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
@@ -1375,13 +1411,12 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         try:
             key = (symbol, exp)
             if key not in chain_cache:
-                tk = yf.Ticker(symbol)
-                oc = get_option_chain(tk, symbol, exp, test_mode)
+                oc = get_option_chain(symbol, exp, test_mode)
                 chain_cache[key] = oc.calls
                 if symbol not in spot_cache:
                     # Spot from the chain's own underlying snapshot => time-aligned
                     # with the option quotes below (see _underlying_spot_and_time).
-                    spot_cache[symbol] = _underlying_spot_and_time(oc, tk)
+                    spot_cache[symbol] = _underlying_spot_and_time(oc, symbol)
             calls = chain_cache[key]
             spot, quote_ts, prev_close = spot_cache.get(symbol, (None, None, None))
             result["spot"] = round(spot, 2) if spot is not None else None
@@ -1986,9 +2021,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="header">
   <h1>Call Spread Finder <span class="tag" id="modeTag">LIVE</span></h1>
   <a href="/positions" target="_blank" class="positions-link">My Positions &rarr;</a>
-  <label id="testToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so repeated searches (e.g. after hours) don't re-fetch from Yahoo. Data stays frozen until you Clear cache or turn Test off.">
+  <label id="testToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so repeated searches (e.g. after hours) don't re-fetch from the data source. Data stays frozen until you Clear cache or turn Test off.">
     <input type="checkbox" id="testMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
   </label>
+  <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Market data source (server-wide — affects all pages)"></select>
   <button type="button" id="clearCacheBtn" class="primary" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);padding:5px 10px;font-size:12px;font-weight:500;" onclick="clearChainCache()">Clear cache</button>
   <div class="spot-display">
     <span class="label" id="spotLabel">SPX Last:</span>
@@ -2468,11 +2504,12 @@ async function deleteSelectedTemplate() {
 fetchTemplates();
 
 // ---- Test mode: cache each underlying's option chain so repeated searches
-// (e.g. after hours) don't re-fetch from Yahoo. Toggle is sent as ?test=1. ----
+// (e.g. after hours) don't re-fetch from the data source. Sent as ?test=1. ----
+let activeSourceName = '';   // short name of the active data source, for the badge
 function updateModeTag() {
   const t = document.getElementById('testMode').checked;
   const tag = document.getElementById('modeTag');
-  tag.textContent = t ? 'TEST · cached' : 'LIVE';
+  tag.textContent = t ? 'TEST · cached' : ('LIVE' + (activeSourceName ? ' · ' + activeSourceName : ''));
   tag.style.background = t ? 'var(--yellow)' : 'var(--accent)';
   tag.style.color = t ? '#0f1117' : '#fff';
 }
@@ -2491,6 +2528,43 @@ function clearChainCache() {
   cb.addEventListener('change', () => {
     localStorage.setItem('finderTestMode', cb.checked ? '1' : '0');
     updateModeTag();
+  });
+})();
+
+// ---- Data source selector: server-global (NOT per-browser/localStorage) —
+// the server is the source of truth and every page must agree. ----
+(function initDataSource() {
+  const sel = document.getElementById('dataSource');
+  function apply(d) {
+    sel.innerHTML = '';
+    (d.sources || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.name; o.textContent = s.label;
+      sel.appendChild(o);
+    });
+    sel.value = d.active;
+    const active = (d.sources || []).find(s => s.name === d.active);
+    // Badge shows the short vendor name (label up to the first parenthesis).
+    activeSourceName = active ? active.label.replace(/\s*\(.*$/, '') : '';
+    updateModeTag();
+  }
+  fetch('/api/source').then(r => r.json()).then(apply).catch(() => { sel.style.display = 'none'; });
+  sel.addEventListener('change', () => {
+    const prev = activeSourceName;
+    fetch('/api/source', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: sel.value}),
+    }).then(r => r.json()).then(d => {
+      apply(d);                      // server echoes the (possibly unchanged) state
+      if (d.error) {                 // flash the select red; apply() already reverted it
+        sel.style.borderColor = 'var(--red)';
+        setTimeout(() => { sel.style.borderColor = 'var(--border)'; }, 1500);
+      }
+    }).catch(() => {                 // network failure: revert the visible choice
+      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
+      activeSourceName = prev;
+    });
   });
 })();
 
@@ -3316,9 +3390,10 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
 <div class="header">
   <h1>My Positions <span class="tag" id="posModeTag">LIVE</span></h1>
   <div class="right">
-    <label id="posTestToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so the 30s auto-refresh (e.g. after hours) doesn't re-fetch from Yahoo. Quotes stay frozen until you Clear cache or turn Test off.">
+    <label id="posTestToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so the 30s auto-refresh (e.g. after hours) doesn't re-fetch from the data source. Quotes stay frozen until you Clear cache or turn Test off.">
       <input type="checkbox" id="posTestMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
     </label>
+    <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Market data source (server-wide — affects all pages)"></select>
     <button type="button" id="posClearCacheBtn" class="secondary" style="padding:4px 9px;font-size:12px;" onclick="clearChainCache()">Clear cache</button>
     <span class="timestamp">Updated: <span id="lastUpdate">--</span></span>
     <span class="timestamp">Next refresh in: <span id="countdown">--</span>s</span>
@@ -3860,11 +3935,12 @@ $('sigmaMult').addEventListener('change', () => {
 });
 
 // Test/Live mode: in Test mode the server caches each underlying's option chain,
-// so the 30s auto-refresh reuses frozen quotes instead of re-fetching from Yahoo.
+// so the 30s auto-refresh reuses frozen quotes instead of re-fetching.
+let activeSourceName = '';   // short name of the active data source, for the badge
 function updateModeTag() {
   const t = $('posTestMode').checked;
   const tag = $('posModeTag');
-  tag.textContent = t ? 'TEST · cached' : 'LIVE';
+  tag.textContent = t ? 'TEST · cached' : ('LIVE' + (activeSourceName ? ' · ' + activeSourceName : ''));
   tag.style.background = t ? 'var(--yellow)' : '';
   tag.style.color = t ? '#0f1117' : '';
 }
@@ -3885,6 +3961,42 @@ function clearChainCache() {
     localStorage.setItem('posTestMode', cb.checked ? '1' : '0');
     updateModeTag();
     refreshQuotes();
+  });
+})();
+
+// Data source selector: server-global (NOT per-browser/localStorage) — the
+// server is the source of truth and every page must agree.
+(function initDataSource() {
+  const sel = $('dataSource');
+  function apply(d) {
+    sel.innerHTML = '';
+    (d.sources || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.name; o.textContent = s.label;
+      sel.appendChild(o);
+    });
+    sel.value = d.active;
+    const active = (d.sources || []).find(s => s.name === d.active);
+    activeSourceName = active ? active.label.replace(/\s*\(.*$/, '') : '';
+    updateModeTag();
+  }
+  fetch('/api/source').then(r => r.json()).then(apply).catch(() => { sel.style.display = 'none'; });
+  sel.addEventListener('change', () => {
+    fetch('/api/source', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: sel.value}),
+    }).then(r => r.json()).then(d => {
+      apply(d);                      // server echoes the (possibly unchanged) state
+      if (d.error) {                 // flash the select red; apply() already reverted it
+        sel.style.borderColor = 'var(--red)';
+        setTimeout(() => { sel.style.borderColor = 'var(--border)'; }, 1500);
+      } else {
+        refreshQuotes();             // reprice immediately off the new source
+      }
+    }).catch(() => {
+      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
+    });
   });
 })();
 
@@ -4491,13 +4603,31 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             n = clear_test_cache()
             self._send_json({"cleared": n})
 
+        elif parsed.path == "/api/source":
+            self._send_json(source_status())
+
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/positions":
+        if parsed.path == "/api/source":
+            try:
+                body = self._read_json_body()
+                name = (body.get("name") or "").strip()
+                if name not in SOURCES:
+                    self._send_json({"error": f"Unknown data source: {name!r}",
+                                     **source_status()})
+                    return
+                set_active_source(name)
+                cfg = _load_sources_config()
+                cfg["active"] = name
+                _save_json_dict(SOURCES_CONFIG_FILE, cfg)
+                self._send_json(source_status())
+            except Exception as e:
+                self._send_json({"error": str(e)})
+        elif parsed.path == "/api/positions":
             try:
                 body = self._read_json_body()
                 self._validate_position_payload(body)
@@ -4696,6 +4826,11 @@ def main():
         except (AttributeError, ValueError):
             pass
 
+    # Build the price-source registry from sources.json and activate the saved
+    # source (falls back to Yahoo). Must precede the chain-cache load so cached
+    # keys and the active source agree from the first request.
+    active_src = init_sources()
+
     # Rehydrate the Test-mode chain cache from disk so a cache captured while
     # quotes were live (e.g. Friday's session) survives restarts. Cleared only
     # via the "Clear cache" button.
@@ -4706,6 +4841,7 @@ def main():
     httpd, port = start_server(PORT)
 
     _print_banner(port)
+    print(f"  Data source: {active_src.label}")
     topic = get_alert_topic()
     print(f"  Adj P&L alerts -> ntfy topic: {topic}")
     print(f"    (subscribe in the ntfy phone app, or watch https://ntfy.sh/{topic})")
