@@ -426,6 +426,15 @@ def _load_chain_cache():
 # when scanning after hours.
 STALE_TRADE_AGE_SECS = 86400
 
+# Age at which the chain's bundled underlying quote is distrusted and the
+# monitor falls back to the candle feed for spot/prev-close. Yahoo's quote
+# feed intermittently freezes at a prior session's close while its candles
+# stay live (seen 2026-07-14: quotes pinned at Monday's close 30+ min into
+# Tuesday's session, marketState still REGULAR). 20 min comfortably exceeds
+# the normal ~15-min option-quote delay, so intraday it only trips when the
+# feed is genuinely stuck.
+QUOTE_STALE_FALLBACK_SECS = 20 * 60
+
 # Yahoo reports a near-zero impliedVolatility for contracts with no live
 # two-sided quote (market open, after hours, weekends). IVs below this floor
 # are presumed bogus: ATM-IV selection prefers live-quoted strikes above it,
@@ -700,7 +709,6 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                             continue
 
                     total_premium = net_premium * contracts
-
                     # Compute deltas using implied vol
                     iv_buy = float(row_buy["impliedVolatility"])
                     iv_sell = float(row_sell["impliedVolatility"])
@@ -1298,7 +1306,33 @@ def check_pnl_alerts(quotes):
                          args=(topic, "Call spread P&L alert", body)).start()
 
 
-def _underlying_spot_and_time(oc, symbol):
+def _candle_spot_and_prev(symbol):
+    """(spot, epoch_secs, prev_close) from the candle feed, or None.
+
+    Used when the quote feed is stuck (see QUOTE_STALE_FALLBACK_SECS): the last
+    1-minute candle is then the freshest price the vendor publishes, and the
+    prior session's daily candle gives the true previous close — the frozen
+    quote block's previousClose is a session behind as well, which would turn
+    Daily Theo P&L into a two-day move if reused.
+    """
+    src = get_source()
+    intra = src.get_daily_closes(symbol, "1d", "1m").dropna()
+    if intra.empty:
+        return None
+    last_ts = intra.index[-1]
+    spot = float(intra.iloc[-1])
+    prev_close = None
+    try:
+        daily = src.get_daily_closes(symbol, "5d", "1d").dropna()
+        prior = daily[[d.date() < last_ts.date() for d in daily.index]]
+        if not prior.empty:
+            prev_close = float(prior.iloc[-1])
+    except Exception:
+        pass
+    return spot, int(last_ts.timestamp()), prev_close
+
+
+def _underlying_spot_and_time(oc, symbol, candle_fallback=False):
     """Return (spot, quote_epoch_seconds, prev_close) for a chain snapshot.
 
     Prefers the underlying quote bundled with the chain (`oc.underlying`) because
@@ -1308,25 +1342,49 @@ def _underlying_spot_and_time(oc, symbol):
     close from the active source (which is NOT time-aligned, so quote_time is
     reported as None).
 
+    candle_fallback: when True and the bundled quote is missing or older than
+    QUOTE_STALE_FALLBACK_SECS, replace spot/quote-time/prev-close from the
+    candle feed (see _candle_spot_and_prev) if its data is genuinely newer.
+    Costs up to two extra history calls per symbol, so only the monitor's
+    live-mode spot path enables it — not test mode (frozen data must stay
+    frozen, and no extra vendor hits) and not the ATM-strike-picking helpers.
+
     prev_close is the underlying's official prior-day close (for the one-day
     theoretical P&L); may be None if the chain snapshot doesn't carry it.
     """
     u = getattr(oc, "underlying", None) or {}
     prev_close = u.get("regularMarketPreviousClose") or u.get("previousClose")
     prev_close = float(prev_close) if prev_close else None
-    # Try each price source paired with its own timestamp.
+    # Best quote bundled with the chain: each price source paired with its
+    # own timestamp, then a bid/ask mid.
+    px = ts = None
     for price_key, time_key in (
         ("regularMarketPrice", "regularMarketTime"),
         ("postMarketPrice", "postMarketTime"),
         ("preMarketPrice", "preMarketTime"),
     ):
-        px = u.get(price_key)
-        if px:
-            return float(px), u.get(time_key), prev_close
-    # Bid/ask mid of the underlying, if quoted.
-    bid, ask = u.get("bid") or 0, u.get("ask") or 0
-    if bid and ask:
-        return (float(bid) + float(ask)) / 2, u.get("regularMarketTime"), prev_close
+        if u.get(price_key):
+            px, ts = float(u[price_key]), u.get(time_key)
+            break
+    if px is None:
+        bid, ask = u.get("bid") or 0, u.get("ask") or 0
+        if bid and ask:
+            px, ts = (float(bid) + float(ask)) / 2, u.get("regularMarketTime")
+
+    age = (datetime.now().timestamp() - ts) if ts else None
+    if candle_fallback and (px is None or age is None or age > QUOTE_STALE_FALLBACK_SECS):
+        try:
+            candle = _candle_spot_and_prev(symbol)
+        except Exception:
+            candle = None
+        # Only override when the candle is strictly newer than the quote, so a
+        # legitimately-quiet market (weekend, holiday) keeps the quote block.
+        if candle and (ts is None or candle[1] > ts):
+            c_spot, c_ts, c_prev = candle
+            return c_spot, c_ts, (c_prev if c_prev is not None else prev_close)
+
+    if px is not None:
+        return px, ts, prev_close
     # Last resort: a separate daily-close fetch, not aligned with the chain.
     return float(get_source().get_daily_closes(symbol, "1d").iloc[-1]), None, prev_close
 
@@ -1427,7 +1485,10 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                 if symbol not in spot_cache:
                     # Spot from the chain's own underlying snapshot => time-aligned
                     # with the option quotes below (see _underlying_spot_and_time).
-                    spot_cache[symbol] = _underlying_spot_and_time(oc, symbol)
+                    # In live mode a stuck quote feed falls back to the candle
+                    # feed so spot / Daily Theo track the real market.
+                    spot_cache[symbol] = _underlying_spot_and_time(
+                        oc, symbol, candle_fallback=not test_mode)
             calls = chain_cache[key]
             spot, quote_ts, prev_close = spot_cache.get(symbol, (None, None, None))
             result["spot"] = round(spot, 2) if spot is not None else None
