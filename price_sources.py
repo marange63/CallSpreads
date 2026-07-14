@@ -133,6 +133,15 @@ class PriceSource(abc.ABC):
         raises — it's a convenience quote with history fallbacks in callers)."""
         return _YAHOO_SOURCE.get_previous_close(symbol)
 
+    def get_option_prev_close(self, symbol, exp, strike):
+        """Official prior-session close of one CALL contract, or None.
+
+        Optional: feeds the monitor's daily mark-to-market P&L when a chain
+        doesn't carry a per-contract `change` column (Yahoo's does, so its
+        legs never need this). Callers memoize per day — implementations may
+        fetch. Default: unavailable."""
+        return None
+
 
 class YahooSource(PriceSource):
     """Yahoo Finance via yfinance. Free; option quotes ~15 min delayed."""
@@ -176,8 +185,9 @@ class MarketDataSource(PriceSource):
       live   — 1 credit per CONTRACT returned; never fetch broad chains on it.
     We only request calls (side=call — the app never reads puts), which also
     halves any live-feed cost. Free/trial accounts always get delayed data
-    and may reject the feed parameter — on such an error we retry once
-    without it and stop sending it for the session.
+    and reject the feed parameter — that error is SURFACED, never silently
+    downgraded to feedless (= live, per-contract billing); feedless requires
+    an explicit "feed": "" in sources.json.
 
     Tier-2 reference data (^IRX rate, VIX level, beta history) stays on the
     Yahoo delegation — marketdata doesn't need to serve those.
@@ -194,7 +204,6 @@ class MarketDataSource(PriceSource):
         if not self.token:
             raise ValueError("no token in sources.json")
         self.feed = (self.config.get("feed", "cached") or "").strip()
-        self._send_feed = bool(self.feed)
 
     def map_symbol(self, symbol):
         # Yahoo's ^/$ index prefixes don't exist here (^SPX -> SPX, ^VIX -> VIX).
@@ -225,18 +234,27 @@ class MarketDataSource(PriceSource):
         return tuple(data.get("expirations") or ())
 
     def _chain_request(self, sym, params):
-        if self._send_feed:
-            try:
-                return self._get_json(f"/options/chain/{sym}/",
-                                      {**params, "feed": self.feed})
-            except RuntimeError as e:
-                msg = str(e).lower()
-                # Trial/free plans reject feed control with a bare HTTP 402
-                # ("Payment is required") that never mentions the parameter.
-                if "feed" not in msg and "402" not in msg:
-                    raise
-                self._send_feed = False  # plan can't control the feed — omit it
-        return self._get_json(f"/options/chain/{sym}/", params)
+        # BILLING SAFETY: a chain request WITHOUT a feed parameter defaults to
+        # the live feed and bills 1 credit PER CONTRACT (a monitor refresh
+        # cycle can burn thousands). So the configured feed is always sent,
+        # and a rejection (trial/free plans answer feed control with a bare
+        # HTTP 402) is surfaced as an error — never silently retried at
+        # per-contract prices. Feedless live is an explicit opt-in:
+        # set "feed": "" in sources.json.
+        if not self.feed:
+            return self._get_json(f"/options/chain/{sym}/", params)
+        try:
+            return self._get_json(f"/options/chain/{sym}/",
+                                  {**params, "feed": self.feed})
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "402" in msg or "feed" in msg:
+                raise RuntimeError(
+                    f"marketdata: plan rejected feed={self.feed!r} — real-time "
+                    f"entitlement missing/pending. Not retrying without the "
+                    f"feed (that bills per contract); use Yahoo meanwhile or "
+                    f"set feed \"\" explicitly.") from None
+            raise
 
     def get_option_chain(self, symbol, exp):
         data = self._chain_request(self.map_symbol(symbol),
@@ -282,6 +300,24 @@ class MarketDataSource(PriceSource):
             pass  # chain-derived spot still works; candle fallback covers the rest
         return SimpleNamespace(calls=calls, puts=None, underlying=underlying,
                                fetched_at=datetime.now().timestamp())
+
+    def get_option_prev_close(self, symbol, exp, strike):
+        """Prior-session close via the contract's daily candles (the chain
+        response has no change/prevClose field). Billed as historical data —
+        effectively 1 credit — and memoized per day by the caller."""
+        occ = (f"{self.map_symbol(symbol)}"
+               f"{datetime.strptime(exp, '%Y-%m-%d'):%y%m%d}"
+               f"C{int(round(float(strike) * 1000)):08d}")
+        data = self._get_json(f"/options/candles/D/{occ}/", {"countback": 2})
+        if data.get("s") != "ok":
+            return None
+        today = datetime.now().date()
+        closes, times = data.get("c") or [], data.get("t") or []
+        # Newest-last; skip today's (possibly partial) candle.
+        for c, t in zip(reversed(closes), reversed(times)):
+            if c and t and datetime.fromtimestamp(t).date() < today:
+                return float(c)
+        return None
 
     def _underlying_quote(self, symbol):
         kind = "indices" if symbol.startswith(("^", "$")) else "stocks"

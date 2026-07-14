@@ -1099,11 +1099,26 @@ def get_index_sigma_1d(index_symbol, test_mode=False):
     return annual_iv * math.sqrt(1.0 / TRADING_DAYS), round(annual_iv * 100, 2)
 
 
+# Live-mode TTL cache for the ~30-day ATM IV: a σ input doesn't need
+# 30-second freshness, and without this every monitor refresh pulls one extra
+# FULL chain per symbol from the vendor (the exact traffic that can burn
+# metered credit plans). Test mode bypasses it (the frozen chain cache already
+# makes those fetches free).
+IV30_TTL_SECS = 15 * 60
+_IV30_CACHE = {}   # (source, symbol) -> (annual_iv, fetched_epoch)
+
+
 def get_atm_iv_30d(symbol, target_days=30, test_mode=False):
     """~30-day constant-maturity ATM implied vol (annualized fraction) for a
     symbol. Picks the listed expiration nearest target_days and reads the ATM
     IV (nearest-to-spot strike). Used to put the own-vol 1σ shock on the same
-    ~30-day tenor as the index's VIX-based 1σ. Returns None if unavailable."""
+    ~30-day tenor as the index's VIX-based 1σ. Cached IV30_TTL_SECS per
+    (source, symbol) in live mode. Returns None if unavailable."""
+    cache_key = (get_source().name, symbol)
+    if not test_mode:
+        hit = _IV30_CACHE.get(cache_key)
+        if hit and (datetime.now().timestamp() - hit[1]) < IV30_TTL_SECS:
+            return hit[0]
     try:
         exps = get_expirations(symbol, test_mode)
         if not exps:
@@ -1112,7 +1127,10 @@ def get_atm_iv_30d(symbol, target_days=30, test_mode=False):
         best = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - now).days - target_days))
         oc = get_option_chain(symbol, best, test_mode)
         spot = _underlying_spot_and_time(oc, symbol)[0]
-        return _atm_iv_from_calls(oc.calls, spot)
+        iv = _atm_iv_from_calls(oc.calls, spot)
+        if iv and not test_mode:
+            _IV30_CACHE[cache_key] = (iv, datetime.now().timestamp())
+        return iv
     except Exception:
         return None
 
@@ -1192,6 +1210,29 @@ def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
         if implied and implied >= MIN_TRUSTED_IV:
             return implied
     return iv
+
+
+# Per-day memo of official option prior closes, for the daily mark-to-market
+# P&L when a leg's chain row carries no `change` column (marketdata.app).
+# A prior close is immutable for the calendar day, so the first refresh of the
+# day pays the vendor calls (2 per position) and every later refresh is free.
+_OPT_PREV_CLOSE_CACHE = {}   # (source, symbol, exp, strike, YYYY-MM-DD) -> float|None
+
+
+def _option_prev_close(symbol, exp, strike, test_mode):
+    """Official prior-session close for one call contract via the active
+    source's optional hook, memoized per day. None in test mode (frozen data
+    must not trigger live fetches) or when the source can't supply it."""
+    if test_mode:
+        return None
+    src = get_source()
+    key = (src.name, symbol, exp, float(strike), datetime.now().strftime("%Y-%m-%d"))
+    if key not in _OPT_PREV_CLOSE_CACHE:
+        try:
+            _OPT_PREV_CLOSE_CACHE[key] = src.get_option_prev_close(symbol, exp, float(strike))
+        except Exception:
+            _OPT_PREV_CLOSE_CACHE[key] = None
+    return _OPT_PREV_CLOSE_CACHE[key]
 
 
 # ---- P&L history (in-memory, per-server-session) ----
@@ -1457,6 +1498,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["pnlWorstPct"] = None
         result["adjPnlWorst"] = None
         result["adjPnlWorstPct"] = None
+        result["dailyMtmPnl"] = None
         result["netDelta"] = None
         result["netThetaPerDay"] = None
         result["netVega"] = None
@@ -1544,6 +1586,22 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                      result["adjPnl"], result["adjPnlPct"]) = pnl_pair(current_value)
                     (result["pnlWorst"], result["pnlWorstPct"],
                      result["adjPnlWorst"], result["adjPnlWorstPct"]) = pnl_pair(liquidation_value)
+
+                # Daily live mark-to-market: yesterday's official option
+                # closes -> today's best (mid) marks. The realized-market
+                # counterpart of Daily Theo P&L (which is a model reprice of
+                # the underlying's move only). Leg prev closes come from the
+                # chain's `change` column when present (Yahoo), else the
+                # source's per-contract hook (memoized per day).
+                prev_l = long_leg.get("prevClose")
+                prev_s = short_leg.get("prevClose")
+                if prev_l is None:
+                    prev_l = _option_prev_close(symbol, exp, p["longStrike"], test_mode)
+                if prev_s is None:
+                    prev_s = _option_prev_close(symbol, exp, p["shortStrike"], test_mode)
+                if prev_l is not None and prev_s is not None:
+                    prev_value = (prev_l - prev_s) * 100 * contracts
+                    result["dailyMtmPnl"] = round(current_value - prev_value, 2)
 
                 # Greeks — use both leg IVs; skip if either IV missing
                 exp_dt = datetime.strptime(exp, "%Y-%m-%d")
@@ -3537,6 +3595,9 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <input id="sigmaMult" type="number" min="0.1" max="10" step="0.5" value="1">
     <span class="dim">&sigma;</span>
   </div>
+  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Auto-refresh only between 9:30 AM and 4:30 PM ET on US trading days (weekends and NYSE holidays skipped). Polling pauses automatically at the close and resumes at the next open. Manual Refresh now always works.">
+    <input type="checkbox" id="marketHoursOnly" style="width:15px;height:15px;"> Market hours only
+  </label>
   <button class="ghost" id="refreshNowBtn">Refresh now</button>
   <span class="dim" id="autoStatus" style="margin-left:auto;">auto-refresh: <span style="color:var(--green);">on</span></span>
 </div>
@@ -3548,7 +3609,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <div class="stat"><div class="stat-label">Entry Cost</div><div class="stat-value mono" id="sumEntry">--</div></div>
     <div class="stat"><div class="stat-label">Current Value (mid)</div><div class="stat-value mono" id="sumCurrent">--</div><div class="stat-sub mono" id="sumCurrentLiq">--</div></div>
     <div class="stat"><div class="stat-label">Total P&amp;L (best)</div><div class="stat-value mono" id="sumPnl">--</div><div class="stat-sub mono" id="sumPnlWorst">--</div></div>
-    <div class="stat" title="Sum of the per-position Daily Theo P&amp;L (Black-Scholes reprice for each underlying's one-day move, option quotes held aside)."><div class="stat-label">Daily Theo P&amp;L</div><div class="stat-value mono" id="sumDailyTheo">--</div><div class="stat-sub mono" id="sumDailyTheoPct">--</div></div>
+    <div class="stat" title="Main number: Daily Theo P&amp;L — Black-Scholes reprice for each underlying's one-day move, option quotes held aside. MTM line: daily live mark-to-market — today's mid marks vs yesterday's official option closes, i.e. what the option market actually did."><div class="stat-label">Daily Theo P&amp;L</div><div class="stat-value mono" id="sumDailyTheo">--</div><div class="stat-sub mono" id="sumDailyMtm">--</div><div class="stat-sub mono" id="sumDailyTheoPct">--</div></div>
     <div class="stat-highlight">
       <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlWorst">--</div></div>
       <div class="stat"><div class="stat-label">Total Return (best)</div><div class="stat-value mono" id="sumRet">--</div><div class="stat-sub mono" id="sumRetWorst">--</div></div>
@@ -3641,6 +3702,8 @@ function updateSummary(rows) {
   const totalAdjPnl = withData.reduce((s, r) => s + (r.adjPnl || 0), 0);
   const totalAdjPnlWorst = withData.reduce((s, r) => s + (r.adjPnlWorst || 0), 0);
   const totalDailyTheoPnl = withData.reduce((s, r) => s + (r.dailyTheoPnl || 0), 0);
+  const mtmRows = withData.filter(r => r.dailyMtmPnl !== null && r.dailyMtmPnl !== undefined);
+  const totalDailyMtm = mtmRows.reduce((s, r) => s + r.dailyMtmPnl, 0);
   const totalRet = totalEntry ? (totalAdjPnl / Math.abs(totalEntry)) * 100 : 0;
   const totalRetWorst = totalEntry ? (totalAdjPnlWorst / Math.abs(totalEntry)) * 100 : 0;
   const totalDailyTheoPct = totalEntry ? (totalDailyTheoPnl / Math.abs(totalEntry)) * 100 : 0;
@@ -3686,6 +3749,16 @@ function updateSummary(rows) {
   setPnlText('sumDailyTheo', totalDailyTheoPnl);
   setWorstSub('sumDailyTheoPct', sign(totalDailyTheoPct) + totalDailyTheoPct.toFixed(2) + '% of entry',
               totalDailyTheoPnl);
+  // Daily live mark-to-market: today's mid marks vs yesterday's official
+  // option closes. Flags partial coverage when some legs lack a prior close.
+  if (mtmRows.length) {
+    const partial = mtmRows.length < withData.length ? ` (${mtmRows.length}/${withData.length})` : '';
+    setWorstSub('sumDailyMtm', 'MTM ' + fmtSignedDollar(totalDailyMtm, 0) + partial, totalDailyMtm);
+  } else {
+    const el = $('sumDailyMtm');
+    el.textContent = 'MTM --';
+    el.className = 'stat-sub mono dim';
+  }
   // Reflect the active haircut % on the label and column header
   const activeHc = currentHaircutPct().toFixed(0);
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
@@ -4115,24 +4188,71 @@ function clearChainCache() {
   });
 })();
 
+// ---- Market-hours gate for the auto-refresh ----
+// Clock is evaluated in America/New_York (DST-correct via Intl), so it works
+// from any local timezone. Auto-polling runs 9:30 AM – 4:30 PM ET on trading
+// days; outside that window the interval keeps ticking but skips the fetch,
+// so the first tick after the next open resumes automatically. Manual
+// "Refresh now" and the initial page load are never gated.
+// NYSE full-session holidays, maintained by hand (a missing future date just
+// means harmless polling of unchanging quotes that day):
+const MARKET_HOLIDAYS = new Set([
+  '2026-01-01','2026-01-19','2026-02-16','2026-04-03','2026-05-25','2026-06-19',
+  '2026-07-03','2026-09-07','2026-11-26','2026-12-25',
+  '2027-01-01','2027-01-18','2027-02-15','2027-03-26','2027-05-31','2027-06-18',
+  '2027-07-05','2027-09-06','2027-11-25','2027-12-24',
+]);
+function etNow() {
+  const parts = new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York',
+    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}).formatToParts(new Date());
+  const g = t => (parts.find(p => p.type === t) || {}).value;
+  return {wd: g('weekday'), ymd: g('year') + '-' + g('month') + '-' + g('day'),
+          mins: parseInt(g('hour'), 10) * 60 + parseInt(g('minute'), 10)};
+}
+function isMarketOpen() {
+  const t = etNow();
+  if (t.wd === 'Sat' || t.wd === 'Sun' || MARKET_HOLIDAYS.has(t.ymd)) return false;
+  return t.mins >= 570 && t.mins < 990;   // 9:30 – 16:30 ET
+}
+function autoPaused() { return $('marketHoursOnly').checked && !isMarketOpen(); }
+function updateAutoStatus() {
+  $('autoStatus').innerHTML = autoPaused()
+    ? 'auto-refresh: <span style="color:var(--yellow);">paused · market closed</span>'
+    : 'auto-refresh: <span style="color:var(--green);">on</span>';
+}
+(function initMarketHours() {
+  const cb = $('marketHoursOnly');
+  cb.checked = localStorage.getItem('posMarketHoursOnly') !== '0';   // default on
+  cb.addEventListener('change', () => {
+    localStorage.setItem('posMarketHoursOnly', cb.checked ? '1' : '0');
+    updateAutoStatus();
+    if (!autoPaused()) { refreshQuotes(); resetTimer(); }
+  });
+})();
+
 function resetTimer() {
   if (refreshTimer) clearInterval(refreshTimer);
   if (countdownTimer) clearInterval(countdownTimer);
   const sec = Math.max(5, parseInt($('refreshSec').value, 10) || 30);
   nextRefreshAt = Date.now() + sec * 1000;
   refreshTimer = setInterval(() => {
-    refreshQuotes();
     nextRefreshAt = Date.now() + sec * 1000;
+    updateAutoStatus();
+    if (autoPaused()) return;   // market closed — skip the fetch, keep ticking
+    refreshQuotes();
   }, sec * 1000);
   countdownTimer = setInterval(updateCountdown, 250);
   updateCountdown();
 }
 
 function updateCountdown() {
+  if (autoPaused()) { $('countdown').textContent = '--'; return; }
   const remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
   $('countdown').textContent = remaining;
 }
 
+updateAutoStatus();
 loadPositions();
 resetTimer();
 </script>
