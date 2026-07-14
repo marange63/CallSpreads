@@ -17,8 +17,12 @@ file owns the config file (sources.json) and passes its dict to
 """
 
 import abc
+import json
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -162,6 +166,151 @@ class YahooSource(PriceSource):
             return None
 
 
+class MarketDataSource(PriceSource):
+    """marketdata.app — near-real-time US stock/index option data.
+
+    Config (sources.json): {"token": "<api token>", "feed": "cached"}.
+    The feed matters because of the credit model (Trader plan = 100k/day):
+      cached — 1 credit per CALL regardless of chain size; data seconds to a
+               few minutes old. The default: effectively unlimited here.
+      live   — 1 credit per CONTRACT returned; never fetch broad chains on it.
+    We only request calls (side=call — the app never reads puts), which also
+    halves any live-feed cost. Free/trial accounts always get delayed data
+    and may reject the feed parameter — on such an error we retry once
+    without it and stop sending it for the session.
+
+    Tier-2 reference data (^IRX rate, VIX level, beta history) stays on the
+    Yahoo delegation — marketdata doesn't need to serve those.
+    """
+
+    name = "marketdata"
+    label = "MarketData.app"
+    realtime = True
+    BASE = "https://api.marketdata.app/v1"
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.token = (self.config.get("token") or "").strip()
+        if not self.token:
+            raise ValueError("no token in sources.json")
+        self.feed = (self.config.get("feed", "cached") or "").strip()
+        self._send_feed = bool(self.feed)
+
+    def map_symbol(self, symbol):
+        # Yahoo's ^/$ index prefixes don't exist here (^SPX -> SPX, ^VIX -> VIX).
+        return symbol.lstrip("^$")
+
+    def _get_json(self, path, params=None):
+        query = urllib.parse.urlencode(params or {})
+        url = f"{self.BASE}{path}{'?' + query if query else ''}"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json"})
+        try:
+            # 200 = real-time/consolidated, 203 = delayed (trial/free) — both fine.
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read().decode("utf-8")).get("errmsg", "")
+            except Exception:
+                detail = ""
+            raise RuntimeError(
+                f"marketdata {path}: HTTP {e.code} {detail}".strip()) from None
+
+    def get_expirations(self, symbol):
+        data = self._get_json(f"/options/expirations/{self.map_symbol(symbol)}/")
+        if data.get("s") != "ok":
+            return ()
+        return tuple(data.get("expirations") or ())
+
+    def _chain_request(self, sym, params):
+        if self._send_feed:
+            try:
+                return self._get_json(f"/options/chain/{sym}/",
+                                      {**params, "feed": self.feed})
+            except RuntimeError as e:
+                msg = str(e).lower()
+                # Trial/free plans reject feed control with a bare HTTP 402
+                # ("Payment is required") that never mentions the parameter.
+                if "feed" not in msg and "402" not in msg:
+                    raise
+                self._send_feed = False  # plan can't control the feed — omit it
+        return self._get_json(f"/options/chain/{sym}/", params)
+
+    def get_option_chain(self, symbol, exp):
+        data = self._chain_request(self.map_symbol(symbol),
+                                   {"expiration": exp, "side": "call"})
+        if data.get("s") != "ok":
+            raise RuntimeError(
+                f"marketdata: no chain data for {symbol} {exp} (s={data.get('s')})")
+        n = len(data.get("strike") or [])
+
+        def col(key):
+            vals = data.get(key)
+            return vals if isinstance(vals, list) and len(vals) == n else [None] * n
+
+        calls = pd.DataFrame({
+            "strike": col("strike"),
+            "bid": col("bid"), "ask": col("ask"),
+            "lastPrice": col("last"),
+            "impliedVolatility": col("iv"),
+            "volume": col("volume"),
+            "openInterest": col("openInterest"),
+        })
+        # Null quotes -> 0.0, mirroring Yahoo's zeroed-out semantics (the app
+        # treats bid/ask 0 as "no live two-sided market" and IV 0 as missing).
+        for c in calls.columns:
+            calls[c] = pd.to_numeric(calls[c], errors="coerce").fillna(0.0)
+        # 'updated' is the per-contract quote time — not a trade time, but the
+        # honest freshness signal the staleness flags exist to convey.
+        calls["lastTradeDate"] = pd.to_datetime(col("updated"), unit="s", utc=True)
+
+        underlying = {}
+        upx, upd = data.get("underlyingPrice"), data.get("updated")
+        if isinstance(upx, list) and upx and upx[0]:
+            underlying["regularMarketPrice"] = float(upx[0])
+        if isinstance(upd, list):
+            ts = [t for t in upd if t]
+            if ts:
+                underlying["regularMarketTime"] = int(max(ts))
+        try:
+            # One quotes call (1 credit): fresher price/time and the only way
+            # to get the prior close (last − change) for Daily Theo P&L.
+            underlying.update(self._underlying_quote(symbol))
+        except Exception:
+            pass  # chain-derived spot still works; candle fallback covers the rest
+        return SimpleNamespace(calls=calls, puts=None, underlying=underlying,
+                               fetched_at=datetime.now().timestamp())
+
+    def _underlying_quote(self, symbol):
+        kind = "indices" if symbol.startswith(("^", "$")) else "stocks"
+        data = self._get_json(f"/{kind}/quotes/{self.map_symbol(symbol)}/")
+        if data.get("s") != "ok":
+            return {}
+
+        def first(key):
+            vals = data.get(key)
+            v = vals[0] if isinstance(vals, list) and vals else None
+            return None if v is None else float(v)
+
+        out = {}
+        last, change = first("last"), first("change")
+        if last:
+            out["regularMarketPrice"] = last
+        ts = first("updated")
+        if ts:
+            out["regularMarketTime"] = int(ts)
+        bid, ask = first("bid"), first("ask")
+        if bid:
+            out["bid"] = bid
+        if ask:
+            out["ask"] = ask
+        if last is not None and change is not None:
+            out["regularMarketPreviousClose"] = round(last - change, 2)
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Registry + active source. Yahoo exists unconditionally (it is both the
 # default source and the Tier-2 delegation target); other sources appear only
@@ -170,7 +319,8 @@ class YahooSource(PriceSource):
 
 _YAHOO_SOURCE = YahooSource()
 
-SOURCE_CLASSES = {"yahoo": YahooSource}   # future vendor: add ONE entry here
+SOURCE_CLASSES = {"yahoo": YahooSource,   # future vendor: add ONE entry here
+                  "marketdata": MarketDataSource}
 SOURCES = {"yahoo": _YAHOO_SOURCE}        # name -> instantiated, usable source
 _ACTIVE_SOURCE = _YAHOO_SOURCE
 
@@ -195,14 +345,18 @@ def register_sources(config):
     {"active": ..., "sources": {name: {per-source config}, ...}}.
 
     Each registered class is constructed with its config sub-dict; a source
-    whose constructor fails (bad API key, missing dependency) is skipped with
-    a warning rather than killing startup. Yahoo is always (re)constructed and
-    always present. Returns the names of the usable sources."""
+    that has no config entry at all is skipped silently (not offered), while
+    one that is configured but fails to construct (bad API key) is skipped
+    with a warning rather than killing startup. Yahoo is always
+    (re)constructed and always present. Returns the usable source names."""
     cfg = (config or {}).get("sources", {})
     SOURCES.clear()
     for name, cls in SOURCE_CLASSES.items():
+        conf = cfg.get(name)
+        if conf is None and name != "yahoo":
+            continue  # vendor not configured — don't construct, don't warn
         try:
-            SOURCES[name] = cls(cfg.get(name, {}))
+            SOURCES[name] = cls(conf or {})
         except Exception as e:
             print(f"  Warning: price source '{name}' unavailable ({e})")
     if "yahoo" not in SOURCES:               # never let Yahoo drop out
