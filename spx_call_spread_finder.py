@@ -3548,8 +3548,9 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <div class="stat"><div class="stat-label">Entry Cost</div><div class="stat-value mono" id="sumEntry">--</div></div>
     <div class="stat"><div class="stat-label">Current Value (mid)</div><div class="stat-value mono" id="sumCurrent">--</div><div class="stat-sub mono" id="sumCurrentLiq">--</div></div>
     <div class="stat"><div class="stat-label">Total P&amp;L (best)</div><div class="stat-value mono" id="sumPnl">--</div><div class="stat-sub mono" id="sumPnlWorst">--</div></div>
+    <div class="stat" title="Sum of the per-position Daily Theo P&amp;L (Black-Scholes reprice for each underlying's one-day move, option quotes held aside)."><div class="stat-label">Daily Theo P&amp;L</div><div class="stat-value mono" id="sumDailyTheo">--</div><div class="stat-sub mono" id="sumDailyTheoPct">--</div></div>
     <div class="stat-highlight">
-      <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlWorst">--</div><div class="stat-sub mono" id="sumAdjPnlDay">--</div></div>
+      <div class="stat"><div class="stat-label" id="sumAdjPnlLabel">Adj P&amp;L (80%)</div><div class="stat-value mono" id="sumAdjPnl">--</div><div class="stat-sub mono" id="sumAdjPnlWorst">--</div></div>
       <div class="stat"><div class="stat-label">Total Return (best)</div><div class="stat-value mono" id="sumRet">--</div><div class="stat-sub mono" id="sumRetWorst">--</div></div>
     </div>
     <div class="stat stat-risk">
@@ -3679,13 +3680,12 @@ function updateSummary(rows) {
   setWorstSub('sumRetWorst', 'worst ' + sign(totalRetWorst) + totalRetWorst.toFixed(2) + '%', totalRetWorst);
   setPnlText('sumAdjPnl', totalAdjPnl);
   setWorstSub('sumAdjPnlWorst', 'worst ' + fmtSignedDollar(totalAdjPnlWorst, 0), totalAdjPnlWorst);
-  // Daily theoretical P&L: sum of each position's BS reprice for the underlying's
-  // one-day move (spot vs. prior close). Independent of the stale option quotes.
-  const dayEl = $('sumAdjPnlDay');
-  dayEl.textContent = 'Daily Theo ' + fmtSignedDollar(totalDailyTheoPnl, 0) +
-    ' (' + sign(totalDailyTheoPct) + totalDailyTheoPct.toFixed(2) + '%)';
-  dayEl.title = 'Sum of the per-position Daily Theo P&L (Black-Scholes reprice for the underlying’s one-day move).';
-  dayEl.className = 'stat-sub mono ' + (totalDailyTheoPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
+  // Daily theoretical P&L tile: sum of each position's BS reprice for the
+  // underlying's one-day move (spot vs. prior close). Independent of the
+  // (possibly stale) option quotes.
+  setPnlText('sumDailyTheo', totalDailyTheoPnl);
+  setWorstSub('sumDailyTheoPct', sign(totalDailyTheoPct) + totalDailyTheoPct.toFixed(2) + '% of entry',
+              totalDailyTheoPnl);
   // Reflect the active haircut % on the label and column header
   const activeHc = currentHaircutPct().toFixed(0);
   $('sumAdjPnlLabel').textContent = `Adj P&L (${activeHc}%)`;
