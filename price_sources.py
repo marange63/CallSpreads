@@ -23,7 +23,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,7 @@ class PriceSource(abc.ABC):
     name = "abstract"        # short id: config key, cache-key prefix, API value
     label = "Abstract"       # UI display label, e.g. "Yahoo (delayed ~15m)"
     realtime = False
+    feed_options = ()        # runtime-switchable feed ids (empty = not switchable)
 
     def __init__(self, config=None):
         # Per-source dict from sources.json (API keys, account ids, ...).
@@ -89,6 +90,15 @@ class PriceSource(abc.ABC):
         so Yahoo-isms never leak into their APIs. Default: identity.
         """
         return symbol
+
+    def get_feed(self):
+        """Current feed id, for sources whose feed is switchable at runtime
+        (i.e. `feed_options` is non-empty); None otherwise."""
+        return None
+
+    def set_feed(self, feed):
+        """Switch the active feed at runtime. Base sources have no feed."""
+        raise NotImplementedError("this source has no switchable feed")
 
     # ---- Tier 1: options surface (must implement) ----
 
@@ -134,12 +144,14 @@ class PriceSource(abc.ABC):
         return _YAHOO_SOURCE.get_previous_close(symbol)
 
     def get_option_prev_close(self, symbol, exp, strike):
-        """Official prior-session close of one CALL contract, or None.
+        """Prior-session closing mark of one CALL contract, or None.
 
-        Optional: feeds the monitor's daily mark-to-market P&L when a chain
-        doesn't carry a per-contract `change` column (Yahoo's does, so its
-        legs never need this). Callers memoize per day — implementations may
-        fetch. Default: unavailable."""
+        Preferably the closing bid/ask MIDPOINT (so the daily MTM is a true
+        mid-to-mid change, matching how today's side is marked); a trade-based
+        close is an acceptable fallback. Optional: feeds the monitor's daily
+        mark-to-market P&L when a chain doesn't carry a per-contract `change`
+        column (Yahoo's does, so its legs never need this). Callers memoize
+        per day — implementations may fetch. Default: unavailable."""
         return None
 
 
@@ -149,6 +161,12 @@ class YahooSource(PriceSource):
     name = "yahoo"
     label = "Yahoo (delayed ~15m)"
     realtime = False
+
+    _UQ_TTL = 5.0   # seconds to memoize a live underlying quote (hybrid spot)
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self._uq_cache = {}   # symbol -> (epoch_fetched, quote_dict)
 
     def get_expirations(self, symbol):
         return tuple(yf.Ticker(self.map_symbol(symbol)).options)
@@ -174,6 +192,37 @@ class YahooSource(PriceSource):
         except Exception:
             return None
 
+    def get_underlying_quote(self, symbol):
+        """Live-ish underlying quote as a Yahoo-keyed dict: regularMarketPrice +
+        regularMarketTime (from the last 1-minute intraday bar, so it carries a
+        real timestamp) and regularMarketPreviousClose (from fast_info). Empty
+        dict on failure. Used for HYBRID SPOT — when another vendor serves the
+        option chain but only a delayed equity quote, that vendor can override
+        the underlying with this live Yahoo price. Memoized per symbol for a few
+        seconds so one scan/refresh touching many expirations of the same symbol
+        makes a single Yahoo call (the repo minimizes Yahoo hits)."""
+        now = datetime.now().timestamp()
+        hit = self._uq_cache.get(symbol)
+        if hit and now - hit[0] < self._UQ_TTL:
+            return hit[1]
+        sym = self.map_symbol(symbol)
+        out = {}
+        try:
+            h = yf.Ticker(sym).history(period="1d", interval="1m")
+            if len(h):
+                out["regularMarketPrice"] = float(h["Close"].iloc[-1])
+                out["regularMarketTime"] = int(h.index[-1].timestamp())
+        except Exception:
+            pass
+        try:
+            pc = yf.Ticker(sym).fast_info.previous_close
+            if pc:
+                out["regularMarketPreviousClose"] = float(pc)
+        except Exception:
+            pass
+        self._uq_cache[symbol] = (now, out)
+        return out
+
 
 class MarketDataSource(PriceSource):
     """marketdata.app — near-real-time US stock/index option data.
@@ -196,6 +245,7 @@ class MarketDataSource(PriceSource):
     name = "marketdata"
     label = "MarketData.app"
     realtime = True
+    feed_options = ("cached", "live")   # switchable live (see set_feed)
     BASE = "https://api.marketdata.app/v1"
 
     def __init__(self, config=None):
@@ -204,10 +254,28 @@ class MarketDataSource(PriceSource):
         if not self.token:
             raise ValueError("no token in sources.json")
         self.feed = (self.config.get("feed", "cached") or "").strip()
+        # HYBRID SPOT: the Trader plan serves real-time OPTIONS but only a
+        # ~15-min delayed equity quote, so the underlying spot lags the option
+        # marks. Setting "spot_source": "yahoo" in sources.json overrides the
+        # underlying with Yahoo's live-ish equity price (free, ~real-time),
+        # while option quotes stay on marketdata. "" / absent = native quote.
+        self.spot_source = (self.config.get("spot_source") or "").strip().lower()
 
     def map_symbol(self, symbol):
         # Yahoo's ^/$ index prefixes don't exist here (^SPX -> SPX, ^VIX -> VIX).
         return symbol.lstrip("^$")
+
+    def get_feed(self):
+        return self.feed
+
+    def set_feed(self, feed):
+        """Switch the options feed live (no restart): the next chain request
+        reads `self.feed` (see `_chain_request`). 'cached' = ~15-min delayed,
+        1 credit/call; 'live' = real-time, 1 credit PER CONTRACT; '' = feedless
+        live. The caller persists the choice to sources.json."""
+        self.feed = (feed or "").strip()
+        self.config["feed"] = self.feed
+        return self.feed
 
     def _get_json(self, path, params=None):
         query = urllib.parse.urlencode(params or {})
@@ -293,28 +361,67 @@ class MarketDataSource(PriceSource):
             if ts:
                 underlying["regularMarketTime"] = int(max(ts))
         try:
-            # One quotes call (1 credit): fresher price/time and the only way
-            # to get the prior close (last − change) for Daily Theo P&L.
-            underlying.update(self._underlying_quote(symbol))
+            if self.spot_source == "yahoo":
+                # Hybrid spot: live Yahoo equity price overrides the delayed
+                # marketdata quote (and saves the per-symbol quote credit).
+                yq = _YAHOO_SOURCE.get_underlying_quote(symbol)
+                if yq.get("regularMarketPrice"):
+                    underlying.update(yq)
+                else:                       # Yahoo empty -> fall back to native
+                    underlying.update(self._underlying_quote(symbol))
+            else:
+                # One quotes call (1 credit): fresher price/time and the only way
+                # to get the prior close (last − change) for Daily Theo P&L.
+                underlying.update(self._underlying_quote(symbol))
         except Exception:
             pass  # chain-derived spot still works; candle fallback covers the rest
         return SimpleNamespace(calls=calls, puts=None, underlying=underlying,
                                fetched_at=datetime.now().timestamp())
 
+    @staticmethod
+    def _prior_business_day(day):
+        day -= timedelta(days=1)
+        while day.weekday() >= 5:   # Sat/Sun
+            day -= timedelta(days=1)
+        return day
+
     def get_option_prev_close(self, symbol, exp, strike):
-        """Prior-session close via the contract's daily candles (the chain
-        response has no change/prevClose field). Billed as historical data —
-        effectively 1 credit — and memoized per day by the caller."""
+        """Prior-session closing MID for one call contract — true mid-to-mid
+        daily MTM, matching how today's side is marked.
+
+        Historical EOD quotes exist even for contracts that didn't trade, so
+        step back to the prior business day (one extra step for a holiday)
+        and read the closing bid/ask midpoint. Falls back to the trade-based
+        daily-candle close when no historical quote is available (which may
+        predate yesterday on untraded legs). Billed as historical data —
+        ~1 credit per call — and memoized per day by the caller."""
         occ = (f"{self.map_symbol(symbol)}"
                f"{datetime.strptime(exp, '%Y-%m-%d'):%y%m%d}"
                f"C{int(round(float(strike) * 1000)):08d}")
+        day = datetime.now().date()
+        for _ in range(2):
+            day = self._prior_business_day(day)
+            try:
+                q = self._get_json(f"/options/quotes/{occ}/",
+                                   {"date": day.strftime("%Y-%m-%d")})
+            except RuntimeError:
+                break                     # endpoint/plan issue -> candle fallback
+            if q.get("s") != "ok":
+                continue                  # holiday / no data -> step back once more
+            bid = (q.get("bid") or [None])[-1]
+            ask = (q.get("ask") or [None])[-1]
+            if bid and ask:
+                return round((float(bid) + float(ask)) / 2, 4)
+            mid = (q.get("mid") or [None])[-1]
+            if mid:
+                return float(mid)
+            break                         # quote row exists but is one-sided/empty
+        # Fallback: trade-based daily candle close.
         data = self._get_json(f"/options/candles/D/{occ}/", {"countback": 2})
         if data.get("s") != "ok":
             return None
         today = datetime.now().date()
-        closes, times = data.get("c") or [], data.get("t") or []
-        # Newest-last; skip today's (possibly partial) candle.
-        for c, t in zip(reversed(closes), reversed(times)):
+        for c, t in zip(reversed(data.get("c") or []), reversed(data.get("t") or [])):
             if c and t and datetime.fromtimestamp(t).date() < today:
                 return float(c)
         return None

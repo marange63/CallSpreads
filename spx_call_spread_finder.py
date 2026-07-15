@@ -1025,10 +1025,15 @@ def source_status():
     """Payload for GET /api/source: the active source + all usable sources,
     Yahoo first."""
     ordered = sorted(SOURCES.values(), key=lambda s: (s.name != "yahoo", s.name))
+    active = get_source()
     return {
-        "active": get_source().name,
+        "active": active.name,
         "sources": [{"name": s.name, "label": s.label, "realtime": s.realtime}
                     for s in ordered],
+        # Active source's runtime-switchable feed (e.g. marketdata cached/live).
+        # feedOptions is empty for sources with no switchable feed (e.g. Yahoo).
+        "feed": active.get_feed(),
+        "feedOptions": list(active.feed_options),
     }
 
 
@@ -1253,6 +1258,24 @@ def _record_pnl(position_id, pnl):
         del hist[:len(hist) - _HISTORY_MAX]
 
 
+# NYSE full-session holidays (single source of truth — substituted into the
+# positions page JS as __MARKET_HOLIDAYS__ so the client's market-hours gate
+# can never drift from the server's). Maintained by hand; a missing future
+# date just means harmless activity on a closed day.
+MARKET_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+
+def _now_et():
+    """Current time in America/New_York (DST-correct; pandas bundles the tz
+    database, so this works regardless of the host OS/timezone)."""
+    return pd.Timestamp.now(tz="America/New_York")
+
+
 # ---- Adjusted-P&L threshold alerts (ntfy.sh phone push) ----
 # Each live /positions refresh checks every position's Adjusted P&L % against
 # the configured thresholds and fires ONE push per (position, threshold) per
@@ -1345,6 +1368,51 @@ def check_pnl_alerts(quotes):
     for topic, body in to_send:
         threading.Thread(target=_send_ntfy, daemon=True,
                          args=(topic, "Call spread P&L alert", body)).start()
+
+
+def check_position_digest(quotes):
+    """Half-hourly ntfy digest: best (mid) P&L and return for every position.
+
+    Fires on the first live refresh inside each half-hour slot between 9:30
+    and 16:30 ET on US trading days (weekends + MARKET_HOLIDAYS skipped) —
+    at most 15 pushes/day, latched per (slot, date) in alerts.json alongside
+    the threshold-alert latches. Like those alerts, it rides the monitor's
+    polling: no open tab during a slot means that slot is skipped (the
+    market-hours gate keeps polling alive through the 16:30 slot). Disable
+    with "digest": false in alerts.json.
+    """
+    now = _now_et()
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in MARKET_HOLIDAYS:
+        return
+    mins = now.hour * 60 + now.minute
+    if not (570 <= mins <= 991):          # 9:30 .. just past the 16:30 slot
+        return
+    slot_mins = min((mins // 30) * 30, 990)
+    slot = f"{slot_mins // 60:02d}:{slot_mins % 60:02d}"
+    rows = [q for q in quotes if q.get("pnl") is not None]
+    if not rows:
+        return
+    with _alerts_lock:
+        state = _load_alerts()
+        if not state.get("digest", True):
+            return
+        today = now.strftime("%Y-%m-%d")
+        if state.get("digest_date") != today:
+            state["digest_date"] = today
+            state["digest_sent"] = []
+        if slot in state.setdefault("digest_sent", []):
+            return
+        state["digest_sent"].append(slot)     # latch-first, like the alerts
+        _save_alerts(state)
+        topic = state["topic"]
+    lines = [f"{_position_name(q)}: {q['pnl']:+,.0f} ({q['pnlPct']:+.2f}%)"
+             for q in rows]
+    total = sum(q["pnl"] for q in rows)
+    entry = sum(abs(q.get("entryCost") or 0) for q in rows)
+    if entry:
+        lines.append(f"Total: {total:+,.0f} ({total / entry * 100:+.2f}%)")
+    threading.Thread(target=_send_ntfy, daemon=True,
+                     args=(topic, f"Spreads {slot} ET", "\n".join(lines))).start()
 
 
 def _candle_spot_and_prev(symbol):
@@ -3539,6 +3607,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
       <input type="checkbox" id="posTestMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
     </label>
     <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Market data source (server-wide — affects all pages)"></select>
+    <select id="feedSel" style="display:none;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="MarketData options feed (server-wide, takes effect immediately — no restart). cached = ~15-min delayed, 1 credit per call. live = real-time, but bills 1 credit PER CONTRACT per fetch — costly on frequent auto-refresh."></select>
     <button type="button" id="posClearCacheBtn" class="secondary" style="padding:4px 9px;font-size:12px;" onclick="clearChainCache()">Clear cache</button>
     <span class="timestamp">Updated: <span id="lastUpdate">--</span></span>
     <span class="timestamp">Next refresh in: <span id="countdown">--</span>s</span>
@@ -3595,6 +3664,9 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <input id="sigmaMult" type="number" min="0.1" max="10" step="0.5" value="1">
     <span class="dim">&sigma;</span>
   </div>
+  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Master switch for automatic polling. When off, the table never auto-refreshes regardless of the interval or market-hours setting — only manual Refresh now updates it.">
+    <input type="checkbox" id="autoRefreshToggle" style="width:15px;height:15px;"> Auto-refresh
+  </label>
   <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Auto-refresh only between 9:30 AM and 4:30 PM ET on US trading days (weekends and NYSE holidays skipped). Polling pauses automatically at the close and resumes at the next open. Manual Refresh now always works.">
     <input type="checkbox" id="marketHoursOnly" style="width:15px;height:15px;"> Market hours only
   </label>
@@ -3658,9 +3730,12 @@ function sigStr() { return Number.isInteger(curSigmas) ? String(curSigmas) : Str
 function dollarFmt(v, dp=2) { return (v >= 0 ? '$' : '-$') + Math.abs(v).toFixed(dp); }
 function sign(v) { return (v >= 0 ? '+' : ''); }
 
-// Badge showing how stale the quote snapshot is. quoteTime is epoch seconds
-// from the option chain's own underlying, so it dates BOTH spot and options.
-function quoteAgeBadge(epochSec) {
+// Badge showing how old a quote is (epoch seconds -> "Xs/m/h/d ago"), color-
+// graded fresh/delayed/stale. Used for both the spot (underlying quote time)
+// and each option leg (its own per-contract quote time), which can now differ
+// when spot and options come from different feeds (e.g. Yahoo spot + real-time
+// marketdata options), so each carries its own badge and title.
+function quoteAgeBadge(epochSec, title = 'Quote age') {
   if (!epochSec) return '';
   const secs = Math.max(0, Math.floor(Date.now() / 1000 - epochSec));
   let label;
@@ -3668,12 +3743,12 @@ function quoteAgeBadge(epochSec) {
   else if (secs < 3600) label = Math.floor(secs / 60) + 'm';
   else if (secs < 86400) label = Math.floor(secs / 3600) + 'h';
   else label = Math.floor(secs / 86400) + 'd';
-  // Yahoo option quotes are ~15 min delayed, so a couple of minutes is "fresh";
+  // A couple of minutes is still "fresh" (delayed feeds, quiet contracts);
   // >=30 min usually means a stuck feed or a closed market.
   let cls = 'qa-fresh';
   if (secs >= 1800) cls = 'qa-stale';
   else if (secs >= 120) cls = 'qa-delayed';
-  return `<span class="quote-age ${cls}" title="Quote snapshot age (spot + options)">${label} ago</span>`;
+  return `<span class="quote-age ${cls}" title="${title}">${label} ago</span>`;
 }
 
 function showErr(msg) { const b = $('errBanner'); b.textContent = msg; b.classList.add('show'); }
@@ -3868,7 +3943,11 @@ function renderTable() {
     const legLine = (leg, side, strike) => {
       if (!leg) return `<span><span class="strike">${side} ${strike}</span> <span class="quote err-row">missing</span></span>`;
       const ivStr = leg.iv !== null && leg.iv !== undefined ? leg.iv.toFixed(1) + '%' : '--';
-      return `<span><span class="strike">${side} ${strike}</span> <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span>${legStale(leg)}</span>`;
+      // Per-leg quote-age badge from this contract's own quote time (marketdata
+      // 'updated' / Yahoo lastTradeDate) — mirrors the spot badge, but times the
+      // option quotes, which ride a different feed than spot post-hybrid.
+      const ageBadge = quoteAgeBadge(leg.lastTrade, 'Option quote age (this leg)');
+      return `<span><span class="strike">${side} ${strike}</span> <span class="quote">${leg.bid.toFixed(2)} / ${leg.ask.toFixed(2)} / ${leg.last.toFixed(2)} / ${leg.volume.toLocaleString()} / ${ivStr}</span>${ageBadge}${legStale(leg)}</span>`;
     };
     const quoteCell = `<td><div class="leg-block">
       ${legLine(p.long, 'L', p.longStrike)}
@@ -3960,7 +4039,7 @@ function renderTable() {
     }
 
     const label = p.label || `${p.symbol} ${p.longStrike}/${p.shortStrike}`;
-    const spotCell = (p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--') + quoteAgeBadge(p.quoteTime);
+    const spotCell = (p.spot !== null && p.spot !== undefined ? `$${p.spot.toFixed(2)}` : '--') + quoteAgeBadge(p.quoteTime, 'Spot quote age');
     // Entry Spread and Liquidation collapsed into one column: entry price paid
     // per spread over the current liquidation price per spread.
     const es = (p.entrySpread !== null && p.entrySpread !== undefined) ? `$${p.entrySpread.toFixed(2)}` : '--';
@@ -4156,6 +4235,7 @@ function clearChainCache() {
 // server is the source of truth and every page must agree.
 (function initDataSource() {
   const sel = $('dataSource');
+  const feedSel = $('feedSel');
   function apply(d) {
     sel.innerHTML = '';
     (d.sources || []).forEach(s => {
@@ -4166,6 +4246,22 @@ function clearChainCache() {
     sel.value = d.active;
     const active = (d.sources || []).find(s => s.name === d.active);
     activeSourceName = active ? active.label.replace(/\s*\(.*$/, '') : '';
+    // Feed toggle: only shown when the active source has a switchable feed.
+    const feeds = d.feedOptions || [];
+    feedSel.innerHTML = '';
+    feeds.forEach(f => {
+      const o = document.createElement('option');
+      o.value = f; o.textContent = 'feed: ' + f;
+      feedSel.appendChild(o);
+    });
+    if (feeds.length) {
+      feedSel.value = d.feed || feeds[0];
+      // Tint 'live' amber as a running reminder it bills per contract.
+      feedSel.style.color = (feedSel.value === 'live') ? 'var(--yellow)' : 'var(--text-dim)';
+      feedSel.style.display = '';
+    } else {
+      feedSel.style.display = 'none';
+    }
     updateModeTag();
   }
   fetch('/api/source').then(r => r.json()).then(apply).catch(() => { sel.style.display = 'none'; });
@@ -4186,6 +4282,23 @@ function clearChainCache() {
       fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
     });
   });
+  feedSel.addEventListener('change', () => {
+    fetch('/api/source/feed', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({feed: feedSel.value}),
+    }).then(r => r.json()).then(d => {
+      apply(d);                      // echoes the applied (or reverted) feed
+      if (d.error) {
+        feedSel.style.borderColor = 'var(--red)';
+        setTimeout(() => { feedSel.style.borderColor = 'var(--border)'; }, 1500);
+      } else {
+        refreshQuotes();             // reprice immediately off the new feed
+      }
+    }).catch(() => {
+      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
+    });
+  });
 })();
 
 // ---- Market-hours gate for the auto-refresh ----
@@ -4194,14 +4307,10 @@ function clearChainCache() {
 // days; outside that window the interval keeps ticking but skips the fetch,
 // so the first tick after the next open resumes automatically. Manual
 // "Refresh now" and the initial page load are never gated.
-// NYSE full-session holidays, maintained by hand (a missing future date just
-// means harmless polling of unchanging quotes that day):
-const MARKET_HOLIDAYS = new Set([
-  '2026-01-01','2026-01-19','2026-02-16','2026-04-03','2026-05-25','2026-06-19',
-  '2026-07-03','2026-09-07','2026-11-26','2026-12-25',
-  '2027-01-01','2027-01-18','2027-02-15','2027-03-26','2027-05-31','2027-06-18',
-  '2027-07-05','2027-09-06','2027-11-25','2027-12-24',
-]);
+// NYSE full-session holidays — substituted at serve time from the Python
+// MARKET_HOLIDAYS constant (single source of truth for client gate + server
+// digest schedule):
+const MARKET_HOLIDAYS = new Set(__MARKET_HOLIDAYS__);
 function etNow() {
   const parts = new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York',
     weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -4213,21 +4322,43 @@ function etNow() {
 function isMarketOpen() {
   const t = etNow();
   if (t.wd === 'Sat' || t.wd === 'Sun' || MARKET_HOLIDAYS.has(t.ymd)) return false;
-  return t.mins >= 570 && t.mins < 990;   // 9:30 – 16:30 ET
+  // 9:30 – 16:30 ET, plus one extra minute so a refresh lands inside the
+  // 16:30 slot and the server's half-hourly ntfy digest can fire for it.
+  return t.mins >= 570 && t.mins < 991;
 }
+function autoRefreshOn() { return $('autoRefreshToggle').checked; }
 function autoPaused() { return $('marketHoursOnly').checked && !isMarketOpen(); }
+// Whether an auto-tick should actually fetch: master switch on AND not paused
+// by the market-hours gate.
+function autoActive() { return autoRefreshOn() && !autoPaused(); }
 function updateAutoStatus() {
-  $('autoStatus').innerHTML = autoPaused()
-    ? 'auto-refresh: <span style="color:var(--yellow);">paused · market closed</span>'
-    : 'auto-refresh: <span style="color:var(--green);">on</span>';
+  let html;
+  if (!autoRefreshOn()) html = 'auto-refresh: <span style="color:var(--text-dim);">off</span>';
+  else if (autoPaused()) html = 'auto-refresh: <span style="color:var(--yellow);">paused · market closed</span>';
+  else html = 'auto-refresh: <span style="color:var(--green);">on</span>';
+  $('autoStatus').innerHTML = html;
 }
+(function initAutoRefresh() {
+  const cb = $('autoRefreshToggle');
+  cb.checked = localStorage.getItem('posAutoRefresh') !== '0';   // default on
+  cb.addEventListener('change', () => {
+    localStorage.setItem('posAutoRefresh', cb.checked ? '1' : '0');
+    updateAutoStatus();
+    if (cb.checked) {                 // turning on: restart the cycle and refresh now
+      resetTimer();
+      if (!autoPaused()) refreshQuotes();
+    } else {                          // turning off: timer keeps ticking but won't fetch
+      updateCountdown();
+    }
+  });
+})();
 (function initMarketHours() {
   const cb = $('marketHoursOnly');
   cb.checked = localStorage.getItem('posMarketHoursOnly') !== '0';   // default on
   cb.addEventListener('change', () => {
     localStorage.setItem('posMarketHoursOnly', cb.checked ? '1' : '0');
     updateAutoStatus();
-    if (!autoPaused()) { refreshQuotes(); resetTimer(); }
+    if (autoActive()) { refreshQuotes(); resetTimer(); }
   });
 })();
 
@@ -4239,7 +4370,7 @@ function resetTimer() {
   refreshTimer = setInterval(() => {
     nextRefreshAt = Date.now() + sec * 1000;
     updateAutoStatus();
-    if (autoPaused()) return;   // market closed — skip the fetch, keep ticking
+    if (!autoActive()) return;  // off or market-closed — skip the fetch, keep ticking
     refreshQuotes();
   }, sec * 1000);
   countdownTimer = setInterval(updateCountdown, 250);
@@ -4247,6 +4378,7 @@ function resetTimer() {
 }
 
 function updateCountdown() {
+  if (!autoRefreshOn()) { $('countdown').textContent = 'off'; return; }
   if (autoPaused()) { $('countdown').textContent = '--'; return; }
   const remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
   $('countdown').textContent = remaining;
@@ -4776,7 +4908,9 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(POSITIONS_PAGE.encode("utf-8"))
+            page = POSITIONS_PAGE.replace(
+                "__MARKET_HOLIDAYS__", json.dumps(sorted(MARKET_HOLIDAYS)))
+            self.wfile.write(page.encode("utf-8"))
 
         elif parsed.path == "/scatter":
             self.send_response(200)
@@ -4820,6 +4954,7 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                                                test_mode=test_mode)
                 if not test_mode:
                     check_pnl_alerts(quotes)
+                    check_position_digest(quotes)
                 self._send_json({
                     "positions": quotes,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4858,6 +4993,28 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 set_active_source(name)
                 cfg = _load_sources_config()
                 cfg["active"] = name
+                _save_json_dict(SOURCES_CONFIG_FILE, cfg)
+                self._send_json(source_status())
+            except Exception as e:
+                self._send_json({"error": str(e)})
+        elif parsed.path == "/api/source/feed":
+            # Switch the active source's feed at runtime (e.g. marketdata
+            # cached<->live) — takes effect on the next fetch, no restart.
+            try:
+                body = self._read_json_body()
+                feed = (body.get("feed") or "").strip()
+                src = get_source()
+                if not src.feed_options:
+                    self._send_json({"error": f"{src.label} has no switchable feed",
+                                     **source_status()})
+                    return
+                if feed not in src.feed_options:
+                    self._send_json({"error": f"Unknown feed: {feed!r}",
+                                     **source_status()})
+                    return
+                src.set_feed(feed)
+                cfg = _load_sources_config()
+                cfg.setdefault("sources", {}).setdefault(src.name, {})["feed"] = feed
                 _save_json_dict(SOURCES_CONFIG_FILE, cfg)
                 self._send_json(source_status())
             except Exception as e:
