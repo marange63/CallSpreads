@@ -100,6 +100,28 @@ class PriceSource(abc.ABC):
         """Switch the active feed at runtime. Base sources have no feed."""
         raise NotImplementedError("this source has no switchable feed")
 
+    def get_underlying_quote(self, symbol):
+        """Standalone underlying quote as a Yahoo-keyed dict (at minimum
+        regularMarketPrice + regularMarketTime; regularMarketPreviousClose
+        when available). Used when this source is selected as the SPOT source
+        while another source serves the option chains (see set_spot_source).
+        {} = unavailable — callers keep the chain's native spot."""
+        return {}
+
+    def _spot_override(self, symbol):
+        """Underlying quote from the global spot-source override, or None when
+        spot should stay native: no override selected, the override is this
+        source itself, or the override couldn't produce a price. Sources call
+        this from get_option_chain to decide what to bundle as .underlying."""
+        src = SOURCES.get(_SPOT_SOURCE_NAME) if _SPOT_SOURCE_NAME else None
+        if src is None or src is self:
+            return None
+        try:
+            q = src.get_underlying_quote(symbol)
+        except Exception:
+            return None
+        return q if q.get("regularMarketPrice") else None
+
     # ---- Tier 1: options surface (must implement) ----
 
     @abc.abstractmethod
@@ -172,7 +194,11 @@ class YahooSource(PriceSource):
         return tuple(yf.Ticker(self.map_symbol(symbol)).options)
 
     def get_option_chain(self, symbol, exp):
-        return _snap_chain(yf.Ticker(self.map_symbol(symbol)).option_chain(exp))
+        snap = _snap_chain(yf.Ticker(self.map_symbol(symbol)).option_chain(exp))
+        ov = self._spot_override(symbol)
+        if ov:
+            snap.underlying = {**(snap.underlying or {}), **ov}
+        return snap
 
     def get_daily_closes(self, symbol, period="5d", interval="1d"):
         return yf.Ticker(self.map_symbol(symbol)).history(
@@ -196,9 +222,10 @@ class YahooSource(PriceSource):
         """Live-ish underlying quote as a Yahoo-keyed dict: regularMarketPrice +
         regularMarketTime (from the last 1-minute intraday bar, so it carries a
         real timestamp) and regularMarketPreviousClose (from fast_info). Empty
-        dict on failure. Used for HYBRID SPOT — when another vendor serves the
-        option chain but only a delayed equity quote, that vendor can override
-        the underlying with this live Yahoo price. Memoized per symbol for a few
+        dict on failure. Used when Yahoo is the SPOT source while another
+        vendor serves the option chains (see set_spot_source) — that vendor's
+        delayed equity quote is overridden with this live Yahoo price. Memoized
+        per symbol for a few
         seconds so one scan/refresh touching many expirations of the same symbol
         makes a single Yahoo call (the repo minimizes Yahoo hits)."""
         now = datetime.now().timestamp()
@@ -254,12 +281,7 @@ class MarketDataSource(PriceSource):
         if not self.token:
             raise ValueError("no token in sources.json")
         self.feed = (self.config.get("feed", "cached") or "").strip()
-        # HYBRID SPOT: the Trader plan serves real-time OPTIONS but only a
-        # ~15-min delayed equity quote, so the underlying spot lags the option
-        # marks. Setting "spot_source": "yahoo" in sources.json overrides the
-        # underlying with Yahoo's live-ish equity price (free, ~real-time),
-        # while option quotes stay on marketdata. "" / absent = native quote.
-        self.spot_source = (self.config.get("spot_source") or "").strip().lower()
+        self._uq_cache = {}   # symbol -> (epoch_fetched, quote_dict)
 
     def map_symbol(self, symbol):
         # Yahoo's ^/$ index prefixes don't exist here (^SPX -> SPX, ^VIX -> VIX).
@@ -361,18 +383,16 @@ class MarketDataSource(PriceSource):
             if ts:
                 underlying["regularMarketTime"] = int(max(ts))
         try:
-            if self.spot_source == "yahoo":
-                # Hybrid spot: live Yahoo equity price overrides the delayed
-                # marketdata quote (and saves the per-symbol quote credit).
-                yq = _YAHOO_SOURCE.get_underlying_quote(symbol)
-                if yq.get("regularMarketPrice"):
-                    underlying.update(yq)
-                else:                       # Yahoo empty -> fall back to native
-                    underlying.update(self._underlying_quote(symbol))
+            ov = self._spot_override(symbol)
+            if ov:
+                # Spot-source override (e.g. live Yahoo equity price over the
+                # delayed marketdata quote — also saves the quote credit).
+                underlying.update(ov)
             else:
-                # One quotes call (1 credit): fresher price/time and the only way
-                # to get the prior close (last − change) for Daily Theo P&L.
-                underlying.update(self._underlying_quote(symbol))
+                # One quotes call (1 credit, memoized ~5s): fresher price/time
+                # and the only way to get the prior close (last − change) for
+                # Daily Theo P&L.
+                underlying.update(self.get_underlying_quote(symbol))
         except Exception:
             pass  # chain-derived spot still works; candle fallback covers the rest
         return SimpleNamespace(calls=calls, puts=None, underlying=underlying,
@@ -426,6 +446,21 @@ class MarketDataSource(PriceSource):
                 return float(c)
         return None
 
+    _UQ_TTL = 5.0   # seconds to memoize an underlying quote (1 credit each)
+
+    def get_underlying_quote(self, symbol):
+        """Memoized `_underlying_quote`: one scan/refresh touches many
+        expirations of the same symbol, and each quotes call costs a credit —
+        whether marketdata is serving its own chains or acting as the spot
+        source for another vendor's."""
+        now = datetime.now().timestamp()
+        hit = self._uq_cache.get(symbol)
+        if hit and now - hit[0] < self._UQ_TTL:
+            return hit[1]
+        q = self._underlying_quote(symbol)
+        self._uq_cache[symbol] = (now, q)
+        return q
+
     def _underlying_quote(self, symbol):
         kind = "indices" if symbol.startswith(("^", "$")) else "stocks"
         data = self._get_json(f"/{kind}/quotes/{self.map_symbol(symbol)}/")
@@ -466,6 +501,7 @@ SOURCE_CLASSES = {"yahoo": YahooSource,   # future vendor: add ONE entry here
                   "marketdata": MarketDataSource}
 SOURCES = {"yahoo": _YAHOO_SOURCE}        # name -> instantiated, usable source
 _ACTIVE_SOURCE = _YAHOO_SOURCE
+_SPOT_SOURCE_NAME = ""    # underlying-spot override; "" = ride the options source
 
 
 def get_source():
@@ -481,6 +517,27 @@ def set_active_source(name):
     global _ACTIVE_SOURCE
     _ACTIVE_SOURCE = SOURCES[name]
     return _ACTIVE_SOURCE
+
+
+def get_spot_source_name():
+    """Name of the source supplying underlying SPOT prices, or "" when spot
+    rides the options source's own chain quote (native)."""
+    return _SPOT_SOURCE_NAME
+
+
+def set_spot_source(name):
+    """Choose which source supplies underlying spot prices, independently of
+    the options (chain) source — the split lets e.g. real-time-options vendors
+    with delayed equity quotes borrow Yahoo's live-ish spot, or vice versa.
+    "" = native (spot bundled with the chain). Selecting the options source
+    itself is equivalent to "" (sources skip the override for themselves).
+    Memory only — the caller persists config. Raises KeyError if unusable."""
+    global _SPOT_SOURCE_NAME
+    name = (name or "").strip()
+    if name and name not in SOURCES:
+        raise KeyError(name)
+    _SPOT_SOURCE_NAME = name
+    return name
 
 
 def register_sources(config):

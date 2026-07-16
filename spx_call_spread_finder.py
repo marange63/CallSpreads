@@ -32,7 +32,8 @@ from urllib.parse import urlparse, parse_qs
 # This file must contain no direct yf.* calls.
 # ---------------------------------------------------------------------------
 from price_sources import (_YAHOO_SOURCE, SOURCES, get_source,
-                           set_active_source, register_sources)
+                           set_active_source, register_sources,
+                           get_spot_source_name, set_spot_source)
 
 import numpy as np  # ships with pandas/yfinance; used for the Monte Carlo path engine
 import pandas as pd  # ships with yfinance; used for the beta regression on daily returns
@@ -1004,15 +1005,28 @@ def _load_sources_config():
     cfg = _load_json_dict(SOURCES_CONFIG_FILE)
     cfg.setdefault("active", "yahoo")
     cfg.setdefault("sources", {"yahoo": {}})
+    if "spot" not in cfg:
+        # Migrate the legacy per-vendor hybrid-spot key ("spot_source" inside
+        # the marketdata block) to the top-level spot-source setting; once
+        # "spot" is persisted the old key is inert.
+        cfg["spot"] = (cfg["sources"].get("marketdata") or {}).get(
+            "spot_source", "") or ""
     return cfg
 
 
 def init_sources():
     """Load sources.json, build the source registry, and activate the saved
-    source (unknown/unusable names fall back to Yahoo with a warning).
-    Called from main(); plain module import stays Yahoo-only with no config."""
+    options source + spot source (unknown/unusable names fall back to Yahoo /
+    native spot with a warning). Called from main(); plain module import stays
+    Yahoo-only with no config."""
     cfg = _load_sources_config()
     register_sources(cfg)
+    try:
+        set_spot_source(cfg.get("spot", ""))
+    except KeyError:
+        print(f"  Warning: spot source '{cfg.get('spot')}' unavailable — "
+              f"spot stays on the options source")
+        set_spot_source("")
     name = cfg.get("active", "yahoo")
     try:
         return set_active_source(name)
@@ -1034,6 +1048,8 @@ def source_status():
         # feedOptions is empty for sources with no switchable feed (e.g. Yahoo).
         "feed": active.get_feed(),
         "feedOptions": list(active.feed_options),
+        # Underlying-spot source override; "" = spot rides the options source.
+        "spot": get_spot_source_name(),
     }
 
 
@@ -1371,7 +1387,7 @@ def check_pnl_alerts(quotes):
 
 
 def check_position_digest(quotes):
-    """Half-hourly ntfy digest: best (mid) P&L and return for every position.
+    """Half-hourly ntfy digest: best (mid) Adjusted P&L and return for every position.
 
     Fires on the first live refresh inside each half-hour slot between 9:30
     and 16:30 ET on US trading days (weekends + MARKET_HOLIDAYS skipped) —
@@ -1389,7 +1405,7 @@ def check_position_digest(quotes):
         return
     slot_mins = min((mins // 30) * 30, 990)
     slot = f"{slot_mins // 60:02d}:{slot_mins % 60:02d}"
-    rows = [q for q in quotes if q.get("pnl") is not None]
+    rows = [q for q in quotes if q.get("adjPnl") is not None]
     if not rows:
         return
     with _alerts_lock:
@@ -1405,9 +1421,9 @@ def check_position_digest(quotes):
         state["digest_sent"].append(slot)     # latch-first, like the alerts
         _save_alerts(state)
         topic = state["topic"]
-    lines = [f"{_position_name(q)}: {q['pnl']:+,.0f} ({q['pnlPct']:+.2f}%)"
+    lines = [f"{_position_name(q)}: {q['adjPnl']:+,.0f} ({q['adjPnlPct']:+.2f}%)"
              for q in rows]
-    total = sum(q["pnl"] for q in rows)
+    total = sum(q["adjPnl"] for q in rows)
     entry = sum(abs(q.get("entryCost") or 0) for q in rows)
     if entry:
         lines.append(f"Total: {total:+,.0f} ({total / entry * 100:+.2f}%)")
@@ -1576,6 +1592,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["oneSigmaPnlDown"] = None
         result["dailyTheoPnl"] = None
         result["dailyTheoMove"] = None
+        result["dailyTheoMovePct"] = None
         result["beta"] = None
         result["betaDollarDeltaPer1Pct"] = None
         result["betaIndexMove"] = None
@@ -1730,6 +1747,8 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                         theo_prev = (bs_call_price(prev_close, K1, T, r, iv_l)
                                      - bs_call_price(prev_close, K2, T, r, iv_s))
                         result["dailyTheoMove"] = round(spot - prev_close, 2)
+                        result["dailyTheoMovePct"] = round(
+                            (spot - prev_close) / prev_close * 100, 2)
                         result["dailyTheoPnl"] = round((theo_now - theo_prev) * 100 * contracts, 2)
 
                     # Beta-scaled 1σ index-move P&L: translate a ±1σ move in the
@@ -2237,7 +2256,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label id="testToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so repeated searches (e.g. after hours) don't re-fetch from the data source. Data stays frozen until you Clear cache or turn Test off.">
     <input type="checkbox" id="testMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
   </label>
-  <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Market data source (server-wide — affects all pages)"></select>
+  <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Option-quote data source (server-wide — affects all pages)"></select>
+  <select id="spotSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Underlying SPOT price source (server-wide). 'with options' = the price bundled with the option chain; picking a different vendor overrides just the stock/index spot while option quotes stay on the source at left — e.g. Yahoo's live-ish equity price over MarketData's delayed one."></select>
   <button type="button" id="clearCacheBtn" class="primary" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);padding:5px 10px;font-size:12px;font-weight:500;" onclick="clearChainCache()">Clear cache</button>
   <div class="spot-display">
     <span class="label" id="spotLabel">SPX Last:</span>
@@ -2748,6 +2768,7 @@ function clearChainCache() {
 // the server is the source of truth and every page must agree. ----
 (function initDataSource() {
   const sel = document.getElementById('dataSource');
+  const spotSel = document.getElementById('spotSource');
   function apply(d) {
     sel.innerHTML = '';
     (d.sources || []).forEach(s => {
@@ -2759,9 +2780,27 @@ function clearChainCache() {
     const active = (d.sources || []).find(s => s.name === d.active);
     // Badge shows the short vendor name (label up to the first parenthesis).
     activeSourceName = active ? active.label.replace(/\s*\(.*$/, '') : '';
+    // Spot-source override: '' = spot bundled with the option chain.
+    spotSel.innerHTML = '';
+    const none = document.createElement('option');
+    none.value = ''; none.textContent = 'spot: with options';
+    spotSel.appendChild(none);
+    (d.sources || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.name;
+      o.textContent = 'spot: ' + s.label.replace(/\s*\(.*$/, '');
+      spotSel.appendChild(o);
+    });
+    spotSel.value = d.spot || '';
     updateModeTag();
   }
-  fetch('/api/source').then(r => r.json()).then(apply).catch(() => { sel.style.display = 'none'; });
+  function flash(el) {
+    el.style.borderColor = 'var(--red)';
+    setTimeout(() => { el.style.borderColor = 'var(--border)'; }, 1500);
+  }
+  fetch('/api/source').then(r => r.json()).then(apply).catch(() => {
+    sel.style.display = 'none'; spotSel.style.display = 'none';
+  });
   sel.addEventListener('change', () => {
     const prev = activeSourceName;
     fetch('/api/source', {
@@ -2770,13 +2809,22 @@ function clearChainCache() {
       body: JSON.stringify({name: sel.value}),
     }).then(r => r.json()).then(d => {
       apply(d);                      // server echoes the (possibly unchanged) state
-      if (d.error) {                 // flash the select red; apply() already reverted it
-        sel.style.borderColor = 'var(--red)';
-        setTimeout(() => { sel.style.borderColor = 'var(--border)'; }, 1500);
-      }
+      if (d.error) flash(sel);       // apply() already reverted the selection
     }).catch(() => {                 // network failure: revert the visible choice
       fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
       activeSourceName = prev;
+    });
+  });
+  spotSel.addEventListener('change', () => {
+    fetch('/api/source/spot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({spot: spotSel.value}),
+    }).then(r => r.json()).then(d => {
+      apply(d);
+      if (d.error) flash(spotSel);
+    }).catch(() => {
+      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
     });
   });
 })();
@@ -3606,7 +3654,8 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
     <label id="posTestToggle" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);cursor:pointer;" title="Test mode caches each underlying's option chain so the 30s auto-refresh (e.g. after hours) doesn't re-fetch from the data source. Quotes stay frozen until you Clear cache or turn Test off.">
       <input type="checkbox" id="posTestMode" style="width:15px;height:15px;accent-color:var(--yellow);"> Test mode
     </label>
-    <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Market data source (server-wide — affects all pages)"></select>
+    <select id="dataSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Option-quote data source (server-wide — affects all pages)"></select>
+    <select id="spotSource" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="Underlying SPOT price source (server-wide). 'with options' = the price bundled with the option chain; picking a different vendor overrides just the stock/index spot while option quotes stay on the source at left — e.g. Yahoo's live-ish equity price over MarketData's delayed one."></select>
     <select id="feedSel" style="display:none;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;" title="MarketData options feed (server-wide, takes effect immediately — no restart). cached = ~15-min delayed, 1 credit per call. live = real-time, but bills 1 credit PER CONTRACT per fetch — costly on frequent auto-refresh."></select>
     <button type="button" id="posClearCacheBtn" class="secondary" style="padding:4px 9px;font-size:12px;" onclick="clearChainCache()">Clear cache</button>
     <span class="timestamp">Updated: <span id="lastUpdate">--</span></span>
@@ -3642,7 +3691,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
 <div class="refresh-bar">
   <div class="field">
     <label for="refreshSec">Refresh every</label>
-    <input id="refreshSec" type="number" min="5" step="5" value="30">
+    <input id="refreshSec" type="number" min="5" step="5" value="600">
     <span class="dim">seconds</span>
   </div>
   <div class="field">
@@ -3706,7 +3755,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th title="Raw P&amp;L vs entry cost. best = exit both legs at mid; worst = liquidation (long @ bid, short @ ask).">P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col" title="Adjusted P&amp;L: haircut on gains, then round-trip commission. best = mid exit (drives alerts and P(+X%)); worst = liquidation exit.">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+15%)</th>
-        <th>Daily Theo P&amp;L</th>
+        <th title="Main: Daily Theo P&amp;L — BS reprice for this underlying's one-day move (spot vs prior close), option quotes held aside. MTM sub-line: this spread's realized daily mark-to-market — today's mid marks vs yesterday's option closes.">Daily Theo P&amp;L</th>
         <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
         <th id="colGreeks" title="Own-vol &plusmn;&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
@@ -4011,13 +4060,27 @@ function renderTable() {
 
     // Daily theoretical P&L: BS reprice of the spread for the underlying's
     // one-day move (spot vs. prior close), independent of the stale option quotes.
+    // MTM sub-line = this spread's realized daily mark-to-market (today's mid
+    // marks vs yesterday's closes) — the per-position counterpart of the
+    // portfolio-summary Daily MTM tile.
     let dailyTheoCell = '<td class="dim">--</td>';
-    if (p.dailyTheoPnl !== null && p.dailyTheoPnl !== undefined) {
-      const cls = p.dailyTheoPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const moveStr = (p.dailyTheoMove !== null && p.dailyTheoMove !== undefined)
-        ? `<span class="tt-dim">${p.symbol} ${sign(p.dailyTheoMove)}${Math.abs(p.dailyTheoMove).toFixed(2)}</span>` : '';
+    const hasTheo = p.dailyTheoPnl !== null && p.dailyTheoPnl !== undefined;
+    const hasMtm = p.dailyMtmPnl !== null && p.dailyMtmPnl !== undefined;
+    if (hasTheo || hasMtm) {
+      const theoStr = hasTheo
+        ? `<span class="${p.dailyTheoPnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${sign(p.dailyTheoPnl)}${dollarFmt(p.dailyTheoPnl, 0)}</span>`
+        : '<span class="dim">--</span>';
+      const mtmStr = hasMtm
+        ? `<span class="${p.dailyMtmPnl >= 0 ? 'pnl-pos' : 'pnl-neg'}"><span class="tt-dim">MTM</span> ${sign(p.dailyMtmPnl)}${dollarFmt(p.dailyMtmPnl, 0)}</span>`
+        : '';
+      // Sub-line: the spot move driving the theo number — dollar move and %.
+      const movePctStr = (p.dailyTheoMovePct !== null && p.dailyTheoMovePct !== undefined)
+        ? ` (${sign(p.dailyTheoMovePct)}${Math.abs(p.dailyTheoMovePct).toFixed(2)}%)` : '';
+      const moveStr = (hasTheo && p.dailyTheoMove !== null && p.dailyTheoMove !== undefined)
+        ? `<span class="tt-dim">${p.symbol} ${sign(p.dailyTheoMove)}${Math.abs(p.dailyTheoMove).toFixed(2)}${movePctStr}</span>` : '';
       dailyTheoCell = `<td><div class="pnl-block">
-        <span class="${cls}">${sign(p.dailyTheoPnl)}${dollarFmt(p.dailyTheoPnl, 0)}</span>
+        ${theoStr}
+        ${mtmStr}
         ${moveStr}
       </div></td>`;
     }
@@ -4235,6 +4298,7 @@ function clearChainCache() {
 // server is the source of truth and every page must agree.
 (function initDataSource() {
   const sel = $('dataSource');
+  const spotSel = $('spotSource');
   const feedSel = $('feedSel');
   function apply(d) {
     sel.innerHTML = '';
@@ -4246,6 +4310,18 @@ function clearChainCache() {
     sel.value = d.active;
     const active = (d.sources || []).find(s => s.name === d.active);
     activeSourceName = active ? active.label.replace(/\s*\(.*$/, '') : '';
+    // Spot-source override: '' = spot bundled with the option chain.
+    spotSel.innerHTML = '';
+    const none = document.createElement('option');
+    none.value = ''; none.textContent = 'spot: with options';
+    spotSel.appendChild(none);
+    (d.sources || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.name;
+      o.textContent = 'spot: ' + s.label.replace(/\s*\(.*$/, '');
+      spotSel.appendChild(o);
+    });
+    spotSel.value = d.spot || '';
     // Feed toggle: only shown when the active source has a switchable feed.
     const feeds = d.feedOptions || [];
     feedSel.innerHTML = '';
@@ -4264,41 +4340,36 @@ function clearChainCache() {
     }
     updateModeTag();
   }
-  fetch('/api/source').then(r => r.json()).then(apply).catch(() => { sel.style.display = 'none'; });
-  sel.addEventListener('change', () => {
-    fetch('/api/source', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: sel.value}),
-    }).then(r => r.json()).then(d => {
-      apply(d);                      // server echoes the (possibly unchanged) state
-      if (d.error) {                 // flash the select red; apply() already reverted it
-        sel.style.borderColor = 'var(--red)';
-        setTimeout(() => { sel.style.borderColor = 'var(--border)'; }, 1500);
-      } else {
-        refreshQuotes();             // reprice immediately off the new source
-      }
-    }).catch(() => {
-      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
+  function flash(el) {
+    el.style.borderColor = 'var(--red)';
+    setTimeout(() => { el.style.borderColor = 'var(--border)'; }, 1500);
+  }
+  // One handler shape for all three server-global toggles: POST the change,
+  // re-apply the echoed state, flash on rejection, reprice on success.
+  function wireToggle(el, url, payload) {
+    el.addEventListener('change', () => {
+      fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload()),
+      }).then(r => r.json()).then(d => {
+        apply(d);                    // server echoes the (possibly reverted) state
+        if (d.error) {
+          flash(el);
+        } else {
+          refreshQuotes();           // reprice immediately off the new setting
+        }
+      }).catch(() => {
+        fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
+      });
     });
+  }
+  fetch('/api/source').then(r => r.json()).then(apply).catch(() => {
+    sel.style.display = 'none'; spotSel.style.display = 'none';
   });
-  feedSel.addEventListener('change', () => {
-    fetch('/api/source/feed', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({feed: feedSel.value}),
-    }).then(r => r.json()).then(d => {
-      apply(d);                      // echoes the applied (or reverted) feed
-      if (d.error) {
-        feedSel.style.borderColor = 'var(--red)';
-        setTimeout(() => { feedSel.style.borderColor = 'var(--border)'; }, 1500);
-      } else {
-        refreshQuotes();             // reprice immediately off the new feed
-      }
-    }).catch(() => {
-      fetch('/api/source').then(r => r.json()).then(apply).catch(() => {});
-    });
-  });
+  wireToggle(sel, '/api/source', () => ({name: sel.value}));
+  wireToggle(spotSel, '/api/source/spot', () => ({spot: spotSel.value}));
+  wireToggle(feedSel, '/api/source/feed', () => ({feed: feedSel.value}));
 })();
 
 // ---- Market-hours gate for the auto-refresh ----
@@ -4365,7 +4436,7 @@ function updateAutoStatus() {
 function resetTimer() {
   if (refreshTimer) clearInterval(refreshTimer);
   if (countdownTimer) clearInterval(countdownTimer);
-  const sec = Math.max(5, parseInt($('refreshSec').value, 10) || 30);
+  const sec = Math.max(5, parseInt($('refreshSec').value, 10) || 600);
   nextRefreshAt = Date.now() + sec * 1000;
   refreshTimer = setInterval(() => {
     nextRefreshAt = Date.now() + sec * 1000;
@@ -5015,6 +5086,23 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 src.set_feed(feed)
                 cfg = _load_sources_config()
                 cfg.setdefault("sources", {}).setdefault(src.name, {})["feed"] = feed
+                _save_json_dict(SOURCES_CONFIG_FILE, cfg)
+                self._send_json(source_status())
+            except Exception as e:
+                self._send_json({"error": str(e)})
+        elif parsed.path == "/api/source/spot":
+            # Choose which source supplies underlying SPOT prices, independently
+            # of the options (chain) source; "" = ride the options source.
+            try:
+                body = self._read_json_body()
+                spot = (body.get("spot") or "").strip()
+                if spot and spot not in SOURCES:
+                    self._send_json({"error": f"Unknown data source: {spot!r}",
+                                     **source_status()})
+                    return
+                set_spot_source(spot)
+                cfg = _load_sources_config()
+                cfg["spot"] = spot
                 _save_json_dict(SOURCES_CONFIG_FILE, cfg)
                 self._send_json(source_status())
             except Exception as e:
