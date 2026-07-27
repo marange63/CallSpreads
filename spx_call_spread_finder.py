@@ -18,6 +18,7 @@ import os
 import pickle
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 import socketserver
@@ -1429,6 +1430,89 @@ def check_position_digest(quotes):
         lines.append(f"Total: {total:+,.0f} ({total / entry * 100:+.2f}%)")
     threading.Thread(target=_send_ntfy, daemon=True,
                      args=(topic, f"Spreads {slot} ET", "\n".join(lines))).start()
+
+
+# ---- Server-side alert poller ----
+# The threshold alerts and the half-hourly digest above only run when something
+# calls /api/positions/quotes, which used to mean an open monitor tab. That made
+# phone alerts hostage to the browser: a tab that is closed, navigated away,
+# flipped to TEST, or put to sleep by the browser's background-tab freezer
+# silently drops every slot it was asleep for (observed 2026-07-27: no digest
+# 12:30-14:30 ET while the server itself was up the whole time). This thread is
+# the backstop — it drives the same two checks on a timer, independent of any
+# client. It stands down whenever a live browser refresh has already covered the
+# current interval, so an open tab costs no extra vendor credits.
+POLLER_INTERVAL_SECS = 300     # 5 min: fine enough for threshold alerts, ~78 polls/session
+POLLER_TICK_SECS = 15          # granularity of the market-open / skip checks
+_last_live_quotes_at = 0.0     # epoch secs of the last live /api/positions/quotes
+_last_quote_params = {}        # last params a browser sent, so alerts match the UI's numbers
+
+
+def note_live_quote_refresh(params):
+    """Record that a client just took a live quotes refresh (with its settings).
+
+    Lets the poller skip a tick that a browser already paid for, and lets it
+    reuse the monitor's own haircut / target / index / sigma so a server-driven
+    alert reports the same Adjusted P&L the user is looking at.
+    """
+    global _last_live_quotes_at
+    _last_live_quotes_at = time.time()
+    _last_quote_params.update(params)
+
+
+def _market_session_now():
+    """True during the alerting window: 9:30-16:31 ET on a US trading day.
+
+    Matches the client-side gate in POSITIONS_PAGE (same MARKET_HOLIDAYS set)
+    and runs one minute past the 16:30 digest slot so that slot can fire.
+    """
+    now = _now_et()
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in MARKET_HOLIDAYS:
+        return False
+    mins = now.hour * 60 + now.minute
+    return 570 <= mins <= 991
+
+
+def _poll_once():
+    positions = load_positions()
+    if not positions:
+        return
+    p = _last_quote_params
+    quotes = fetch_position_quotes(
+        positions,
+        haircut_pct=p.get("haircut_pct", 0.80),   # same default as fetch_position_quotes
+        profit_target_pct=p.get("profit_target_pct", 15.0),
+        index_symbol=p.get("index_symbol", DEFAULT_INDEX),
+        n_sigma=p.get("n_sigma", 1.0),
+        test_mode=False)
+    check_pnl_alerts(quotes)
+    check_position_digest(quotes)
+
+
+def _alert_poller_loop():
+    while True:
+        try:
+            if _market_session_now():
+                # A live browser refresh inside this interval already ran both
+                # checks on fresher data — don't spend the vendor credits twice.
+                if time.time() - _last_live_quotes_at >= POLLER_INTERVAL_SECS:
+                    note_live_quote_refresh({})   # claim this interval before the fetch
+                    _poll_once()
+        except Exception as e:
+            # Never let a vendor hiccup kill the thread — the next tick retries.
+            print(f"  Alert poller error: {e}")
+        time.sleep(POLLER_TICK_SECS)
+
+
+def start_alert_poller():
+    """Start the backstop poller unless alerts.json sets "poller": false."""
+    with _alerts_lock:
+        state = _load_alerts()
+        enabled = state.get("poller", True)
+    if not enabled:
+        return False
+    threading.Thread(target=_alert_poller_loop, daemon=True).start()
+    return True
 
 
 def _candle_spot_and_prev(symbol):
@@ -5024,6 +5108,11 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                                                index_symbol=index_symbol, n_sigma=n_sigma,
                                                test_mode=test_mode)
                 if not test_mode:
+                    # Tell the backstop poller this interval is covered, and hand it
+                    # the monitor's settings so its alerts use the same numbers.
+                    note_live_quote_refresh({
+                        "haircut_pct": haircut_pct, "profit_target_pct": target_pct,
+                        "index_symbol": index_symbol, "n_sigma": n_sigma})
                     check_pnl_alerts(quotes)
                     check_position_digest(quotes)
                 self._send_json({
@@ -5325,6 +5414,11 @@ def main():
     topic = get_alert_topic()
     print(f"  Adj P&L alerts -> ntfy topic: {topic}")
     print(f"    (subscribe in the ntfy phone app, or watch https://ntfy.sh/{topic})")
+    if start_alert_poller():
+        print(f"    Backstop poller: every {POLLER_INTERVAL_SECS // 60} min during market "
+              f"hours (no open tab needed)")
+    else:
+        print('    Backstop poller: disabled ("poller": false in alerts.json)')
 
     with httpd:
         httpd.allow_reuse_address = True
