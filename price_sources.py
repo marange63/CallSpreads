@@ -212,16 +212,43 @@ class YahooSource(PriceSource):
             data = data.to_frame(symbols[0])
         return data
 
+    @staticmethod
+    def _prev_close(sym):
+        """Official prior *regular-session* close, or None.
+
+        Must be `regular_market_previous_close`, NOT `previous_close`: yfinance
+        derives the latter from 1wk/1h **prepost** bars and returns the prior
+        day's last after-hours print, which silently anchors the monitor's
+        Daily Theo P&L (and the Finder's day move) to an overnight mark — seen
+        2026-07-30, QQQ 666.07 instead of the 661.73 close, understating the
+        day's move by ~0.7pp.
+
+        fast_info can also fail transiently (its 1y-history fetch raises on a
+        rate-limit blip), so the fallback is the daily close series — the last
+        close dated before today — and never `previous_close`: a silent retreat
+        to the prepost mark is exactly the bug this guards against."""
+        try:
+            pc = yf.Ticker(sym).fast_info.regular_market_previous_close
+            if pc:
+                return float(pc)
+        except Exception:
+            pass
+        daily = yf.Ticker(sym).history(period="5d", interval="1d")["Close"].dropna()
+        today = datetime.now().date()
+        prior = daily[[d.date() < today for d in daily.index]]
+        return float(prior.iloc[-1]) if not prior.empty else None
+
     def get_previous_close(self, symbol):
         try:
-            return float(yf.Ticker(self.map_symbol(symbol)).fast_info.previous_close)
+            return self._prev_close(self.map_symbol(symbol))
         except Exception:
             return None
 
     def get_underlying_quote(self, symbol):
         """Live-ish underlying quote as a Yahoo-keyed dict: regularMarketPrice +
         regularMarketTime (from the last 1-minute intraday bar, so it carries a
-        real timestamp) and regularMarketPreviousClose (from fast_info). Empty
+        real timestamp) and regularMarketPreviousClose (the official prior
+        regular-session close — see _prev_close, which drives Daily Theo). Empty
         dict on failure. Used when Yahoo is the SPOT source while another
         vendor serves the option chains (see set_spot_source) — that vendor's
         delayed equity quote is overridden with this live Yahoo price. Memoized
@@ -242,7 +269,7 @@ class YahooSource(PriceSource):
         except Exception:
             pass
         try:
-            pc = yf.Ticker(sym).fast_info.previous_close
+            pc = self._prev_close(sym)
             if pc:
                 out["regularMarketPreviousClose"] = float(pc)
         except Exception:

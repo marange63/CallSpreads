@@ -1211,7 +1211,7 @@ def _leg_snapshot(row):
 
 
 def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
-    """Best-usable IV for one leg of a monitored spread.
+    """Best-usable IV for one leg of a monitored spread, as (iv, source).
 
     Yahoo reports a near-zero impliedVolatility for contracts with no live
     two-sided quote (market open, after hours, weekends); fed straight into
@@ -1220,18 +1220,24 @@ def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
     quoted IV only when it comes with a live two-sided market and clears
     MIN_TRUSTED_IV; otherwise fall back to the expiration's ATM IV, then to
     the IV re-implied from the leg's own mark, then to the raw value.
+
+    `source` tags which of those four rungs produced the number ("leg" /
+    "atm" / "implied" / "raw"). It rides out to the client so the /curve
+    chart can say when it is drawing a fallback: on the "atm" rung both legs
+    share one vol and the spread's skew is gone, which a bare curve would
+    otherwise present as though it were the real surface.
     """
     iv = leg.get("_iv_raw")
     if iv and iv >= MIN_TRUSTED_IV and leg.get("quotedMid"):
-        return iv
+        return iv, "leg"
     if atm_iv and atm_iv >= MIN_TRUSTED_IV:
-        return atm_iv
+        return atm_iv, "atm"
     mark = leg.get("mid")
     if spot and mark and mark > 0 and T > 0:
         implied = implied_vol(mark, spot, strike, T, r)
         if implied and implied >= MIN_TRUSTED_IV:
-            return implied
-    return iv
+            return implied, "implied"
+    return iv, "raw"
 
 
 # Per-day memo of official option prior closes, for the daily mark-to-market
@@ -1670,6 +1676,14 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["netDelta"] = None
         result["netThetaPerDay"] = None
         result["netVega"] = None
+        # Model inputs behind every BS column, exported for the /curve chart so
+        # it reprices with the server's numbers rather than the raw leg quotes.
+        # Initialized here because error rows return before the greeks block.
+        result["ivLongPct"] = None
+        result["ivShortPct"] = None
+        result["atmIvPct"] = None
+        result["ivSource"] = None
+        result["riskFreeRatePct"] = RISK_FREE_RATE_PCT
         result["oneSigmaMove"] = None
         result["oneSigmaIvPct"] = None
         result["oneSigmaPnl"] = None
@@ -1677,6 +1691,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["dailyTheoPnl"] = None
         result["dailyTheoMove"] = None
         result["dailyTheoMovePct"] = None
+        result["dailyTheoPrevClose"] = None
         result["beta"] = None
         result["betaDollarDeltaPer1Pct"] = None
         result["betaIndexMove"] = None
@@ -1786,8 +1801,19 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
 
                 # Leg IVs for every BS-derived column, distrusting Yahoo's
                 # bogus near-zero IVs on unquoted contracts (see _trusted_leg_iv).
-                iv_l = _trusted_leg_iv(long_leg, spot, float(p["longStrike"]), T, r, atm_iv)
-                iv_s = _trusted_leg_iv(short_leg, spot, float(p["shortStrike"]), T, r, atm_iv)
+                iv_l, iv_l_src = _trusted_leg_iv(long_leg, spot, float(p["longStrike"]), T, r, atm_iv)
+                iv_s, iv_s_src = _trusted_leg_iv(short_leg, spot, float(p["shortStrike"]), T, r, atm_iv)
+
+                # Ship the model's own inputs to the client: the /curve chart
+                # reprices this spread in JS and must use the SAME IVs as every
+                # other BS column here, not the raw (often bogus) leg quotes.
+                # ivSource reports the weaker of the two legs' rungs, since one
+                # fallback leg is enough to compromise the pair.
+                result["ivLongPct"] = round(iv_l * 100, 2) if iv_l else None
+                result["ivShortPct"] = round(iv_s * 100, 2) if iv_s else None
+                result["atmIvPct"] = round(atm_iv * 100, 2) if atm_iv else None
+                _IV_RUNG = ("leg", "implied", "atm", "raw")   # best -> worst
+                result["ivSource"] = max((iv_l_src, iv_s_src), key=_IV_RUNG.index)
 
                 if iv_l and iv_s and T > 0:
                     K1 = float(p["longStrike"])
@@ -1833,6 +1859,9 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                         result["dailyTheoMove"] = round(spot - prev_close, 2)
                         result["dailyTheoMovePct"] = round(
                             (spot - prev_close) / prev_close * 100, 2)
+                        # Shown beside the move so the "prev close -> spot" leg
+                        # of the reprice is auditable from the table itself.
+                        result["dailyTheoPrevClose"] = round(prev_close, 2)
                         result["dailyTheoPnl"] = round((theo_now - theo_prev) * 100 * contracts, 2)
 
                     # Beta-scaled 1σ index-move P&L: translate a ±1σ move in the
@@ -2166,6 +2195,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   tbody tr { position: relative; }
   tbody tr:hover { background: var(--surface2); }
+  /* Rows are clickable — they open the interactive value curve in a new tab. */
+  tbody tr[data-idx] { cursor: pointer; }
 
   .row-tooltip {
     display: none;
@@ -2601,6 +2632,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 let allSpreads = [];
+let renderedSpreads = [];   // the rows currently in the table, for row clicks
 let currentSort = { col: 'score', asc: false };
 let activeDteFilter = 'all';
 let currentSpot = null;
@@ -2940,6 +2972,27 @@ function openScatter() {
   window.open('/scatter', '_blank');
 }
 
+__CURVE_LINK__
+
+// Normalize a finder spread into the /curve descriptor. Units: strikes/width/
+// breakeven stay in POINTS; maxProfit arrives as points x contracts (see the
+// server's "maxProfit" field) so it needs the x100 here, not in the chart.
+function spreadCurveDescriptor(s) {
+  const rf = parseFloat(document.getElementById('riskFreeRate').value) / 100;
+  const cost = s.netPremium * 100 * s.contracts + s.totalCommission;
+  return {
+    v: 1, ts: Date.now(), source: 'finder',
+    id: `f:${s.expiration}:${s.buyStrike}:${s.sellStrike}`,
+    symbol: currentSymbol, label: null, expiration: s.expiration, dte: s.dte,
+    K1: s.buyStrike, K2: s.sellStrike, width: s.spreadWidth, contracts: s.contracts,
+    netPremium: s.netPremium, totalCommission: s.totalCommission, totalCost: cost,
+    maxProfit: s.maxProfit * 100, breakeven: s.breakeven,
+    spot: currentSpot, rfRate: rf,
+    ivLong: s.ivBuy / 100, ivShort: s.ivSell / 100, ivSource: 'leg',
+    markValue: null,
+  };
+}
+
 async function doSearch() {
   const symbol = document.getElementById('ticker').value.trim().toUpperCase();
   if (!symbol) { showError('Please enter a ticker symbol.'); return; }
@@ -3065,6 +3118,8 @@ async function doSearch() {
     buildDteFilters();
     renderTable();
     stashScatterData();  // keep any open scatter tab in sync with this search
+    // Same for any /curve tab already open on one of these spreads.
+    refreshOpenCurves(allSpreads.map(spreadCurveDescriptor));
 
     if (allSpreads.length === 0) {
       document.getElementById('emptyState').innerHTML = '<h2>No spreads found</h2><p>Try increasing the max premium or decreasing the min leverage.</p>';
@@ -3268,23 +3323,9 @@ function initScoreWeights() {
 }
 initScoreWeights();
 
-// Black-Scholes helpers for theoretical value curve
-function jsNormCdf(x) {
-  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
-  const sign = x < 0 ? -1 : 1;
-  x = Math.abs(x) / Math.sqrt(2);
-  const t = 1.0 / (1.0 + p * x);
-  const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t * Math.exp(-x*x);
-  return 0.5 * (1.0 + sign * y);
-}
-
-function jsBsCallPrice(S, K, T, r, sigma) {
-  if (T <= 0) return Math.max(S - K, 0);
-  if (sigma <= 0) return Math.max(S - K * Math.exp(-r * T), 0);
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  const d2 = d1 - sigma * Math.sqrt(T);
-  return S * jsNormCdf(d1) - K * Math.exp(-r * T) * jsNormCdf(d2);
-}
+// Black-Scholes helpers for theoretical value curve (server-injected; the one
+// copy of the math, shared with /scatter and /curve).
+__BS_JS__
 
 function buildPnlChart(s) {
   const m = 100;
@@ -3470,9 +3511,14 @@ function renderTable() {
 
   // Show up to 500 rows
   const display = spreads.slice(0, 500);
+  // Kept for the row click handler below (dataset.idx indexes into this).
+  renderedSpreads = display;
 
-  for (const s of display) {
+  for (let rowIdx = 0; rowIdx < display.length; rowIdx++) {
+    const s = display[rowIdx];
     const tr = document.createElement('tr');
+    tr.dataset.idx = rowIdx;
+    tr.title = 'Click for the interactive value curve';
     const m = 100; // options contract multiplier
     const c = s.contracts;
     const buyEach = (s.buyAsk * m).toLocaleString('en-US', {maximumFractionDigits: 0});
@@ -3555,6 +3601,19 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !document.getElementById('searchBtn').disabled) {
     doSearch();
   }
+});
+
+// Click a result row -> open its interactive value curve in a tab. Delegated,
+// like the hover handler below, so re-rendering the table needs no re-wiring.
+// The hover tooltip is unaffected: it is pointer-events:none and mouse-driven.
+document.addEventListener('click', (e) => {
+  if (e.target.closest('a, button, input, select, th')) return;
+  // Don't hijack a drag-select of the row's text.
+  if (window.getSelection && String(window.getSelection())) return;
+  const tr = e.target.closest('#resultsBody tr');
+  if (!tr || tr.dataset.idx === undefined) return;   // skips the "showing N of M" row
+  const s = renderedSpreads[+tr.dataset.idx];
+  if (s) openCurve(spreadCurveDescriptor(s), showError);
 });
 
 // Tooltip positioning — show near the mouse, flipping if it would overflow
@@ -3839,7 +3898,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th title="Raw P&amp;L vs entry cost. best = exit both legs at mid; worst = liquidation (long @ bid, short @ ask).">P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col" title="Adjusted P&amp;L: haircut on gains, then round-trip commission. best = mid exit (drives alerts and P(+X%)); worst = liquidation exit.">Adj P&amp;L (80%)</th>
         <th id="colProbTarget">P(+15%)</th>
-        <th title="Main: Daily Theo P&amp;L — BS reprice for this underlying's one-day move (spot vs prior close), option quotes held aside. MTM sub-line: this spread's realized daily mark-to-market — today's mid marks vs yesterday's option closes.">Daily Theo P&amp;L</th>
+        <th title="Main: Daily Theo P&amp;L — BS reprice for this underlying's one-day move (spot vs prior close), option quotes held aside. MTM sub-line: this spread's realized daily mark-to-market — today's mid marks vs yesterday's option closes. Bottom sub-lines: the day's move in points and %, then the underlying prices it spans (prior close &rarr; current spot).">Daily Theo P&amp;L</th>
         <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
         <th id="colGreeks" title="Own-vol &plusmn;&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
         <th></th>
@@ -4042,10 +4101,37 @@ async function refreshQuotes() {
       $('colBetaIdx').innerHTML = '&plusmn;' + sigStr() + '&sigma; ' + data.indexSymbol + ' P&L (&beta;)';
     }
     renderTable();
+    // Push fresh spot/IV/mark into any /curve tab already open on a position.
+    refreshOpenCurves(lastQuotes.map(positionCurveDescriptor));
     $('lastUpdate').textContent = data.timestamp;
   } catch (e) {
     showErr('Quote refresh failed: ' + e.message);
   }
+}
+
+__CURVE_LINK__
+
+// Normalize a monitored position into the /curve descriptor. Width, breakeven
+// and max profit aren't in the quotes payload but are pure arithmetic off the
+// strikes and entry price; the IVs are NOT derivable and come from the server
+// (see _trusted_leg_iv) so the chart reprices with the same vols as every
+// other BS column on this page.
+function positionCurveDescriptor(p) {
+  if (p.error || p.spot == null || !p.ivLongPct || !p.ivShortPct) return null;
+  const width = p.shortStrike - p.longStrike;
+  const cost = p.entrySpread * 100 * p.contracts + (p.totalCommission || 0);
+  return {
+    v: 1, ts: Date.now(), source: 'positions', id: 'p:' + p.id,
+    symbol: p.symbol, label: p.label || null, expiration: p.expiration,
+    dte: (p.dte != null ? p.dte : dteFromExp(p.expiration)),
+    K1: p.longStrike, K2: p.shortStrike, width: width, contracts: p.contracts,
+    netPremium: p.entrySpread, totalCommission: p.totalCommission || 0, totalCost: cost,
+    maxProfit: (width - p.entrySpread) * 100 * p.contracts,
+    breakeven: p.longStrike + p.entrySpread,
+    spot: p.spot, rfRate: (p.riskFreeRatePct != null ? p.riskFreeRatePct / 100 : null),
+    ivLong: p.ivLongPct / 100, ivShort: p.ivShortPct / 100, ivSource: p.ivSource || null,
+    markValue: (p.spreadMid != null ? p.spreadMid * 100 * p.contracts : null),
+  };
 }
 
 function renderTable() {
@@ -4063,6 +4149,13 @@ function renderTable() {
   for (const p of lastQuotes) {
     const tr = document.createElement('tr');
     const dte = dteFromExp(p.expiration);
+    // Clickable -> interactive value curve. Only rows we can actually model:
+    // an errored or unpriced row has no spot/IVs to draw a curve from.
+    if (!p.error && p.spot != null && p.ivLongPct && p.ivShortPct) {
+      tr.dataset.posid = p.id;
+      tr.style.cursor = 'pointer';
+      tr.title = 'Click for the interactive value curve';
+    }
     // Both legs collapsed into one "Quote" column: long then short, one line
     // each — side+strike, then bid / ask / last / vol / IV. A leg whose last
     // trade predates the quote snapshot by more than a day gets a staleness
@@ -4162,10 +4255,17 @@ function renderTable() {
         ? ` (${sign(p.dailyTheoMovePct)}${Math.abs(p.dailyTheoMovePct).toFixed(2)}%)` : '';
       const moveStr = (hasTheo && p.dailyTheoMove !== null && p.dailyTheoMove !== undefined)
         ? `<span class="tt-dim">${p.symbol} ${sign(p.dailyTheoMove)}${Math.abs(p.dailyTheoMove).toFixed(2)}${movePctStr}</span>` : '';
+      // Second sub-line: the underlying prices the move is measured between —
+      // prior close -> current spot. Makes the reprice auditable in place and
+      // ties this column back to the spot shown in the Position cell.
+      const pxStr = (hasTheo && p.dailyTheoPrevClose !== null && p.dailyTheoPrevClose !== undefined
+                     && p.spot !== null && p.spot !== undefined)
+        ? `<span class="tt-dim">${p.dailyTheoPrevClose.toFixed(2)} &rarr; ${p.spot.toFixed(2)}</span>` : '';
       dailyTheoCell = `<td><div class="pnl-block">
         ${theoStr}
         ${mtmStr}
         ${moveStr}
+        ${pxStr}
       </div></td>`;
     }
 
@@ -4317,6 +4417,19 @@ $('positionForm').addEventListener('submit', async (e) => {
 });
 
 $('cancelEditBtn').addEventListener('click', resetForm);
+
+// Click a position row -> open its interactive value curve. Wired ONCE here,
+// not inside renderTable, which rebuilds the rows on every refresh. The button
+// guard is load-bearing: Edit/Delete live inside the row and bubble up here.
+$('posBody').addEventListener('click', (e) => {
+  if (e.target.closest('button, a, input, select')) return;
+  if (window.getSelection && String(window.getSelection())) return;
+  const tr = e.target.closest('tr[data-posid]');
+  if (!tr) return;
+  const p = lastQuotes.find(x => String(x.id) === tr.dataset.posid);
+  if (p) openCurve(positionCurveDescriptor(p), showErr);
+});
+
 $('refreshNowBtn').addEventListener('click', () => { refreshQuotes(); resetTimer(); });
 $('refreshSec').addEventListener('change', resetTimer);
 
@@ -4555,6 +4668,83 @@ resetTimer();
 # is self-contained: it carries its own copy of the payoff chart + Spread Detail
 # popup so the finder's working popup is left untouched.
 # ---------------------------------------------------------------------------
+
+# Client-side Black-Scholes call pricer, shared by every page that draws a
+# theoretical curve (finder popup, scatter popup, /curve). Injected via the
+# __BS_JS__ token so there is exactly one copy of the math in the file.
+BS_JS = r'''
+function jsNormCdf(x) {
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.sqrt(2);
+  const t = 1.0 / (1.0 + p * x);
+  const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t * Math.exp(-x*x);
+  return 0.5 * (1.0 + sign * y);
+}
+
+function jsBsCallPrice(S, K, T, r, sigma) {
+  if (T <= 0) return Math.max(S - K, 0);
+  if (sigma <= 0) return Math.max(S - K * Math.exp(-r * T), 0);
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  return S * jsNormCdf(d1) - K * Math.exp(-r * T) * jsNormCdf(d2);
+}
+'''
+
+
+# Shared "open this spread in the /curve tab" plumbing, injected into both the
+# finder and the monitor via __CURVE_LINK__. Each page supplies its own
+# descriptor adapter (their row objects differ); everything downstream of that
+# — storage key, pruning, window naming, live re-stash — is identical, so it
+# lives here once.
+CURVE_LINK_JS = r'''
+// One tab per spread, reused on re-click: the window NAME is derived from the
+// spread id, so clicking the same row again refocuses its tab instead of
+// piling up duplicates, while a different row still gets its own tab (so two
+// spreads can be compared side by side).
+function openCurve(desc, onError) {
+  if (!desc) return;
+  try {
+    pruneCurveKeys();
+    localStorage.setItem('spreadCurve:' + desc.id, JSON.stringify(desc));
+  } catch (e) {
+    if (onError) onError('Could not hand the spread to the chart tab (storage full?).');
+    return;
+  }
+  const name = 'spreadCurve_' + desc.id.replace(/[^A-Za-z0-9_]/g, '_');
+  window.open('/curve?id=' + encodeURIComponent(desc.id), name);
+}
+
+// Drop descriptors older than a day so the key space can't grow without bound.
+function pruneCurveKeys() {
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const doomed = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k || k.indexOf('spreadCurve:') !== 0) continue;
+    try {
+      const o = JSON.parse(localStorage.getItem(k));
+      if (!o || !o.ts || o.ts < cutoff) doomed.push(k);
+    } catch (e) { doomed.push(k); }
+  }
+  doomed.forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
+}
+
+// Refresh ONLY descriptors that already exist (an open chart tab), so a data
+// refresh keeps that tab live without creating keys for rows nobody opened.
+// Writing the key fires the 'storage' event the /curve page listens on.
+function refreshOpenCurves(descriptors) {
+  for (const desc of descriptors) {
+    if (!desc) continue;
+    const k = 'spreadCurve:' + desc.id;
+    try {
+      if (localStorage.getItem(k) === null) continue;
+      localStorage.setItem(k, JSON.stringify(desc));
+    } catch (e) { return; }
+  }
+}
+'''
+
 
 # Copy of the finder's payoff chart, with the risk-free rate taken from the
 # handed-over data (`rfRate`) instead of the finder's #riskFreeRate input.
@@ -4821,22 +5011,8 @@ const COLS = [
 const colByKey = {};
 COLS.forEach(c => colByKey[c.key] = c);
 
-// ---- BS helpers + payoff chart + popup (self-contained copy of the finder's) ----
-function jsNormCdf(x) {
-  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
-  const sign = x < 0 ? -1 : 1;
-  x = Math.abs(x) / Math.sqrt(2);
-  const t = 1.0 / (1.0 + p * x);
-  const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t * Math.exp(-x*x);
-  return 0.5 * (1.0 + sign * y);
-}
-function jsBsCallPrice(S, K, T, r, sigma) {
-  if (T <= 0) return Math.max(S - K, 0);
-  if (sigma <= 0) return Math.max(S - K * Math.exp(-r * T), 0);
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  const d2 = d1 - sigma * Math.sqrt(T);
-  return S * jsNormCdf(d1) - K * Math.exp(-r * T) * jsNormCdf(d2);
-}
+// ---- BS helpers + payoff chart + popup (server-injected; shared with the finder) ----
+__BS_JS__
 __PNL_CHART__
 __SPREAD_TOOLTIP__
 
@@ -5005,6 +5181,544 @@ window.addEventListener('storage', (e) => {
 
 
 # ---------------------------------------------------------------------------
+# Interactive spread-value chart (/curve) — one spread, repriced live across
+# spot with sliders for spot / days-to-expiry / IV shift. Opened by clicking a
+# row on EITHER the finder results table or the My Positions table; both hand
+# over the same normalized descriptor through localStorage (key
+# "spreadCurve:<id>"), so this page has a single code path. Like /scatter it
+# re-reads on the 'storage' event, so an open chart tracks the monitor's
+# auto-refresh.
+#
+# Units recap, because this file's two conventions meet here: K1/K2/width/
+# breakeven/spot are index POINTS, netPremium is POINTS PER SPREAD, and every
+# field named *Cost/*Profit/*Commission is already DOLLARS (points x 100 x
+# contracts). The adapters on each page do that multiplication, never the chart.
+# ---------------------------------------------------------------------------
+
+CURVE_PAGE = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Spread Curve</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface2: #242837; --border: #2e3348;
+    --text: #e4e6f0; --text-dim: #8b8fa3; --accent: #4f8ff7; --green: #34d399;
+    --red: #f87171; --yellow: #fbbf24; --purple: #c084fc;
+    --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text);
+         display: flex; flex-direction: column; overflow: hidden; }
+  .bar { background: var(--surface); border-bottom: 1px solid var(--border);
+         padding: 10px 20px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .bar h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  .bar .meta { color: var(--text-dim); font-size: 12px; font-family: var(--mono); }
+  .bar a { color: var(--accent); text-decoration: none; font-size: 13px; margin-left: auto; }
+  .bar a:hover { text-decoration: underline; }
+  .warn { color: var(--yellow); font-size: 12px; font-family: var(--mono); }
+
+  /* Segmented Y-axis mode toggle */
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button { background: transparent; border: 0; color: var(--text-dim); font-family: var(--font);
+                font-size: 12px; padding: 5px 11px; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+                 font-size: 12px; padding: 5px 11px; border-radius: 6px; cursor: pointer; }
+  button.ghost:hover { color: var(--text); border-color: var(--text-dim); }
+
+  #main { flex: 1 1 auto; min-height: 0; display: flex; }
+  #left { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+  .plot { flex: 1 1 auto; min-height: 0; position: relative; }
+  .plot svg { display: block; width: 100%; height: 100%; }
+
+  /* Slider strip — same shape as the finder's score-weight sliders */
+  .sliders { display: flex; gap: 26px; flex-wrap: wrap; padding: 10px 20px;
+             border-top: 1px solid var(--border); background: var(--surface); }
+  .sl { display: flex; flex-direction: column; gap: 4px; min-width: 250px; flex: 1 1 250px; }
+  .sl .top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .sl label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+  .sl .val { font-family: var(--mono); font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .sl input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  /* Readouts */
+  #side { width: 260px; flex: 0 0 260px; border-left: 1px solid var(--border);
+          background: var(--surface); padding: 14px 16px; overflow-y: auto; }
+  #side h2 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+             color: var(--text-dim); margin: 0 0 8px; font-weight: 600; }
+  #side h2 + h2 { margin-top: 16px; }
+  .ro { display: flex; justify-content: space-between; gap: 10px; font-size: 12px;
+        font-family: var(--mono); padding: 2px 0; }
+  .ro .k { color: var(--text-dim); }
+  .ro .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .pos { color: var(--green); } .neg { color: var(--red); } .dim { color: var(--text-dim); }
+  .note { font-size: 11px; color: var(--text-dim); line-height: 1.4; margin-top: 10px;
+          border-top: 1px solid var(--border); padding-top: 8px; }
+  .empty { display: flex; align-items: center; justify-content: center; flex: 1 1 auto;
+           color: var(--text-dim); text-align: center; padding: 40px; }
+  .empty h2 { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1 id="title">Spread Curve</h1>
+  <span class="meta" id="meta"></span>
+  <div class="seg" id="modeSeg">
+    <button id="modePnl" class="on" onclick="setMode('pnl')" title="Profit &amp; loss in dollars against what the spread cost (zero line = breakeven).">P&amp;L ($)</button>
+    <button id="modeVal" onclick="setMode('value')" title="Raw theoretical value of the spread in dollars, from 0 up to its width.">Spread value ($)</button>
+  </div>
+  <button class="ghost" onclick="resetSliders()" title="Put all three sliders back to today's spot, full time to expiry, and no IV shift.">Reset</button>
+  <span class="warn" id="ivWarn"></span>
+  <a href="/positions">&larr; Back</a>
+</div>
+
+<div class="empty" id="empty" style="display:none;"><div><h2>No spread selected</h2>
+  <p>Open this from a row on the Finder results table or the My Positions table.</p></div></div>
+
+<div id="main" style="display:none;">
+  <div id="left">
+    <div class="plot" id="plot"></div>
+    <div class="sliders">
+      <div class="sl">
+        <div class="top"><label for="slSpot">Spot price</label><span class="val" id="vSpot">--</span></div>
+        <input type="range" id="slSpot" oninput="onSlider()">
+      </div>
+      <div class="sl">
+        <div class="top"><label for="slDays">Days to expiry</label><span class="val" id="vDays">--</span></div>
+        <input type="range" id="slDays" oninput="onSlider()">
+      </div>
+      <div class="sl">
+        <div class="top"><label for="slIv">IV shift (vol pts)</label><span class="val" id="vIv">--</span></div>
+        <input type="range" id="slIv" min="-20" max="20" step="0.5" value="0" oninput="onSlider()">
+      </div>
+    </div>
+  </div>
+  <div id="side">
+    <h2 id="roHeading">At the slider</h2>
+    <div class="ro"><span class="k">Spot</span><span class="v" id="roSpot">--</span></div>
+    <div class="ro"><span class="k">Spread value</span><span class="v" id="roValue">--</span></div>
+    <div class="ro"><span class="k">P&amp;L</span><span class="v" id="roPnl">--</span></div>
+    <div class="ro"><span class="k">Return</span><span class="v" id="roRet">--</span></div>
+    <div class="ro"><span class="k">Delta ($/pt)</span><span class="v" id="roDelta">--</span></div>
+    <div class="ro"><span class="k">Gamma</span><span class="v" id="roGamma">--</span></div>
+
+    <h2>Breakeven</h2>
+    <div class="ro"><span class="k">At these sliders</span><span class="v" id="roBeLive">--</span></div>
+    <div class="ro"><span class="k">Move needed</span><span class="v" id="roBeMove">--</span></div>
+    <div class="ro"><span class="k">At expiry</span><span class="v" id="roBeExp">--</span></div>
+
+    <h2>The spread</h2>
+    <div class="ro"><span class="k">Strikes</span><span class="v" id="roStrikes">--</span></div>
+    <div class="ro"><span class="k">Contracts</span><span class="v" id="roCon">--</span></div>
+    <div class="ro"><span class="k">Total cost</span><span class="v" id="roCost">--</span></div>
+    <div class="ro"><span class="k">Commission</span><span class="v" id="roComm">--</span></div>
+    <div class="ro"><span class="k">Max profit</span><span class="v" id="roMax">--</span></div>
+    <div class="ro"><span class="k">Spot now</span><span class="v" id="roSpotNow">--</span></div>
+    <div class="ro"><span class="k">IV long / short</span><span class="v" id="roIv">--</span></div>
+    <div class="ro" id="roMarkRow" style="display:none;"><span class="k">Market mark</span><span class="v" id="roMark">--</span></div>
+    <div class="ro" id="roBasisRow" style="display:none;"><span class="k">Model &minus; market</span><span class="v" id="roBasis">--</span></div>
+    <div class="note" id="roNote"></div>
+  </div>
+</div>
+
+<script>
+__BS_JS__
+
+// ---- state ----------------------------------------------------------------
+// `d` is the descriptor written by whichever table opened this tab (see the
+// module comment above for the field contract). Everything else is derived.
+let d = null;
+let mode = 'pnl';
+const RF_FALLBACK = __RF_RATE__ / 100;   // server's rate, if a descriptor omits one
+let els = null;          // cached SVG nodes; the chart is built once and mutated
+let dom = {};            // x/y domains, fixed up front so nothing jumps mid-drag
+let hoverS = null;       // crosshair spot, or null when not hovering
+const W = 1000, H = 560, PAD = {l: 74, r: 24, t: 20, b: 42};
+
+function curveId() {
+  const q = new URLSearchParams(location.search).get('id');
+  return q || null;
+}
+
+function loadDescriptor() {
+  const id = curveId();
+  if (!id) return null;
+  try {
+    const raw = localStorage.getItem('spreadCurve:' + id);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && o.K1 != null && o.K2 != null) ? o : null;
+  } catch (e) { return null; }
+}
+
+// ---- the model ------------------------------------------------------------
+// One series function for both Y modes: value in dollars, then yOf() shifts it
+// by cost for the P&L view. IVs shift additively in vol POINTS to match this
+// repo's vega convention ("$ per 1 vol-point").
+function valueAt(S, days, ivShiftPts) {
+  const T = Math.max(0, days) / 365;
+  const ivL = Math.max(0.0001, d.ivLong + ivShiftPts / 100);
+  const ivS = Math.max(0.0001, d.ivShort + ivShiftPts / 100);
+  return (jsBsCallPrice(S, d.K1, T, d.rfRate, ivL)
+        - jsBsCallPrice(S, d.K2, T, d.rfRate, ivS)) * 100 * d.contracts;
+}
+function yOf(v) { return mode === 'pnl' ? v - d.totalCost : v; }
+
+// Breakeven under the CURRENT sliders (not the static expiry breakeven):
+// bisect value(S) - totalCost. Returns null when there's no sign change in
+// range, e.g. deep ITM where the spread is already above cost everywhere.
+function liveBreakeven(days, ivShift) {
+  let lo = dom.xMin, hi = dom.xMax;
+  const f = (S) => valueAt(S, days, ivShift) - d.totalCost;
+  let flo = f(lo), fhi = f(hi);
+  if (!(flo < 0 && fhi > 0)) return null;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (f(mid) < 0) { lo = mid; } else { hi = mid; }
+  }
+  return (lo + hi) / 2;
+}
+
+// ---- formatting -----------------------------------------------------------
+const fmt0 = (v) => (v < 0 ? '-' : '') + '$' + Math.abs(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+const fmtSigned = (v) => (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+const fmtPts = (v) => v.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtK = (v) => v.toLocaleString('en-US', {maximumFractionDigits: (Math.abs(v) >= 1000 ? 0 : 2)});
+function setSigned(el, v, text) {
+  el.textContent = text;
+  el.className = 'v ' + (v >= 0 ? 'pos' : 'neg');
+}
+
+// ---- chart: build once, mutate on redraw ----------------------------------
+function initChart() {
+  const svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <g id="gYGrid"></g>
+    <path id="lossFill" fill="rgba(248,113,113,0.13)" stroke="none"/>
+    <path id="profFill" fill="rgba(52,211,153,0.13)" stroke="none"/>
+    <line id="refLine" stroke="#2e3348" stroke-width="1" stroke-dasharray="4,3"/>
+    <line id="kLine1" stroke="#2e3348" stroke-width="1" stroke-dasharray="3,3"/>
+    <line id="kLine2" stroke="#2e3348" stroke-width="1" stroke-dasharray="3,3"/>
+    <path id="expiryPath" fill="none" stroke="#e4e6f0" stroke-width="1.5" opacity="0.35"/>
+    <path id="ghostPath" fill="none" stroke="#c084fc" stroke-width="1.5" stroke-dasharray="5,4" opacity="0.3"/>
+    <path id="theoPath" fill="none" stroke="#c084fc" stroke-width="2.5"/>
+    <line id="beLine" stroke="#fbbf24" stroke-width="1" stroke-dasharray="2,3" opacity="0.7"/>
+    <line id="spotNowLine" stroke="#4f8ff7" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <text id="spotNowLabel" fill="#4f8ff7" font-size="11" font-weight="600" text-anchor="middle" font-family="sans-serif"></text>
+    <line id="whatIfLine" stroke="#fbbf24" stroke-width="1.5"/>
+    <text id="whatIfLabel" fill="#fbbf24" font-size="11" font-weight="600" text-anchor="middle" font-family="sans-serif"></text>
+    <circle id="whatIfDot" r="5" fill="#fbbf24"/>
+    <circle id="markDot" r="4.5" fill="none" stroke="#34d399" stroke-width="2"/>
+    <line id="crossLine" stroke="#8b8fa3" stroke-width="1" stroke-dasharray="2,2" opacity="0"/>
+    <g id="gXTicks"></g>
+    <g id="gYTicks"></g>
+    <text id="legend" fill="#8b8fa3" font-size="11" font-family="sans-serif"></text>
+    <rect id="hit" x="${PAD.l}" y="${PAD.t}" width="${W-PAD.l-PAD.r}" height="${H-PAD.t-PAD.b}" fill="transparent"/>
+  </svg>`;
+  document.getElementById('plot').innerHTML = svg;
+  const g = (id) => document.getElementById(id);
+  els = {
+    yGrid: g('gYGrid'), lossFill: g('lossFill'), profFill: g('profFill'), refLine: g('refLine'),
+    k1: g('kLine1'), k2: g('kLine2'), expiry: g('expiryPath'), ghost: g('ghostPath'),
+    theo: g('theoPath'), beLine: g('beLine'),
+    spotNow: g('spotNowLine'), spotNowLbl: g('spotNowLabel'),
+    whatIf: g('whatIfLine'), whatIfLbl: g('whatIfLabel'), whatIfDot: g('whatIfDot'),
+    markDot: g('markDot'), cross: g('crossLine'),
+    xTicks: g('gXTicks'), yTicks: g('gYTicks'), legend: g('legend'), hit: g('hit'),
+  };
+  // Crosshair: read out any spot without disturbing the slider.
+  els.hit.addEventListener('mousemove', (e) => {
+    const r = els.hit.getBoundingClientRect();
+    const frac = (e.clientX - r.left) / r.width;
+    hoverS = dom.xMin + frac * (dom.xMax - dom.xMin);
+    scheduleRedraw();
+  });
+  els.hit.addEventListener('mouseleave', () => { hoverS = null; scheduleRedraw(); });
+}
+
+const xScale = (v) => PAD.l + (v - dom.xMin) / (dom.xMax - dom.xMin) * (W - PAD.l - PAD.r);
+const yScale = (v) => PAD.t + (1 - (v - dom.yMin) / (dom.yMax - dom.yMin)) * (H - PAD.t - PAD.b);
+
+function pathFor(days, ivShift) {
+  const n = 240, out = [];
+  for (let i = 0; i <= n; i++) {
+    const S = dom.xMin + (dom.xMax - dom.xMin) * i / n;
+    out.push((i ? 'L' : 'M') + xScale(S).toFixed(1) + ',' + yScale(yOf(valueAt(S, days, ivShift))).toFixed(1));
+  }
+  return out.join(' ');
+}
+
+function niceTicks(lo, hi, n) {
+  const raw = (hi - lo) / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || mag * 10;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) out.push(v);
+  return out;
+}
+
+let rafPending = false;
+function scheduleRedraw() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => { rafPending = false; redraw(); });
+}
+
+function redraw() {
+  const S = +document.getElementById('slSpot').value;
+  const days = +document.getElementById('slDays').value;
+  const ivShift = +document.getElementById('slIv').value;
+
+  // Y domain depends on the mode only — recompute here so the toggle works,
+  // but never on the live slider values, so dragging never rescales the axes.
+  const pad = Math.max(Math.abs(d.totalCost), Math.abs(d.maxProfit)) * 0.15;
+  if (mode === 'pnl') { dom.yMin = -d.totalCost - pad; dom.yMax = d.maxProfit + pad; }
+  else { dom.yMin = 0; dom.yMax = d.width * 100 * d.contracts * 1.05; }
+
+  const yRef = yScale(mode === 'pnl' ? 0 : d.totalCost);
+  els.refLine.setAttribute('x1', PAD.l); els.refLine.setAttribute('x2', W - PAD.r);
+  els.refLine.setAttribute('y1', yRef); els.refLine.setAttribute('y2', yRef);
+
+  // Expiry payoff: flat at max loss up to K1, linear to K2, flat after.
+  const eLo = yOf(0), eHi = yOf(d.width * 100 * d.contracts);
+  els.expiry.setAttribute('d',
+    `M${xScale(dom.xMin).toFixed(1)},${yScale(eLo).toFixed(1)} L${xScale(d.K1).toFixed(1)},${yScale(eLo).toFixed(1)}`
+    + ` L${xScale(d.K2).toFixed(1)},${yScale(eHi).toFixed(1)} L${xScale(dom.xMax).toFixed(1)},${yScale(eHi).toFixed(1)}`);
+
+  // Ghost = where the curve started (today's DTE, no IV shift), so the sliders'
+  // effect is visible rather than being the only thing on screen.
+  const moved = Math.abs(days - d.dte) > 0.001 || Math.abs(ivShift) > 0.001;
+  els.ghost.setAttribute('d', moved ? pathFor(d.dte, 0) : '');
+  els.theo.setAttribute('d', pathFor(days, ivShift));
+
+  // Profit/loss shading, P&L mode only.
+  const be = liveBreakeven(days, ivShift);
+  if (mode === 'pnl' && be !== null) {
+    const yb = yScale(0), xb = xScale(be);
+    els.lossFill.setAttribute('d', `M${xScale(dom.xMin).toFixed(1)},${yb.toFixed(1)} L${xb.toFixed(1)},${yb.toFixed(1)} L${xb.toFixed(1)},${yScale(dom.yMin).toFixed(1)} L${xScale(dom.xMin).toFixed(1)},${yScale(dom.yMin).toFixed(1)} Z`);
+    els.profFill.setAttribute('d', `M${xb.toFixed(1)},${yb.toFixed(1)} L${xScale(dom.xMax).toFixed(1)},${yb.toFixed(1)} L${xScale(dom.xMax).toFixed(1)},${yScale(dom.yMax).toFixed(1)} L${xb.toFixed(1)},${yScale(dom.yMax).toFixed(1)} Z`);
+    els.beLine.setAttribute('x1', xb); els.beLine.setAttribute('x2', xb);
+    els.beLine.setAttribute('y1', PAD.t); els.beLine.setAttribute('y2', H - PAD.b);
+    els.beLine.setAttribute('opacity', '0.7');
+  } else {
+    els.lossFill.setAttribute('d', ''); els.profFill.setAttribute('d', '');
+    els.beLine.setAttribute('opacity', '0');
+  }
+
+  for (const [el, K] of [[els.k1, d.K1], [els.k2, d.K2]]) {
+    const x = xScale(K);
+    el.setAttribute('x1', x); el.setAttribute('x2', x);
+    el.setAttribute('y1', PAD.t); el.setAttribute('y2', H - PAD.b);
+  }
+
+  // Spot NOW — fixed reference, never moves while dragging.
+  const xNow = xScale(d.spot);
+  els.spotNow.setAttribute('x1', xNow); els.spotNow.setAttribute('x2', xNow);
+  els.spotNow.setAttribute('y1', PAD.t); els.spotNow.setAttribute('y2', H - PAD.b);
+  els.spotNowLbl.setAttribute('x', xNow); els.spotNowLbl.setAttribute('y', H - PAD.b + 26);
+  els.spotNowLbl.textContent = `${d.symbol} ${fmtK(d.spot)} · now`;
+
+  // What-if spot — hidden while it sits on top of "now".
+  const step = +document.getElementById('slSpot').step || 1;
+  const showWhatIf = Math.abs(S - d.spot) > step / 2;
+  const xw = xScale(S), yw = yScale(yOf(valueAt(S, days, ivShift)));
+  for (const el of [els.whatIf, els.whatIfLbl, els.whatIfDot]) {
+    el.setAttribute('opacity', showWhatIf ? '1' : '0');
+  }
+  els.whatIf.setAttribute('x1', xw); els.whatIf.setAttribute('x2', xw);
+  els.whatIf.setAttribute('y1', PAD.t); els.whatIf.setAttribute('y2', H - PAD.b);
+  els.whatIfLbl.setAttribute('x', xw); els.whatIfLbl.setAttribute('y', PAD.t - 6);
+  els.whatIfLbl.textContent = fmtK(S);
+  els.whatIfDot.setAttribute('cx', xw); els.whatIfDot.setAttribute('cy', yw);
+
+  // Where the market actually marks this spread (positions only) — the BS curve
+  // will NOT pass through it, and hiding that would misrepresent the position.
+  if (d.markValue != null) {
+    els.markDot.setAttribute('cx', xNow);
+    els.markDot.setAttribute('cy', yScale(yOf(d.markValue)));
+    els.markDot.setAttribute('opacity', '1');
+  } else {
+    els.markDot.setAttribute('opacity', '0');
+  }
+
+  if (hoverS !== null) {
+    const xh = xScale(hoverS);
+    els.cross.setAttribute('x1', xh); els.cross.setAttribute('x2', xh);
+    els.cross.setAttribute('y1', PAD.t); els.cross.setAttribute('y2', H - PAD.b);
+    els.cross.setAttribute('opacity', '1');
+  } else {
+    els.cross.setAttribute('opacity', '0');
+  }
+
+  // Ticks (the only innerHTML in the redraw path — ~14 nodes).
+  els.xTicks.innerHTML = niceTicks(dom.xMin, dom.xMax, 8).map(v =>
+    `<text x="${xScale(v).toFixed(1)}" y="${H - PAD.b + 15}" fill="#8b8fa3" font-size="10" text-anchor="middle" font-family="sans-serif">${fmtK(v)}</text>`
+  ).join('');
+  els.yTicks.innerHTML = niceTicks(dom.yMin, dom.yMax, 6).map(v =>
+    `<text x="${PAD.l - 8}" y="${(yScale(v) + 3).toFixed(1)}" fill="#8b8fa3" font-size="10" text-anchor="end" font-family="sans-serif">${fmt0(v)}</text>`
+    + `<line x1="${PAD.l}" y1="${yScale(v).toFixed(1)}" x2="${W - PAD.r}" y2="${yScale(v).toFixed(1)}" stroke="#1a1d27" stroke-width="1"/>`
+  ).join('');
+  els.legend.setAttribute('x', W - PAD.r); els.legend.setAttribute('y', PAD.t + 12);
+  els.legend.setAttribute('text-anchor', 'end');
+  els.legend.textContent = moved ? 'dashed = today · solid = sliders · faint = at expiry'
+                                 : 'solid = now · faint = at expiry';
+
+  updateReadouts(hoverS !== null ? hoverS : S, days, ivShift, be, hoverS !== null);
+}
+
+function updateReadouts(S, days, ivShift, be, hovering) {
+  const v = valueAt(S, days, ivShift);
+  const pnl = v - d.totalCost;
+  const g = (id) => document.getElementById(id);
+  g('roHeading').textContent = hovering ? 'At the cursor' : 'At the slider';
+  g('roSpot').textContent = fmtK(S) + '  (' + (S >= d.spot ? '+' : '')
+    + ((S / d.spot - 1) * 100).toFixed(2) + '%)';
+  g('roValue').textContent = fmt0(v);
+  setSigned(g('roPnl'), pnl, fmtSigned(pnl));
+  setSigned(g('roRet'), pnl, (pnl >= 0 ? '+' : '') + (pnl / d.totalCost * 100).toFixed(1) + '%');
+  // Greeks by finite difference on the same pricer — no second BS implementation.
+  const h = Math.max(0.5, d.width * 0.01);
+  const up = valueAt(S + h, days, ivShift), dn = valueAt(S - h, days, ivShift);
+  g('roDelta').textContent = fmt0((up - dn) / (2 * h));
+  g('roGamma').textContent = ((up - 2 * v + dn) / (h * h)).toFixed(2);
+
+  g('roBeLive').textContent = be === null ? '--' : fmtPts(be);
+  g('roBeMove').textContent = be === null ? '--'
+    : ((be / d.spot - 1) * 100 >= 0 ? '+' : '') + ((be / d.spot - 1) * 100).toFixed(2) + '%';
+  g('roBeExp').textContent = fmtPts(d.breakeven);
+}
+
+function fillStatics() {
+  const g = (id) => document.getElementById(id);
+  g('roStrikes').textContent = `${fmtK(d.K1)} / ${fmtK(d.K2)}`;
+  g('roCon').textContent = String(d.contracts);
+  g('roCost').textContent = fmt0(d.totalCost);
+  g('roComm').textContent = fmt0(d.totalCommission);
+  g('roMax').textContent = fmt0(d.maxProfit);
+  g('roSpotNow').textContent = fmtK(d.spot);
+  g('roIv').textContent = `${(d.ivLong * 100).toFixed(1)}% / ${(d.ivShort * 100).toFixed(1)}%`;
+  if (d.markValue != null) {
+    g('roMarkRow').style.display = ''; g('roBasisRow').style.display = '';
+    g('roMark').textContent = fmt0(d.markValue);
+    const basis = valueAt(d.spot, d.dte, 0) - d.markValue;
+    setSigned(g('roBasis'), basis, fmtSigned(basis));
+  } else {
+    g('roMarkRow').style.display = 'none'; g('roBasisRow').style.display = 'none';
+  }
+  // Say plainly when the curve is drawn on fallback vol.
+  const warn = g('ivWarn');
+  if (d.ivSource && d.ivSource !== 'leg') {
+    const why = {atm: "both legs on the expiration's ATM IV — no skew",
+                 implied: "IV re-implied from the legs' own marks",
+                 raw: 'raw vendor IV, untrusted'}[d.ivSource] || d.ivSource;
+    warn.textContent = '⚠ ' + why;
+    warn.title = 'The quoted leg IVs were unusable (no live two-sided market), so the server fell back. The curve is still directionally right but not a true surface.';
+  } else { warn.textContent = ''; }
+  g('roNote').textContent = d.markValue != null
+    ? 'Model curve vs. the live bid/ask mid: a gap is normal (BS vs. market), and it is the basis you would actually trade out of.'
+    : 'Theoretical Black-Scholes value with each leg on its own IV; commissions are included in cost and breakeven.';
+}
+
+// ---- sliders --------------------------------------------------------------
+function onSlider() {
+  const S = +document.getElementById('slSpot').value;
+  const days = +document.getElementById('slDays').value;
+  const ivShift = +document.getElementById('slIv').value;
+  document.getElementById('vSpot').textContent =
+    fmtK(S) + '  (' + (S >= d.spot ? '+' : '') + ((S / d.spot - 1) * 100).toFixed(2) + '% vs now)';
+  document.getElementById('vDays').textContent =
+    days + 'd  (T=' + (days / 365).toFixed(3) + 'y)' + (days === 0 ? '  at expiry' : '');
+  document.getElementById('vIv').textContent =
+    (ivShift >= 0 ? '+' : '') + ivShift.toFixed(1) + '  → L ' +
+    (Math.max(0.0001, d.ivLong + ivShift / 100) * 100).toFixed(1) + '% / S ' +
+    (Math.max(0.0001, d.ivShort + ivShift / 100) * 100).toFixed(1) + '%';
+  scheduleRedraw();
+}
+
+function resetSliders() {
+  document.getElementById('slSpot').value = d.spot;
+  document.getElementById('slDays').value = d.dte;
+  document.getElementById('slIv').value = 0;
+  onSlider();
+}
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('modePnl').className = (m === 'pnl' ? 'on' : '');
+  document.getElementById('modeVal').className = (m === 'value' ? 'on' : '');
+  try { localStorage.setItem('curveYMode', m); } catch (e) {}
+  scheduleRedraw();
+}
+
+// ---- boot / live sync -----------------------------------------------------
+function applyData(firstRun) {
+  const next = loadDescriptor();
+  if (!next) {
+    document.getElementById('empty').style.display = 'flex';
+    document.getElementById('main').style.display = 'none';
+    return;
+  }
+  // Preserve the user's slider positions across a live-sync refresh: only the
+  // spot slider follows the market, and only if it was still parked on "now".
+  const prev = d;
+  const wasAtNow = prev && Math.abs(+document.getElementById('slSpot').value - prev.spot) < 1e-9;
+  d = next;
+  if (d.rfRate == null || !isFinite(d.rfRate)) d.rfRate = RF_FALLBACK;
+  if (!d.ivLong || !d.ivShort) { d.ivLong = d.ivLong || 0.20; d.ivShort = d.ivShort || 0.20; }
+
+  document.getElementById('empty').style.display = 'none';
+  document.getElementById('main').style.display = 'flex';
+  document.getElementById('title').textContent =
+    (d.label || `${d.symbol} ${fmtK(d.K1)}/${fmtK(d.K2)}`) + ' · Spread Curve';
+  document.getElementById('meta').textContent =
+    `${d.symbol} · ${d.expiration} (${d.dte}d) · ${d.contracts}x · ` +
+    (d.source === 'positions' ? 'open position' : 'finder candidate');
+
+  const sl = document.getElementById('slSpot');
+  const lo = Math.floor(Math.min(d.K1, d.spot) * 0.85);
+  const hi = Math.ceil(Math.max(d.K2, d.spot) * 1.15);
+  const step = Math.max(0.05, Math.round(d.width / 50 * 20) / 20);
+  // A range input snaps to min + n*step, so offset min onto the spot itself —
+  // otherwise "now" isn't representable and Reset lands next to it, not on it.
+  sl.min = lo + ((((d.spot - lo) % step) + step) % step);
+  sl.max = hi; sl.step = step;
+  const slD = document.getElementById('slDays');
+  slD.min = 0; slD.max = Math.max(1, d.dte); slD.step = 1;
+
+  if (firstRun) {
+    sl.value = d.spot; slD.value = d.dte;
+    try { const m = localStorage.getItem('curveYMode'); if (m === 'value' || m === 'pnl') mode = m; } catch (e) {}
+    setMode(mode);
+  } else if (wasAtNow) {
+    sl.value = d.spot;                        // still tracking the market
+    if (+slD.value > d.dte) slD.value = d.dte;  // never allow more time than is left
+  }
+
+  // X domain fixed from the slider's range, not its value.
+  dom.xMin = lo; dom.xMax = hi;
+
+  if (firstRun) initChart();
+  fillStatics();
+  onSlider();
+}
+
+applyData(true);
+window.addEventListener('resize', scheduleRedraw);
+// Live sync: the opening page re-stashes this key on each refresh, which fires
+// here (storage never fires in the writing tab, hence the read on boot above).
+window.addEventListener('storage', (e) => {
+  const id = curveId();
+  if (e.key && e.key !== 'spreadCurve:' + id) return;
+  applyData(false);
+});
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
 
@@ -5016,7 +5730,10 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            page = HTML_PAGE.replace("{RISK_FREE_RATE_PCT}", str(RISK_FREE_RATE_PCT))
+            page = (HTML_PAGE
+                    .replace("{RISK_FREE_RATE_PCT}", str(RISK_FREE_RATE_PCT))
+                    .replace("__BS_JS__", BS_JS)
+                    .replace("__CURVE_LINK__", CURVE_LINK_JS))
             self.wfile.write(page.encode("utf-8"))
 
         elif parsed.path == "/api/spreads":
@@ -5063,8 +5780,9 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            page = POSITIONS_PAGE.replace(
-                "__MARKET_HOLIDAYS__", json.dumps(sorted(MARKET_HOLIDAYS)))
+            page = (POSITIONS_PAGE
+                    .replace("__MARKET_HOLIDAYS__", json.dumps(sorted(MARKET_HOLIDAYS)))
+                    .replace("__CURVE_LINK__", CURVE_LINK_JS))
             self.wfile.write(page.encode("utf-8"))
 
         elif parsed.path == "/scatter":
@@ -5072,8 +5790,21 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             page = (SCATTER_PAGE
+                    .replace("__BS_JS__", BS_JS)
                     .replace("__PNL_CHART__", PNL_CHART_JS)
                     .replace("__SPREAD_TOOLTIP__", SPREAD_TOOLTIP_JS))
+            self.wfile.write(page.encode("utf-8"))
+
+        elif parsed.path == "/curve":
+            # Interactive one-spread value chart. The spread itself arrives via
+            # localStorage (?id= names the key), so this route is pure static
+            # HTML — no vendor call, no query parsing beyond the page's own JS.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            page = (CURVE_PAGE
+                    .replace("__BS_JS__", BS_JS)
+                    .replace("__RF_RATE__", str(RISK_FREE_RATE_PCT)))
             self.wfile.write(page.encode("utf-8"))
 
         elif parsed.path == "/api/positions":
