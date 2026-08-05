@@ -5418,8 +5418,15 @@ CURVE_PAGE = r"""<!DOCTYPE html>
 
   #main { flex: 1 1 auto; min-height: 0; display: flex; }
   #left { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-  .plot { flex: 1 1 auto; min-height: 0; position: relative; }
-  .plot svg { display: block; width: 100%; height: 100%; }
+  /* The value chart and the greeks pane split the plot area 50/50: equal grow
+     with a 0 basis so neither's content height biases the split. */
+  .plot { flex: 1 1 0; min-height: 0; position: relative; }
+  .plot svg, .plot-greeks svg { display: block; width: 100%; height: 100%; }
+  /* Greeks pane: same height as the value chart, x-aligned to it. overflow:hidden
+     + the svg height:100% above keep its drawing inside the box so it can't spill
+     over the slider strip below. */
+  .plot-greeks { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden;
+                 border-top: 1px solid var(--border); }
 
   /* Slider strip — same shape as the finder's score-weight sliders */
   .sliders { display: flex; gap: 26px; flex-wrap: wrap; padding: 10px 20px;
@@ -5467,6 +5474,7 @@ CURVE_PAGE = r"""<!DOCTYPE html>
 <div id="main" style="display:none;">
   <div id="left">
     <div class="plot" id="plot"></div>
+    <div class="plot-greeks" id="plotG"></div>
     <div class="sliders">
       <div class="sl">
         <div class="top"><label for="slSpot">Spot price</label><span class="val" id="vSpot">--</span></div>
@@ -5523,6 +5531,10 @@ let els = null;          // cached SVG nodes; the chart is built once and mutate
 let dom = {};            // x/y domains, fixed up front so nothing jumps mid-drag
 let hoverS = null;       // crosshair spot, or null when not hovering
 const W = 1000, H = 560, PAD = {l: 74, r: 24, t: 20, b: 42};
+// Greeks pane: same viewBox width W and left/right padding as the main chart so
+// its x-axis (spot) lines up pixel-for-pixel; its own shorter height + a right
+// gutter for the second (gamma) axis.
+const HG = 300, PADG = {l: 74, r: 24, t: 16, b: 30};
 
 function curveId() {
   const q = new URLSearchParams(location.search).get('id');
@@ -5622,6 +5634,48 @@ function initChart() {
     scheduleRedraw();
   });
   els.hit.addEventListener('mouseleave', () => { hoverS = null; scheduleRedraw(); });
+  initGreeks();
+}
+
+// ---- greeks pane: net delta ($/pt) and gamma across spot -------------------
+// Built once and mutated on redraw, exactly like the main chart. Delta and
+// gamma live on very different scales (gamma is a second derivative), so each
+// gets its own y-axis: delta on the left (green), gamma on the right (purple).
+function initGreeks() {
+  const svg = `<svg viewBox="0 0 ${W} ${HG}" preserveAspectRatio="none">
+    <g id="ggYGrid"></g>
+    <line id="ggZero" stroke="#8b8fa3" stroke-width="1.25" stroke-dasharray="5,4" opacity="0.85"/>
+    <line id="ggK1" stroke="#2e3348" stroke-width="1" stroke-dasharray="3,3"/>
+    <line id="ggK2" stroke="#2e3348" stroke-width="1" stroke-dasharray="3,3"/>
+    <path id="deltaPath" fill="none" stroke="#34d399" stroke-width="2.25"/>
+    <path id="gammaPath" fill="none" stroke="#c084fc" stroke-width="2.25"/>
+    <line id="ggSpotNow" stroke="#4f8ff7" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <line id="ggWhatIf" stroke="#fbbf24" stroke-width="1.5"/>
+    <line id="ggCross" stroke="#8b8fa3" stroke-width="1" stroke-dasharray="2,2" opacity="0"/>
+    <circle id="deltaDot" r="4" fill="#34d399" opacity="0"/>
+    <circle id="gammaDot" r="4" fill="#c084fc" opacity="0"/>
+    <g id="ggXTicks"></g>
+    <g id="ggYTicksL"></g>
+    <g id="ggYTicksR"></g>
+    <text id="ggLegend" font-size="11" font-family="sans-serif"></text>
+    <rect id="ggHit" x="${PADG.l}" y="${PADG.t}" width="${W-PADG.l-PADG.r}" height="${HG-PADG.t-PADG.b}" fill="transparent"/>
+  </svg>`;
+  document.getElementById('plotG').innerHTML = svg;
+  const g = (id) => document.getElementById(id);
+  els.g = {
+    yGrid: g('ggYGrid'), zero: g('ggZero'), k1: g('ggK1'), k2: g('ggK2'),
+    delta: g('deltaPath'), gamma: g('gammaPath'), spotNow: g('ggSpotNow'),
+    whatIf: g('ggWhatIf'), cross: g('ggCross'), deltaDot: g('deltaDot'), gammaDot: g('gammaDot'),
+    xTicks: g('ggXTicks'), yTicksL: g('ggYTicksL'), yTicksR: g('ggYTicksR'),
+    legend: g('ggLegend'), hit: g('ggHit'),
+  };
+  els.g.hit.addEventListener('mousemove', (e) => {
+    const r = els.g.hit.getBoundingClientRect();
+    const frac = (e.clientX - r.left) / r.width;
+    hoverS = dom.xMin + frac * (dom.xMax - dom.xMin);
+    scheduleRedraw();
+  });
+  els.g.hit.addEventListener('mouseleave', () => { hoverS = null; scheduleRedraw(); });
 }
 
 const xScale = (v) => PAD.l + (v - dom.xMin) / (dom.xMax - dom.xMin) * (W - PAD.l - PAD.r);
@@ -5643,6 +5697,99 @@ function niceTicks(lo, hi, n) {
   const out = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) out.push(v);
   return out;
+}
+
+// ---- greeks pane math -----------------------------------------------------
+// Net delta ($ P&L per 1 point of spot) and gamma ($ change in that delta per
+// 1 point) by central finite difference on the SAME pricer as everything else
+// — same step h as the side-panel readouts, so the pane and the numbers agree.
+function greekAt(S, days, ivShift) {
+  const h = Math.max(0.5, d.width * 0.01);
+  const v = valueAt(S, days, ivShift);
+  const up = valueAt(S + h, days, ivShift), dn = valueAt(S - h, days, ivShift);
+  return {delta: (up - dn) / (2 * h), gamma: (up - 2 * v + dn) / (h * h)};
+}
+
+function redrawGreeks(days, ivShift) {
+  if (!els.g) return;
+  const g = els.g;
+  const n = 240, xs = [], del = [], gam = [];
+  let dHi = 0, gLo = 0, gHi = 0;
+  for (let i = 0; i <= n; i++) {
+    const S = dom.xMin + (dom.xMax - dom.xMin) * i / n;
+    const gr = greekAt(S, days, ivShift);
+    xs.push(S); del.push(gr.delta); gam.push(gr.gamma);
+    if (gr.delta > dHi) dHi = gr.delta;         // net delta stays >= 0 for a call debit spread
+    if (gr.gamma > gHi) gHi = gr.gamma;
+    if (gr.gamma < gLo) gLo = gr.gamma;
+  }
+  // Shared zero baseline. Gamma is signed (positive near the long strike,
+  // negative near the short strike) while delta stays >= 0, so split the pane
+  // height above/below a common zero line IN PROPORTION to gamma's own +/-
+  // extents — that way negative gamma always gets real vertical room instead of
+  // being crushed against the floor. Delta rides the same zero, scaled into the
+  // band above it (independent magnitude — gamma is a second derivative).
+  const ph = HG - PADG.t - PADG.b;
+  const gPos = (gHi > 0 ? gHi : 0) * 1.12 || 1e-9;
+  const gNeg = (gLo < 0 ? -gLo : 0) * 1.12;
+  const aboveH = ph * gPos / (gPos + gNeg);   // pixels above the zero line
+  const belowH = ph - aboveH;                 // pixels below (gamma negatives)
+  const y0 = PADG.t + aboveH;                 // shared zero line
+  const dTop = dHi > 0 ? dHi * 1.12 : 1;
+  const gTop = gPos, gBot = -gNeg;
+  const dY = (v) => y0 - (v / dTop) * aboveH;
+  const gY = (v) => v >= 0 ? y0 - (v / gPos) * aboveH
+                           : y0 + (-v / (gNeg || 1)) * belowH;
+
+  const line = (arr, sc) => arr.map((v, i) =>
+    (i ? 'L' : 'M') + xScale(xs[i]).toFixed(1) + ',' + sc(v).toFixed(1)).join(' ');
+  g.delta.setAttribute('d', line(del, dY));
+  g.gamma.setAttribute('d', line(gam, gY));
+
+  // Gamma zero reference (delta never goes negative, so this is the meaningful one).
+  const yz = gY(0);
+  g.zero.setAttribute('x1', PADG.l); g.zero.setAttribute('x2', W - PADG.r);
+  g.zero.setAttribute('y1', yz); g.zero.setAttribute('y2', yz);
+
+  for (const [el, K] of [[g.k1, d.K1], [g.k2, d.K2]]) {
+    const x = xScale(K);
+    el.setAttribute('x1', x); el.setAttribute('x2', x);
+    el.setAttribute('y1', PADG.t); el.setAttribute('y2', HG - PADG.b);
+  }
+  const vline = (el, x, show) => {
+    el.setAttribute('x1', x); el.setAttribute('x2', x);
+    el.setAttribute('y1', PADG.t); el.setAttribute('y2', HG - PADG.b);
+    el.setAttribute('opacity', show ? '1' : '0');
+  };
+  vline(g.spotNow, xScale(d.spot), true);
+  const S = +document.getElementById('slSpot').value;
+  const step = +document.getElementById('slSpot').step || 1;
+  vline(g.whatIf, xScale(S), Math.abs(S - d.spot) > step / 2);
+
+  // Marker dots + crosshair at the active spot (cursor if hovering, else slider).
+  const aS = hoverS !== null ? hoverS : S;
+  const ag = greekAt(aS, days, ivShift);
+  g.deltaDot.setAttribute('cx', xScale(aS)); g.deltaDot.setAttribute('cy', dY(ag.delta));
+  g.gammaDot.setAttribute('cx', xScale(aS)); g.gammaDot.setAttribute('cy', gY(ag.gamma));
+  g.deltaDot.setAttribute('opacity', '1'); g.gammaDot.setAttribute('opacity', '1');
+  vline(g.cross, xScale(aS), hoverS !== null);
+
+  // Axes: delta left (green), gamma right (purple).
+  g.xTicks.innerHTML = niceTicks(dom.xMin, dom.xMax, 8).map(v =>
+    `<text x="${xScale(v).toFixed(1)}" y="${HG - PADG.b + 15}" fill="#8b8fa3" font-size="10" text-anchor="middle" font-family="sans-serif">${fmtK(v)}</text>`
+  ).join('');
+  g.yTicksL.innerHTML = niceTicks(0, dTop, 3).map(v =>
+    `<text x="${PADG.l - 8}" y="${(dY(v) + 3).toFixed(1)}" fill="#34d399" font-size="10" text-anchor="end" font-family="sans-serif">${fmt0(v)}</text>`
+    + `<line x1="${PADG.l}" y1="${dY(v).toFixed(1)}" x2="${W - PADG.r}" y2="${dY(v).toFixed(1)}" stroke="#1a1d27" stroke-width="1"/>`
+  ).join('');
+  g.yTicksR.innerHTML = niceTicks(gBot, gTop, 4).map(v =>
+    `<text x="${W - PADG.r + 6}" y="${(gY(v) + 3).toFixed(1)}" fill="#c084fc" font-size="10" text-anchor="start" font-family="sans-serif">${v.toFixed(2)}</text>`
+  ).join('');
+  g.legend.setAttribute('x', (PADG.l + W - PADG.r) / 2);
+  g.legend.setAttribute('y', PADG.t - 3);
+  g.legend.setAttribute('text-anchor', 'middle');
+  g.legend.innerHTML = `<tspan fill="#34d399">━ net delta ($/pt)</tspan>`
+    + `<tspan fill="#8b8fa3">   ·   </tspan><tspan fill="#c084fc">━ gamma ($/pt²)</tspan>`;
 }
 
 let rafPending = false;
@@ -5752,6 +5899,7 @@ function redraw() {
                                  : 'solid = now · faint = at expiry';
 
   updateReadouts(hoverS !== null ? hoverS : S, days, ivShift, be, hoverS !== null);
+  redrawGreeks(days, ivShift);
 }
 
 function updateReadouts(S, days, ivShift, be, hovering) {
@@ -5863,8 +6011,10 @@ function applyData(firstRun) {
     (d.source === 'positions' ? 'open position' : 'finder candidate');
 
   const sl = document.getElementById('slSpot');
-  const lo = Math.floor(Math.min(d.K1, d.spot) * 0.85);
-  const hi = Math.ceil(Math.max(d.K2, d.spot) * 1.15);
+  // Default spot window: ~25% either side of the strikes/spot (wide enough to
+  // show the full delta S-curve and both gamma lobes flatten out).
+  const lo = Math.floor(Math.min(d.K1, d.spot) * 0.75);
+  const hi = Math.ceil(Math.max(d.K2, d.spot) * 1.25);
   const step = Math.max(0.05, Math.round(d.width / 50 * 20) / 20);
   // A range input snaps to min + n*step, so offset min onto the spot itself —
   // otherwise "now" isn't representable and Reset lands next to it, not on it.
