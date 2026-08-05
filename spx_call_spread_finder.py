@@ -958,6 +958,34 @@ def _save_json_list(path, items):
 
 
 # ---------------------------------------------------------------------------
+# Dip Scanner watchlist (watchlist.json, gitignored — runtime state).
+# The curated universe of large caps the Dip Scanner pre-screens for pullbacks.
+# ---------------------------------------------------------------------------
+WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
+DEFAULT_WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "JPM",
+    "V", "MA", "UNH", "XOM", "HD", "COST", "PG", "JNJ", "WMT", "LLY", "ORCL",
+]
+
+
+def load_watchlist():
+    """Return the saved watchlist (list of upper-cased tickers). Seeds the file
+    with DEFAULT_WATCHLIST on first run so the Dip Scanner is usable out of the box."""
+    wl = _load_json_list(WATCHLIST_FILE)
+    if not wl:
+        save_watchlist(DEFAULT_WATCHLIST)
+        return list(DEFAULT_WATCHLIST)
+    return [str(s).strip().upper() for s in wl if str(s).strip()]
+
+
+def save_watchlist(symbols):
+    """Persist a de-duped, upper-cased watchlist (order preserved)."""
+    clean = list(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
+    _save_json_list(WATCHLIST_FILE, clean)
+    return clean
+
+
+# ---------------------------------------------------------------------------
 # Index beta + option-implied 1-sigma engine (for the "Idx ±1σ P&L (β)" column)
 # ---------------------------------------------------------------------------
 BETA_CACHE_FILE = Path(__file__).parent / "beta_cache.json"
@@ -1119,6 +1147,147 @@ def get_index_sigma_1d(index_symbol, test_mode=False):
     if not annual_iv or annual_iv <= 0:
         return None, None
     return annual_iv * math.sqrt(1.0 / TRADING_DAYS), round(annual_iv * 100, 2)
+
+
+# ---------------------------------------------------------------------------
+# Dip Scanner engine — ranks a watchlist of large caps by how attractive a
+# pullback each is right now, purely from daily-close history (no option-chain
+# calls). One batched get_daily_closes_batch(...) for the whole watchlist + one
+# ^VIX series, cached per calendar day on disk (mirrors get_betas). EOD/daily-
+# close based, so a "from time to time" scan, not an intraday feed.
+# ---------------------------------------------------------------------------
+DIP_CACHE_FILE = Path(__file__).parent / "dip_cache.json"
+DIP_HISTORY = "1y"        # enough for the 200-day SMA + realized vol + RSI
+DIP_MIN_ROWS = 60         # skip names with too little history to be meaningful
+
+
+def _rsi(closes, period):
+    """Classic RSI on a close Series via simple (rolling-mean) gain/loss
+    averaging. Returns the latest value (0-100), or None if history is short."""
+    delta = closes.diff().dropna()
+    if len(delta) < period:
+        return None
+    gain = delta.clip(lower=0).rolling(period).mean().iloc[-1]
+    loss = (-delta.clip(upper=0)).rolling(period).mean().iloc[-1]
+    if loss == 0:
+        return 100.0
+    rs = gain / loss
+    return float(100 - 100 / (1 + rs))
+
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _dip_metrics_for(closes):
+    """Per-symbol dip signals from a daily-close Series. Returns a dict of
+    signals + a 0-100 composite dipScore, or None if history is insufficient.
+
+    Composite: raw = 0.35*sBelow + 0.30*sZ + 0.25*sRSI + 0.10*sVix, then a trend
+    gate multiply (×1 if above the 50/200-day, ×0.35 if not) so dips in uptrends
+    score full and falling knives are penalized — same shape as the Finder
+    Score's liquidity-gate multiply. sVix is injected by the caller (shared macro).
+    """
+    c = closes.dropna()
+    if len(c) < DIP_MIN_ROWS:
+        return None
+    price = float(c.iloc[-1])
+    if price <= 0:
+        return None
+    sma20 = float(c.rolling(20).mean().iloc[-1])
+    sma50 = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else None
+    sma200 = float(c.rolling(200).mean().iloc[-1]) if len(c) >= 200 else None
+
+    pct_below_20 = (sma20 - price) / sma20 * 100 if sma20 else 0.0
+
+    # 10-trading-day (~2 week) return z-score vs realized daily vol.
+    if len(c) >= 11:
+        mom10 = price / float(c.iloc[-11]) - 1.0
+        daily_std = float(c.pct_change().std())
+        z10 = mom10 / (daily_std * math.sqrt(10)) if daily_std > 0 else 0.0
+    else:
+        z10 = 0.0
+
+    rsi2 = _rsi(c, 2)
+    rsi14 = _rsi(c, 14)
+
+    # Long-trend filter = above the 200-day (falls back to the 50-day if 200d
+    # history is short). Deliberately NOT gated on the 50-day: a genuine dip is
+    # normally *below* the fast MA, so requiring it would reject the very setups
+    # we want. "Buy dips in uptrends, not falling knives."
+    trend_ma = sma200 if sma200 is not None else sma50
+    above_trend = trend_ma is not None and price > trend_ma
+    pct_above_200 = (price - sma200) / sma200 * 100 if sma200 else None
+
+    # Sub-scores mapped to 0-100 (deeper pullback -> higher).
+    s_below = _clamp(pct_below_20, 0, 5) / 5 * 100
+    s_z = _clamp(-z10, 0, 3) / 3 * 100
+    rsi_blend = ((100 - rsi2) if rsi2 is not None else 0) * 0.5 + \
+                ((100 - rsi14) if rsi14 is not None else 0) * 0.5
+    s_rsi = _clamp(rsi_blend, 0, 100)
+
+    return {
+        "price": round(price, 2),
+        "pctBelow20": round(pct_below_20, 2),
+        "z10": round(z10, 2),
+        "rsi2": round(rsi2, 1) if rsi2 is not None else None,
+        "rsi14": round(rsi14, 1) if rsi14 is not None else None,
+        "aboveTrend": bool(above_trend),
+        "pctAbove200": round(pct_above_200, 2) if pct_above_200 is not None else None,
+        # sub-scores kept for the composite; blended (with sVix) by the caller
+        "_sBelow": s_below, "_sZ": s_z, "_sRSI": s_rsi,
+    }
+
+
+def compute_dip_signals(symbols=None, force=False):
+    """Rank a watchlist by dipScore. One batched daily-close download for the
+    whole list + one ^VIX series, cached per calendar day on disk (force=True
+    bypasses). Returns {asOf, vixRank, candidates:[...]} sorted by dipScore desc.
+    Names with insufficient history are dropped. Never raises — vendor failure
+    yields an empty candidate list with a warning, like get_betas."""
+    symbols = list(dict.fromkeys(s.strip().upper() for s in (symbols or load_watchlist()) if s.strip()))
+    today = datetime.now().strftime("%Y-%m-%d")
+    cache = _load_json_dict(DIP_CACHE_FILE)
+    if not force and cache.get("date") == today and \
+            set(cache.get("symbols") or []) == set(symbols):
+        return {"asOf": cache.get("asOf"), "vixRank": cache.get("vixRank"),
+                "candidates": cache.get("candidates") or []}
+
+    vix_rank = None
+    candidates = []
+    try:
+        data = get_source().get_daily_closes_batch(symbols, DIP_HISTORY)
+        # ^VIX percentile rank (0-100) within its own 1y history — macro context.
+        try:
+            vh = get_source().get_daily_closes("^VIX", DIP_HISTORY).dropna()
+            if len(vh) > 20:
+                cur = float(vh.iloc[-1])
+                vix_rank = round(float((vh <= cur).mean()) * 100, 1)
+        except Exception:
+            vix_rank = None
+        s_vix = vix_rank if vix_rank is not None else 0.0
+
+        for sym in symbols:
+            if sym not in data.columns:
+                continue
+            m = _dip_metrics_for(data[sym])
+            if m is None:
+                continue
+            raw = 0.35 * m.pop("_sBelow") + 0.30 * m.pop("_sZ") + \
+                  0.25 * m.pop("_sRSI") + 0.10 * s_vix
+            gate = 1.0 if m["aboveTrend"] else 0.35
+            m["ticker"] = sym
+            m["dipScore"] = round(raw * gate, 1)
+            candidates.append(m)
+    except Exception as e:
+        print(f"  Warning: dip scan failed for {symbols} ({e})")
+        return {"asOf": None, "vixRank": None, "candidates": []}
+
+    candidates.sort(key=lambda x: x["dipScore"], reverse=True)
+    as_of = datetime.now().strftime("%Y-%m-%d %H:%M")
+    _save_json_dict(DIP_CACHE_FILE, {"date": today, "asOf": as_of, "symbols": symbols,
+                                     "vixRank": vix_rank, "candidates": candidates})
+    return {"asOf": as_of, "vixRank": vix_rank, "candidates": candidates}
 
 
 # Live-mode TTL cache for the ~30-day ATM IV: a σ input doesn't need
@@ -2493,6 +2662,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button type="button" class="primary" id="advancedToggle" style="background:transparent;color:var(--text-dim);border:1px solid var(--border);" onclick="toggleAdvanced()">Model inputs ▸</button>
     <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
     <button type="button" class="primary" id="scatterBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="openScatter()" title="Open a scatter plot of the current results in a new tab (pick any two columns for the axes).">&#128202; Scatter</button>
+    <button type="button" class="primary" id="dipScanBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="window.open('/dip','_blank')" title="Open the Dip Scanner: rank a watchlist of large caps for pullbacks, then click one to screen it here.">&#128201; Dip Scanner</button>
   </div>
 </div>
 <div class="controls collapsed" id="advancedFilters" style="border-top:none;padding-top:0;">
@@ -2708,14 +2878,18 @@ toggleAdvanced(localStorage.getItem('finderAdvancedOpen') === '1');
 
 // ---------------- Dip-buy / recovery preset ----------------
 // A tunable starting point for buying call spreads on dips to catch a recovery:
-// modest risk cap, meaningful leverage per 1% bounce, long strike near spot, and
-// enough time for the move. Leaves ticker & expirations as currently chosen.
+// modest risk cap, meaningful leverage per 1% bounce, long strike near-the-money
+// (minNetDelta floor keeps it directional, not a lottery ticket), and enough
+// time for the move. Leaves ticker & expirations as currently chosen. Applying
+// it also flips the Score to the Conservative tilt (probability + reward:risk up,
+// gamma/premium down) so the ranking matches the modest-leverage intent.
 const DIP_BUY_PRESET = {
   maxPremium: '3000', minLeverage: '3', minRewardRisk: '1', maxOtm: '3',
-  maxWidth: '50', movePct: '5', minDte: '45'
+  maxWidth: '50', movePct: '5', minDte: '45', minNetDelta: '0.40'
 };
 function applyDipBuyPreset() {
   applyParams(DIP_BUY_PRESET);
+  applyScorePreset('conservative');   // risk-adjusted ranking to match the filters
   doSearch();
 }
 
@@ -3322,6 +3496,19 @@ function initScoreWeights() {
   }
 }
 initScoreWeights();
+
+// ---- Dip Scanner handoff: opened as /?ticker=SYM&preset=dip, prefill the
+// ticker and apply the dip-buy screen (filters + Conservative score), then it
+// auto-searches via applyDipBuyPreset(). Runs AFTER initScoreWeights() so the
+// SCORE_METRICS/SCORE_PRESETS consts applyScorePreset() reads are initialized
+// (they're `const`, i.e. not usable before their declaration line — a TDZ).
+// Expirations are already populated (default "All"), so no extra wait is needed.
+(function applyDipHandoff() {
+  const q = new URLSearchParams(window.location.search);
+  const t = (q.get('ticker') || '').trim().toUpperCase();
+  if (t) document.getElementById('ticker').value = t;
+  if (q.get('preset') === 'dip') applyDipBuyPreset();
+})();
 
 // Black-Scholes helpers for theoretical value curve (server-injected; the one
 // copy of the math, shared with /scatter and /curve).
@@ -5719,6 +5906,219 @@ window.addEventListener('storage', (e) => {
 
 
 # ---------------------------------------------------------------------------
+# Dip Scanner page (/dip) — ranks the watchlist by pullback attractiveness and
+# hands a chosen ticker into the Finder with the dip-buy preset. Self-contained
+# static HTML; all data via /api/dipscan + /api/watchlist. No .replace() tokens.
+# ---------------------------------------------------------------------------
+DIP_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dip Scanner</title>
+<style>
+  :root {
+    --bg:#0f1117; --surface:#1a1d27; --surface2:#242837; --border:#2e3348;
+    --text:#e4e6f0; --text-dim:#8b8fa3; --accent:#4f8ff7; --accent-hover:#6ba1ff;
+    --green:#34d399; --red:#f87171; --yellow:#fbbf24;
+    --font:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;
+    --mono:'SF Mono','Cascadia Code','Consolas',monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:var(--font); background:var(--bg); color:var(--text);
+         min-height:100vh; padding:18px 22px; }
+  h1 { font-size:20px; font-weight:600; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { color:var(--accent-hover); }
+  header { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
+  header .nav { margin-left:auto; font-size:13px; display:flex; gap:14px; }
+  .sub { color:var(--text-dim); font-size:12px; }
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:10px;
+           padding:14px 16px; margin-bottom:16px; }
+  .panel h2 { font-size:13px; font-weight:600; color:var(--text-dim); text-transform:uppercase;
+              letter-spacing:.04em; margin-bottom:10px; }
+  textarea { width:100%; min-height:52px; resize:vertical; background:var(--surface2);
+             border:1px solid var(--border); border-radius:6px; color:var(--text);
+             font-family:var(--mono); font-size:13px; padding:8px 10px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+  button { background:var(--accent); color:#fff; border:none; border-radius:6px;
+           padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  button:hover { background:var(--accent-hover); }
+  button.ghost { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
+  button.ghost:hover { background:var(--border); }
+  button.mini { padding:4px 10px; font-size:12px; }
+  .macro { display:flex; gap:22px; align-items:baseline; flex-wrap:wrap; }
+  .macro b { font-size:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { padding:7px 10px; text-align:right; border-bottom:1px solid var(--border);
+          white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--text-dim); font-weight:600; font-size:11px; text-transform:uppercase;
+       letter-spacing:.03em; cursor:pointer; user-select:none; position:sticky; top:0;
+       background:var(--surface); }
+  td.tk { font-family:var(--mono); font-weight:600; }
+  .score { font-weight:700; font-family:var(--mono); border-radius:4px; padding:2px 8px; }
+  .trend-up { color:var(--green); }
+  .trend-no { color:var(--text-dim); }
+  .neg { color:var(--red); }
+  .msg { color:var(--text-dim); font-size:13px; padding:14px 4px; }
+  tbody tr:hover { background:var(--surface2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128201; Dip Scanner</h1>
+  <span class="sub" id="asOf"></span>
+  <nav class="nav">
+    <a href="/">&#8592; Call Spread Finder</a>
+    <a href="/positions">My Positions</a>
+  </nav>
+</header>
+
+<div class="panel">
+  <h2>Watchlist</h2>
+  <textarea id="wl" spellcheck="false" placeholder="AAPL MSFT NVDA ..."></textarea>
+  <div class="row">
+    <button onclick="scan(false)" id="scanBtn">Scan for dips</button>
+    <button class="ghost" onclick="scan(true)">Force refresh</button>
+    <button class="ghost" onclick="saveWatchlist()">Save watchlist</button>
+    <span class="sub" id="wlMsg"></span>
+  </div>
+</div>
+
+<div class="panel macro" id="macro" style="display:none">
+  <div>VIX IV-rank (1y): <b id="vixRank">--</b></div>
+  <div class="sub">Percentile of today's VIX within its 1-year range &mdash; market-level vol
+    context. Per-stock IV rank isn't available historically, so this is macro only.</div>
+</div>
+
+<div class="panel">
+  <div id="results"><div class="msg">Scan the watchlist to rank pullbacks. Signals are
+    end-of-day (daily-close based), cached once per day &mdash; a "from time to time" scan.</div></div>
+</div>
+
+<script>
+let rows = [];
+let sortKey = 'dipScore', sortDir = -1;
+
+const COLS = [
+  ['ticker','Ticker'], ['price','Price'], ['pctBelow20','% &lt;20d MA'],
+  ['z10','z (10d)'], ['rsi2','RSI(2)'], ['rsi14','RSI(14)'],
+  ['aboveTrend','Trend'], ['pctAbove200','% vs 200d'], ['dipScore','Dip Score'],
+];
+
+function scoreColor(s) {
+  // 0 (dim) -> 100 (bright green), matching the Finder's Score coloring intent.
+  const t = Math.max(0, Math.min(100, s)) / 100;
+  const h = 140, l = 18 + t * 32;
+  return 'hsl(' + h + ',' + Math.round(30 + t * 45) + '%,' + Math.round(l) + '%)';
+}
+function fmt(v, dp) { return (v === null || v === undefined) ? '--' : (+v).toFixed(dp); }
+
+async function loadWatchlist() {
+  try {
+    const r = await fetch('/api/watchlist');
+    const j = await r.json();
+    document.getElementById('wl').value = (j.symbols || []).join(' ');
+  } catch (e) {}
+}
+
+function parseWl() {
+  return document.getElementById('wl').value.split(/[\s,]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+}
+
+async function saveWatchlist() {
+  const msg = document.getElementById('wlMsg');
+  try {
+    const r = await fetch('/api/watchlist', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({symbols: parseWl()})
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    document.getElementById('wl').value = (j.symbols || []).join(' ');
+    msg.textContent = 'Saved.'; setTimeout(() => msg.textContent = '', 1500);
+  } catch (e) { msg.textContent = 'Save failed: ' + e.message; }
+}
+
+async function scan(force) {
+  const btn = document.getElementById('scanBtn');
+  const res = document.getElementById('results');
+  btn.disabled = true; btn.textContent = 'Scanning...';
+  res.innerHTML = '<div class="msg">Fetching daily history for the watchlist...</div>';
+  try {
+    // Save the current watchlist first so a Scan reflects any edits.
+    await saveWatchlist();
+    const r = await fetch('/api/dipscan' + (force ? '?force=1' : ''));
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    rows = j.candidates || [];
+    document.getElementById('asOf').textContent = j.asOf ? ('as of ' + j.asOf) : '';
+    const macro = document.getElementById('macro');
+    if (j.vixRank !== null && j.vixRank !== undefined) {
+      macro.style.display = 'flex';
+      document.getElementById('vixRank').textContent = j.vixRank + '%';
+    } else { macro.style.display = 'none'; }
+    render();
+  } catch (e) {
+    res.innerHTML = '<div class="msg">Scan failed: ' + e.message + '</div>';
+  } finally { btn.disabled = false; btn.textContent = 'Scan for dips'; }
+}
+
+function setSort(k) {
+  if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = (k === 'ticker') ? 1 : -1; }
+  render();
+}
+
+function render() {
+  const res = document.getElementById('results');
+  if (!rows.length) { res.innerHTML = '<div class="msg">No candidates returned (insufficient history, or vendor throttled). Try Force refresh.</div>'; return; }
+  const sorted = rows.slice().sort((a, b) => {
+    let x = a[sortKey], y = b[sortKey];
+    if (x === null || x === undefined) x = -Infinity;
+    if (y === null || y === undefined) y = -Infinity;
+    if (typeof x === 'boolean') { x = x ? 1 : 0; y = y ? 1 : 0; }
+    if (typeof x === 'string') return sortDir * x.localeCompare(y);
+    return sortDir * (x - y);
+  });
+  let h = '<table><thead><tr>';
+  for (const [k, label] of COLS) {
+    const arrow = sortKey === k ? (sortDir < 0 ? ' &#9662;' : ' &#9652;') : '';
+    h += '<th onclick="setSort(\'' + k + '\')">' + label + arrow + '</th>';
+  }
+  h += '<th></th></tr></thead><tbody>';
+  for (const r of sorted) {
+    h += '<tr>';
+    h += '<td class="tk">' + r.ticker + '</td>';
+    h += '<td>' + fmt(r.price, 2) + '</td>';
+    h += '<td class="' + (r.pctBelow20 > 0 ? '' : 'neg') + '">' + fmt(r.pctBelow20, 2) + '</td>';
+    h += '<td class="' + (r.z10 < 0 ? 'neg' : '') + '">' + fmt(r.z10, 2) + '</td>';
+    h += '<td>' + fmt(r.rsi2, 0) + '</td>';
+    h += '<td>' + fmt(r.rsi14, 0) + '</td>';
+    h += '<td class="' + (r.aboveTrend ? 'trend-up' : 'trend-no') + '">' + (r.aboveTrend ? '&#9650; up' : 'below') + '</td>';
+    h += '<td>' + fmt(r.pctAbove200, 1) + '</td>';
+    h += '<td><span class="score" style="background:' + scoreColor(r.dipScore) + '">' + fmt(r.dipScore, 1) + '</span></td>';
+    h += '<td><button class="mini" onclick="findSpreads(\'' + r.ticker + '\')">Find spreads &#8594;</button></td>';
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+  res.innerHTML = h;
+}
+
+function findSpreads(ticker) {
+  // Hand off to the Finder: it reads ?ticker=&preset=dip on load, applies the
+  // dip-buy filters + Conservative score, and auto-searches.
+  window.open('/?ticker=' + encodeURIComponent(ticker) + '&preset=dip', '_blank');
+}
+
+loadWatchlist();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
 
@@ -5807,6 +6207,13 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                     .replace("__RF_RATE__", str(RISK_FREE_RATE_PCT)))
             self.wfile.write(page.encode("utf-8"))
 
+        elif parsed.path == "/dip":
+            # Dip Scanner: static HTML, data via /api/dipscan + /api/watchlist.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(DIP_PAGE.encode("utf-8"))
+
         elif parsed.path == "/api/positions":
             self._send_json(load_positions())
 
@@ -5859,6 +6266,17 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/templates":
             self._send_json(load_templates())
+
+        elif parsed.path == "/api/watchlist":
+            self._send_json({"symbols": load_watchlist()})
+
+        elif parsed.path == "/api/dipscan":
+            params = parse_qs(parsed.query)
+            force = params.get("force", ["0"])[0].lower() in ("1", "true", "on")
+            try:
+                self._send_json(compute_dip_signals(force=force))
+            except Exception as e:
+                self._send_json({"error": str(e)})
 
         elif parsed.path == "/api/clear_cache":
             n = clear_test_cache()
@@ -5955,6 +6373,15 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 templates.append(entry)
                 save_templates(templates)
                 self._send_json(entry)
+            except Exception as e:
+                self._send_json({"error": str(e)})
+        elif parsed.path == "/api/watchlist":
+            try:
+                body = self._read_json_body()
+                symbols = body.get("symbols") if isinstance(body, dict) else None
+                if not isinstance(symbols, list) or not any(str(s).strip() for s in symbols):
+                    raise ValueError("symbols must be a non-empty list")
+                self._send_json({"symbols": save_watchlist(symbols)})
             except Exception as e:
                 self._send_json({"error": str(e)})
         else:

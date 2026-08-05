@@ -20,6 +20,8 @@ beta_cache.json
 chain_cache.pkl
 alerts.json
 sources.json
+watchlist.json
+dip_cache.json
 *.tmp
 
 # Generated chart output
