@@ -519,7 +519,7 @@ def clear_test_cache():
     return n
 
 
-def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0, min_short_leg_delta=0.08, min_return_1sigma=0.0, test_mode=False):
+def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=100, max_otm=5.0, risk_free_rate=None, expiration_filter="all", min_net_delta=0.33, min_reward_risk=0.5, commission=35.80, min_dte=30, max_leg_premium=20000, symbol="^SPX", move_pct=1.0, profit_target_pct=5.0, min_gamma=0.0, min_short_leg_delta=0.08, move_basis="pct", test_mode=False):
     if risk_free_rate is None:
         risk_free_rate = RISK_FREE_RATE_PCT / 100.0
     """
@@ -653,10 +653,9 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
             skipped_premium_high = 0
             skipped_leg_premium = 0
             skipped_short_leg = 0
-            skipped_leverage = 0
+            skipped_move_return = 0
             skipped_delta = 0
             skipped_gamma = 0
-            skipped_ret1s = 0
             skipped_rr = 0
             found = 0
 
@@ -744,8 +743,15 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                                 - bs_call_price(S, K2, T, risk_free_rate, iv_sell))
 
                     value_now = spread_value_at(spot)
-                    move_frac = move_pct / 100.0
-                    pnl_move_per = spread_value_at(spot * (1.0 + move_frac)) - value_now
+                    # The "recovery move" — size set by move_basis — drives BOTH the unified
+                    # min-return screen (below) and the "Return @ move" result column, so the
+                    # two always agree. pct → a fixed % up-move; sigma → move_pct·(1σ one-day).
+                    if move_basis == "sigma":
+                        _sigma_1d = (spot * exp_atm_iv * math.sqrt(1 / 252)) if (exp_atm_iv and T > 0) else 0.0
+                        move_dS = move_pct * _sigma_1d
+                    else:
+                        move_dS = spot * (move_pct / 100.0)
+                    pnl_move_per = spread_value_at(spot + move_dS) - value_now
 
                     # P&L for a +1σ *one-day* underlying move using the expiration's ATM IV.
                     # Daily σ = spot * IV * sqrt(1/252) (trading-day convention).
@@ -766,11 +772,16 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         delta_prem = gamma_prem = theta_prem = None
 
                     # Leverage: exact reprice for a +1% move, per unit of premium, so it
-                    # stays comparable regardless of move_pct.
+                    # stays comparable regardless of move_pct. Kept as a display/sort column.
                     leverage = ((spread_value_at(spot * 1.01) - value_now) / net_premium) / 0.01 if net_premium > 0 else 0
 
-                    if leverage < min_leverage:
-                        skipped_leverage += 1
+                    # Unified "min return on move" screen — the merge of the old Min-Leverage
+                    # and Min-Return-1σ filters into one knob. Uses the same basis-aware move_dS
+                    # computed above (so it equals the "Return @ move" column exactly), repriced
+                    # via spread_value_at, so it respects the spread's value cap at width.
+                    move_return = (pnl_move_per / net_premium * 100) if net_premium > 0 else 0
+                    if move_return < min_move_return:
+                        skipped_move_return += 1
                         continue
 
                     # Filter on per-contract net delta (Δ/Contract) — the spread's
@@ -790,10 +801,9 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
 
                     # Return on a +1σ one-day move, as a % of premium paid (the
                     # "Return 1σ 1d %" column). Per-contract ratio, size-independent.
+                    # No longer a standalone filter — folded into the unified move-return
+                    # screen above (set move_basis=sigma to screen on this).
                     return_1sigma = (pnl_1sigma_per / net_premium * 100) if net_premium > 0 else 0
-                    if return_1sigma < min_return_1sigma:
-                        skipped_ret1s += 1
-                        continue
 
                     # Max profit & other metrics (per contract in quoted points)
                     # Commission: convert $/spread round-trip to points (÷100)
@@ -907,7 +917,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
                         "totalCommission": round(commission * contracts, 2),
                     })
 
-            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_leverage} under min leverage, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_ret1s} under min 1σ return, {skipped_rr} under min R/R")
+            print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_move_return} under min move return, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
 
         except Exception as e:
             print(f"  Skipping {exp_date_str}: {e}")
@@ -921,6 +931,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width=100
         "symbol": symbol,
         "spot": round(spot, 2),
         "movePct": move_pct,
+        "moveBasis": move_basis,
         "profitTargetPct": profit_target_pct,
         "prevClose": round(prev_close, 2) if prev_close is not None else None,
         "dayMove": round(day_move, 2) if day_move is not None else None,
@@ -1563,11 +1574,11 @@ def check_pnl_alerts(quotes):
 
 
 def check_position_digest(quotes):
-    """Half-hourly ntfy digest: best (mid) Adjusted P&L and return for every position.
+    """Quarter-hourly ntfy digest: best (mid) Adjusted P&L and return for every position.
 
-    Fires on the first live refresh inside each half-hour slot between 9:30
+    Fires on the first live refresh inside each 15-minute slot between 9:30
     and 16:30 ET on US trading days (weekends + MARKET_HOLIDAYS skipped) —
-    at most 15 pushes/day, latched per (slot, date) in alerts.json alongside
+    at most 29 pushes/day, latched per (slot, date) in alerts.json alongside
     the threshold-alert latches. Like those alerts, it rides the monitor's
     polling: no open tab during a slot means that slot is skipped (the
     market-hours gate keeps polling alive through the 16:30 slot). Disable
@@ -1579,7 +1590,7 @@ def check_position_digest(quotes):
     mins = now.hour * 60 + now.minute
     if not (570 <= mins <= 991):          # 9:30 .. just past the 16:30 slot
         return
-    slot_mins = min((mins // 30) * 30, 990)
+    slot_mins = min((mins // 15) * 15, 990)
     slot = f"{slot_mins // 60:02d}:{slot_mins % 60:02d}"
     rows = [q for q in quotes if q.get("adjPnl") is not None]
     if not rows:
@@ -2563,82 +2574,83 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="hint">Check one or more expirations</span>
     <span class="tooltip-text">3rd Friday of each month — check the expirations you want to scan, or "All" to scan everything</span>
   </div>
-
-  <div class="section-label">Filters <span class="sub">— change which spreads come back</span></div>
-  <div class="input-group tooltip-container">
-    <label>Max Premium ($)</label>
-    <input type="number" id="maxPremium" value="11000" min="100" step="100">
-    <span class="hint">Max net dollars laid out (risk cap)</span>
-    <span class="tooltip-text">Maximum net cash outlay (long call ask − short call bid) × 100 multiplier. This is your capital at risk per spread.</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Leverage (x)</label>
-    <input type="number" id="minLeverage" value="2" min="0.1" step="0.5">
-    <span class="hint">Profit / premium for 1% move</span>
-    <span class="tooltip-text">Minimum ratio of dollar profit from a 1% up move to premium paid — your P&amp;L per 1% recovery, per dollar risked.</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Return 1&sigma; (%)</label>
-    <input type="number" id="minReturn1sigma" value="0" step="5">
-    <span class="hint">Return on a 1-day 1&sigma; move</span>
-    <span class="tooltip-text">Minimum "Return 1&sigma; 1d %" — the P&amp;L for a +1&sigma; one-day move in the underlying, as a % of premium paid. Screens for spreads that pop meaningfully on a normal daily move. Set 0 to disable.</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Reward/Risk</label>
-    <input type="number" id="minRewardRisk" value="0.5" min="0" step="0.1">
-    <span class="hint">Min max-profit / premium ratio</span>
-    <span class="tooltip-text">Minimum ratio of max profit to premium paid — e.g. 1.0 means max profit ≥ premium (hold-to-expiry payoff).</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Max % OTM</label>
-    <input type="number" id="maxOtm" value="5" min="0.1" step="0.5">
-    <span class="hint">Buy strike max % above spot</span>
-    <span class="tooltip-text">Maximum % the lower (buy) strike is above the current underlying price — controls where the long strike sits vs. spot (positioning for the bounce).</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Max Width (pts)</label>
-    <input type="number" id="maxWidth" value="100" min="5" step="5">
-    <span class="hint">Max strike spread in points</span>
-    <span class="tooltip-text">Maximum distance between strikes — e.g. 50 pts = $5,000 max risk (×100 multiplier)</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Net Delta</label>
-    <input type="number" id="minNetDelta" value="0.33" min="0" max="1" step="0.01">
-    <span class="hint">Per-contract net delta (Δ/Contract) floor</span>
-    <span class="tooltip-text">Minimum per-contract net delta (long delta − short delta) — the Δ/Contract column. Filters out low-directional spreads.</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Gamma (&Delta;/1%)</label>
-    <input type="number" id="minGamma" value="0.00" step="0.01">
-    <span class="hint">&uarr; punchier/convex &middot; &darr; steadier/linear</span>
-    <span class="tooltip-text">Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Raise it to require more convexity (punchier, tends to shorter-dated / nearer-the-money spreads); lower it (or go negative) for steadier, more linear spreads (longer-dated / further OTM).</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Max Leg Premium ($)</label>
-    <input type="number" id="maxLegPremium" value="20000" min="0" step="500">
-    <span class="hint">Max $ per individual leg</span>
-    <span class="tooltip-text">Maximum absolute dollar value (price × 100 × contracts) for either the long or short leg individually</span>
-  </div>
-  <div class="input-group tooltip-container">
-    <label>Min Short-Leg Delta</label>
-    <input type="number" id="minShortLegDelta" value="0.08" min="0" max="1" step="0.01">
-    <span class="hint">Short-call moneyness floor (Δ)</span>
-    <span class="tooltip-text">Minimum raw delta of the short (higher-strike) call — a normalized, cross-ticker measure of the short strike's moneyness (≈ probability of finishing ITM). Keeps the short leg from being a too-far-OTM / illiquid token; higher = short strike nearer the money (richer, upside capped sooner). Independent of contract count. Set 0 to disable. Default 0.08 ≈ an 8-delta short.</span>
-  </div>
   <div class="input-group tooltip-container">
     <label>Min DTE</label>
     <input type="number" id="minDte" value="30" min="0" step="1">
     <span class="hint">Min days to expiration</span>
-    <span class="tooltip-text">Skip expirations with fewer than this many days remaining</span>
+    <span class="tooltip-text">Skip expirations with fewer than this many days remaining. A scan constraint (works alongside the expiration checkboxes), not a spread filter.</span>
+  </div>
+
+  <div class="section-label">Filters <span class="sub">— the core 6 (one per axis)</span></div>
+  <div class="input-group tooltip-container">
+    <label>Max Premium ($)</label>
+    <input type="number" id="maxPremium" value="11000" min="100" step="100">
+    <span class="hint">Budget &middot; max net dollars at risk</span>
+    <span class="tooltip-text">Maximum net cash outlay (long call ask − short call bid) × 100 multiplier. This is your capital at risk per spread, and it auto-sizes the contract count.</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min Reward/Risk</label>
+    <input type="number" id="minRewardRisk" value="0.5" min="0" step="0.1">
+    <span class="hint">Risk/reward &middot; max-profit / premium</span>
+    <span class="tooltip-text">Minimum ratio of max profit to premium paid — e.g. 1.0 means max profit ≥ premium (hold-to-expiry payoff).</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min return on move</label>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
+      <select id="moveBasis" onchange="onMoveBasisChange()" style="background:var(--panel,#111);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px;">
+        <option value="pct">&plusmn; %</option>
+        <option value="sigma">&plusmn; &sigma; (1d)</option>
+      </select>
+      <input type="number" id="movePct" value="1" min="0.1" step="0.5" style="width:60px;" title="Move size: the % up-move (basis '± %') or number of 1-day σ (basis '± σ') the underlying makes.">
+      <span style="color:var(--text-dim);font-size:12px;white-space:nowrap;">&rarr; &ge;</span>
+      <input type="number" id="minMoveReturn" value="0" step="5" style="width:64px;">
+      <span style="color:var(--text-dim);font-size:12px;">%</span>
+    </div>
+    <span class="hint" id="moveHint">Leverage &middot; return on a +X% move, as % of premium</span>
+    <span class="tooltip-text">Leverage screen (merge of the old Min Leverage + Min Return 1&sigma;). Both legs are repriced at a move whose size you set — a fixed % up-move (basis "&plusmn; %") or an N&middot;&sigma; one-day move (basis "&plusmn; &sigma;", vol-scaled, N = the middle field). Keeps spreads whose return on that move (as a % of premium paid) is at least the threshold on the right. This same move also drives the "Return @ move" result column. Leverage L in the old sense = L% return on a +1% move.</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min Net Delta</label>
+    <input type="number" id="minNetDelta" value="0.33" min="0" max="1" step="0.01">
+    <span class="hint">Direction &middot; per-contract net &Delta; floor</span>
+    <span class="tooltip-text">Minimum per-contract net delta (long delta − short delta) — the Δ/Contract column. Filters out low-directional spreads, and implicitly bounds how far the long (buy) strike sits above spot (it took over the old Max %OTM role — the finer %OTM control now lives in Fine-tune).</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Min Gamma (&Delta;/1%)</label>
+    <input type="number" id="minGamma" value="0.00" step="0.01">
+    <span class="hint">Convexity &middot; &uarr; punchier &middot; &darr; steadier</span>
+    <span class="tooltip-text">Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Raise it to require more convexity (punchier, tends to shorter-dated / nearer-the-money spreads); lower it (or go negative) for steadier, more linear spreads (longer-dated / further OTM).</span>
+  </div>
+  <div class="input-group tooltip-container">
+    <label>Max Width (pts)</label>
+    <input type="number" id="maxWidth" value="100" min="5" step="5">
+    <span class="hint">Structure &middot; max strike spread (pts)</span>
+    <span class="tooltip-text">Maximum distance between strikes — e.g. 50 pts = $5,000 max risk (×100 multiplier). Structural cap on the payoff ceiling.</span>
+  </div>
+
+  <div class="section-label">Fine-tune <span class="sub">— finer strike/leg controls (collapsed)</span> <button type="button" id="fineTuneToggle" onclick="toggleFineTune()" style="background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:2px 8px;font-size:11px;margin-left:6px;cursor:pointer;">Show ▸</button></div>
+  <div id="fineTuneFilters" style="display:none;flex-wrap:wrap;gap:16px;width:100%;">
+    <div class="input-group tooltip-container">
+      <label>Max % OTM</label>
+      <input type="number" id="maxOtm" value="5" min="0.1" step="0.5">
+      <span class="hint">Buy strike max % above spot</span>
+      <span class="tooltip-text">Maximum % the lower (buy) strike is above the current underlying price — the absolute-distance version of long-strike positioning (Min Net Delta covers most of this now). Raise it wide to disable.</span>
+    </div>
+    <div class="input-group tooltip-container">
+      <label>Min Short-Leg Delta</label>
+      <input type="number" id="minShortLegDelta" value="0.08" min="0" max="1" step="0.01">
+      <span class="hint">Short-call moneyness floor (&Delta;)</span>
+      <span class="tooltip-text">Minimum raw delta of the short (higher-strike) call — a normalized, cross-ticker measure of the short strike's moneyness (≈ probability of finishing ITM). Keeps the short leg from being a too-far-OTM / illiquid token; higher = short strike nearer the money (richer, upside capped sooner). Independent of contract count. Set 0 to disable. Default 0.08 ≈ an 8-delta short.</span>
+    </div>
+    <div class="input-group tooltip-container">
+      <label>Max Leg Premium ($)</label>
+      <input type="number" id="maxLegPremium" value="20000" min="0" step="500">
+      <span class="hint">Max $ per individual leg</span>
+      <span class="tooltip-text">Maximum absolute dollar value (price × 100 × contracts) for either the long or short leg individually. Niche sizing guard; set 0 to disable.</span>
+    </div>
   </div>
 
   <div class="section-label">Output &amp; scenario <span class="sub">— shape the result columns, not which spreads return</span></div>
-  <div class="input-group tooltip-container">
-    <label>Recovery move %</label>
-    <input type="number" id="movePct" value="1" min="0.1" step="0.5">
-    <span class="hint">Underlying bounce → "P&amp;L X% $" column</span>
-    <span class="tooltip-text">The underlying % move you expect to recover — drives the "P&amp;L X% $" column (Δ·dS + ½·Γ·dS²). This is an UNDERLYING price move, not a P&amp;L target. It does not screen spreads (only a tiny 2nd-order effect on Leverage via gamma).</span>
-  </div>
   <div class="input-group tooltip-container">
     <label>P&amp;L target (% of cost)</label>
     <input type="number" id="profitTarget" value="5" min="0.1" step="0.5">
@@ -2876,6 +2888,31 @@ function toggleAdvanced(forceOpen) {
 // Restore prior open/closed state (default closed).
 toggleAdvanced(localStorage.getItem('finderAdvancedOpen') === '1');
 
+// Collapsible "Fine-tune" filter group (Max %OTM / Min Short-Leg Delta / Max Leg Premium).
+function toggleFineTune(forceOpen) {
+  const box = document.getElementById('fineTuneFilters');
+  const btn = document.getElementById('fineTuneToggle');
+  const open = (forceOpen === undefined) ? (box.style.display === 'none') : forceOpen;
+  box.style.display = open ? 'flex' : 'none';
+  if (btn) btn.textContent = open ? 'Hide ▾' : 'Show ▸';
+  try { localStorage.setItem('finderFineTuneOpen', open ? '1' : '0'); } catch (e) {}
+}
+toggleFineTune(localStorage.getItem('finderFineTuneOpen') === '1');
+
+// Keep the unified move control's hint honest as the basis flips (% vs σ).
+function onMoveBasisChange() {
+  const basis = document.getElementById('moveBasis').value;
+  const hint = document.getElementById('moveHint');
+  const mag = document.getElementById('movePct');
+  if (basis === 'sigma') {
+    if (hint) hint.textContent = 'Leverage · return on an N·σ 1-day move, as % of premium';
+    if (mag) { mag.step = '0.5'; mag.title = 'Number of 1-day σ the underlying moves.'; }
+  } else {
+    if (hint) hint.textContent = 'Leverage · return on a +X% move, as % of premium';
+    if (mag) { mag.step = '0.5'; mag.title = 'The % up-move the underlying makes.'; }
+  }
+}
+
 // ---------------- Dip-buy / recovery preset ----------------
 // A tunable starting point for buying call spreads on dips to catch a recovery:
 // modest risk cap, meaningful leverage per 1% bounce, long strike near-the-money
@@ -2884,8 +2921,8 @@ toggleAdvanced(localStorage.getItem('finderAdvancedOpen') === '1');
 // it also flips the Score to the Conservative tilt (probability + reward:risk up,
 // gamma/premium down) so the ranking matches the modest-leverage intent.
 const DIP_BUY_PRESET = {
-  maxPremium: '3000', minLeverage: '3', minRewardRisk: '1', maxOtm: '3',
-  maxWidth: '50', movePct: '5', minDte: '45', minNetDelta: '0.40'
+  maxPremium: '3000', moveBasis: 'pct', movePct: '5', minMoveReturn: '15',
+  minRewardRisk: '1', maxOtm: '3', maxWidth: '50', minDte: '45', minNetDelta: '0.40'
 };
 function applyDipBuyPreset() {
   applyParams(DIP_BUY_PRESET);
@@ -2897,7 +2934,7 @@ function applyDipBuyPreset() {
 
 // Input IDs to capture in a template (order matters for restoring)
 const TEMPLATE_INPUT_IDS = [
-  'ticker','maxPremium','minLeverage','minReturn1sigma','maxWidth','maxOtm','movePct',
+  'ticker','maxPremium','moveBasis','movePct','minMoveReturn','maxWidth','maxOtm',
   'profitTarget','riskFreeRate','minNetDelta','minGamma','minRewardRisk','commission','maxLegPremium',
   'minShortLegDelta','minDte','sortBy'
 ];
@@ -2923,12 +2960,22 @@ function captureCurrentParams() {
 
 function applyParams(params) {
   if (!params) return;
+  // Back-compat: templates saved before the leverage merge carry minLeverage /
+  // minReturn1sigma. Map the old leverage floor onto the unified move-return control:
+  // leverage L == L% return on a +1% move, so basis=pct, movePct=1, minMoveReturn=L.
+  params = Object.assign({}, params);
+  if (params.minMoveReturn === undefined && params.minLeverage !== undefined) {
+    params.moveBasis = 'pct';
+    params.movePct = '1';
+    params.minMoveReturn = String(params.minLeverage);
+  }
   for (const id of TEMPLATE_INPUT_IDS) {
     if (id in params) {
       const el = document.getElementById(id);
       if (el) el.value = params[id];
     }
   }
+  if (typeof onMoveBasisChange === 'function') onMoveBasisChange();
   // Expiration checkbox state
   if ('expiration' in params) {
     const allCb = document.getElementById('exp_all');
@@ -3128,9 +3175,10 @@ function stashScatterData() {
   if (!allSpreads || !allSpreads.length) return false;
   const rf = parseFloat(document.getElementById('riskFreeRate').value) / 100;
   const mp = parseFloat(document.getElementById('movePct').value) || 1;
+  const mb = document.getElementById('moveBasis').value === 'sigma' ? 'sigma' : 'pct';
   const pt = parseFloat(document.getElementById('profitTarget').value) || 5;
   const payload = { spreads: allSpreads, spot: currentSpot, symbol: currentSymbol,
-                    rfRate: rf, movePct: mp, profitTargetPct: pt, ts: Date.now() };
+                    rfRate: rf, movePct: mp, moveBasis: mb, profitTargetPct: pt, ts: Date.now() };
   try { localStorage.setItem('finderScatterData', JSON.stringify(payload)); return true; }
   catch (e) { return false; }
 }
@@ -3171,8 +3219,8 @@ async function doSearch() {
   const symbol = document.getElementById('ticker').value.trim().toUpperCase();
   if (!symbol) { showError('Please enter a ticker symbol.'); return; }
   const maxPremiumDollars = parseFloat(document.getElementById('maxPremium').value);
-  const minLeverage = parseFloat(document.getElementById('minLeverage').value);
-  const minReturn1sigma = parseFloat(document.getElementById('minReturn1sigma').value) || 0;
+  const moveBasis = document.getElementById('moveBasis').value === 'sigma' ? 'sigma' : 'pct';
+  const minMoveReturn = parseFloat(document.getElementById('minMoveReturn').value) || 0;
   const maxWidth = parseFloat(document.getElementById('maxWidth').value);
   const maxOtm = parseFloat(document.getElementById('maxOtm').value);
   const riskFreeRate = parseFloat(document.getElementById('riskFreeRate').value) / 100;
@@ -3201,10 +3249,6 @@ async function doSearch() {
     showError('Please enter a valid max premium greater than 0.');
     return;
   }
-  if (isNaN(minLeverage) || minLeverage <= 0) {
-    showError('Please enter a valid min leverage greater than 0.');
-    return;
-  }
   if (isNaN(maxWidth) || maxWidth <= 0) {
     showError('Please enter a valid max width greater than 0.');
     return;
@@ -3223,8 +3267,8 @@ async function doSearch() {
       symbol: symbol,
       min_premium: minPremium,
       max_premium: maxPremium,
-      min_leverage: minLeverage,
-      min_return_1sigma: minReturn1sigma,
+      move_basis: moveBasis,
+      min_move_return: minMoveReturn,
       max_width: maxWidth,
       max_otm: maxOtm,
       risk_free_rate: riskFreeRate,
@@ -3257,7 +3301,8 @@ async function doSearch() {
     document.getElementById('statusSpot').textContent = '$' + data.spot.toLocaleString('en-US', {minimumFractionDigits: 2});
     if (data.movePct !== undefined && data.movePct !== null) {
       const mp = Number(data.movePct);
-      const label = (Number.isInteger(mp) ? mp.toFixed(0) : mp.toString()) + '%';
+      const num = (Number.isInteger(mp) ? mp.toFixed(0) : mp.toString());
+      const label = (data.moveBasis === 'sigma') ? (num + 'σ') : (num + '%');
       document.getElementById('rocMoveHeader').innerHTML = 'Return @ +' + label;
     }
     if (data.profitTargetPct !== undefined && data.profitTargetPct !== null) {
@@ -5145,7 +5190,7 @@ SCATTER_PAGE = r"""<!DOCTYPE html>
 <div class="row-tooltip" id="tip"></div>
 <script>
 // ---- data handed over from the finder via localStorage ----
-let spreads = [], currentSpot = null, currentSymbol = '', rfRate = 0.045, movePct = 1, targetPct = 5;
+let spreads = [], currentSpot = null, currentSymbol = '', rfRate = 0.045, movePct = 1, moveBasis = 'pct', targetPct = 5;
 let panelsReady = false;
 function loadScatterData() {
   try {
@@ -5156,6 +5201,7 @@ function loadScatterData() {
       currentSpot = d.spot; currentSymbol = d.symbol || '';
       rfRate = (d.rfRate != null ? d.rfRate : 0.045);
       movePct = (d.movePct != null ? d.movePct : 1);
+      moveBasis = (d.moveBasis === 'sigma' ? 'sigma' : 'pct');
       targetPct = (d.profitTargetPct != null ? d.profitTargetPct : 5);
     }
   } catch (e) {}
@@ -5163,7 +5209,7 @@ function loadScatterData() {
 loadScatterData();
 
 // ---- plottable columns (mirror the results table) ----
-const mvLbl = (Number.isInteger(movePct) ? movePct : movePct) + '%';
+const mvLbl = movePct + (moveBasis === 'sigma' ? 'σ' : '%');
 const COLS = [
   {key:'score',        label:'Score (0-100)',      get:s=>s.score},
   {key:'leverage',     label:'Leverage (x)',       get:s=>s.leverage},
@@ -5323,7 +5369,7 @@ function initPanel(idx, defs) {
 // Recovery-move % and profit-target % are baked into a few axis labels; refresh
 // them (and the already-rendered <option> text) whenever fresh data arrives.
 function updateDynamicLabels() {
-  const mv = movePct + '%';
+  const mv = movePct + (moveBasis === 'sigma' ? 'σ' : '%');
   colByKey.returnAtMove.label = 'Return @ +' + mv;
   colByKey.pnlMove.label = 'P&L @' + mv + ' $';
   colByKey.probTarget.label = 'P(+' + targetPct + '%)';
@@ -6290,7 +6336,6 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             min_premium = float(params.get("min_premium", [0])[0])
             max_premium = float(params.get("max_premium", [20])[0])
-            min_leverage = float(params.get("min_leverage", [2])[0])
             max_width = float(params.get("max_width", [100])[0])
             max_otm = float(params.get("max_otm", [5.0])[0])
             risk_free_rate = float(params.get("risk_free_rate", [0.045])[0])
@@ -6305,14 +6350,26 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             move_pct = float(params.get("move_pct", [1.0])[0])
             profit_target_pct = float(params.get("profit_target_pct", [5.0])[0])
             min_gamma = float(params.get("min_gamma", [0.0])[0])
-            min_return_1sigma = float(params.get("min_return_1sigma", [0.0])[0])
+            # Unified move-return screen (replaces min_leverage + min_return_1sigma).
+            # Back-compat: an old client/template that still sends min_leverage maps to the
+            # equivalent pct-basis threshold (leverage L == L% return on a +1% move).
+            move_basis = params.get("move_basis", ["pct"])[0].strip().lower()
+            if move_basis not in ("pct", "sigma"):
+                move_basis = "pct"
+            if "min_move_return" in params:
+                min_move_return = float(params.get("min_move_return", [0.0])[0])
+            elif "min_leverage" in params:
+                move_basis = "pct"
+                min_move_return = float(params.get("min_leverage", [0.0])[0])
+            else:
+                min_move_return = 0.0
             test_mode = params.get("test", ["0"])[0].lower() in ("1", "true", "test", "on")
 
             try:
                 print(f"\n{'='*60}")
-                print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_leverage={min_leverage}x, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_short_leg_delta=${min_short_leg_delta}, move_pct={move_pct}%, expiration={expiration_filter}")
+                print(f"Searching {symbol}: premium=${min_premium}-${max_premium}, min_move_return={min_move_return}% on {move_basis} move={move_pct}, max_width={max_width}pts, max_otm={max_otm}%, r={risk_free_rate:.3f}, min_delta={min_net_delta}, min_rr={min_reward_risk}, commission=${commission}, min_dte={min_dte}, max_leg_premium=${max_leg_premium}, min_short_leg_delta=${min_short_leg_delta}, expiration={expiration_filter}")
                 print(f"{'='*60}")
-                result = fetch_and_find_spreads(min_premium, max_premium, min_leverage, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta, min_return_1sigma, test_mode)
+                result = fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta, move_basis, test_mode)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
 
                 self.send_response(200)
