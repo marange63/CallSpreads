@@ -5473,6 +5473,13 @@ CURVE_PAGE = r"""<!DOCTYPE html>
      over the slider strip below. */
   .plot-greeks { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden;
                  border-top: 1px solid var(--border); }
+  /* Bottom-pane mode toggle, overlaid top-left of the greeks pane. */
+  .seg-mini { position: absolute; top: 6px; left: 8px; z-index: 3;
+              display: flex; border: 1px solid var(--border); border-radius: 6px;
+              overflow: hidden; background: var(--surface); }
+  .seg-mini button { background: transparent; border: 0; color: var(--text-dim);
+              font-family: var(--font); font-size: 11px; padding: 3px 9px; cursor: pointer; }
+  .seg-mini button.on { background: var(--accent); color: #fff; }
 
   /* Slider strip — same shape as the finder's score-weight sliders */
   .sliders { display: flex; gap: 26px; flex-wrap: wrap; padding: 10px 20px;
@@ -5520,7 +5527,13 @@ CURVE_PAGE = r"""<!DOCTYPE html>
 <div id="main" style="display:none;">
   <div id="left">
     <div class="plot" id="plot"></div>
-    <div class="plot-greeks" id="plotG"></div>
+    <div class="plot-greeks" id="plotG">
+      <div class="seg-mini" id="greeksSeg">
+        <button id="gmGreeks" class="on" onclick="setGreeksMode('greeks')" title="Net delta ($ per point of spot) and gamma across spot.">&Delta; / &Gamma;</button>
+        <button id="gmLev" onclick="setGreeksMode('leverage')" title="Leverage: % change in the spread's value for a +1% move in spot, at each spot along the x-axis (its value at that spot is the base).">Leverage</button>
+      </div>
+      <div id="plotGsvg" style="width:100%;height:100%;"></div>
+    </div>
     <div class="sliders">
       <div class="sl">
         <div class="top"><label for="slSpot">Spot price</label><span class="val" id="vSpot">--</span></div>
@@ -5544,6 +5557,7 @@ CURVE_PAGE = r"""<!DOCTYPE html>
     <div class="ro"><span class="k">Return</span><span class="v" id="roRet">--</span></div>
     <div class="ro"><span class="k">Delta ($/pt)</span><span class="v" id="roDelta">--</span></div>
     <div class="ro"><span class="k">Gamma</span><span class="v" id="roGamma">--</span></div>
+    <div class="ro"><span class="k">Leverage (1%)</span><span class="v" id="roLev">--</span></div>
 
     <h2>Breakeven</h2>
     <div class="ro"><span class="k">At these sliders</span><span class="v" id="roBeLive">--</span></div>
@@ -5695,24 +5709,26 @@ function initGreeks() {
     <line id="ggK2" stroke="#2e3348" stroke-width="1" stroke-dasharray="3,3"/>
     <path id="deltaPath" fill="none" stroke="#34d399" stroke-width="2.25"/>
     <path id="gammaPath" fill="none" stroke="#c084fc" stroke-width="2.25"/>
+    <path id="levPath" fill="none" stroke="#f59e0b" stroke-width="2.25" opacity="0"/>
     <line id="ggSpotNow" stroke="#4f8ff7" stroke-width="1.5" stroke-dasharray="5,3"/>
     <line id="ggWhatIf" stroke="#fbbf24" stroke-width="1.5"/>
     <line id="ggCross" stroke="#8b8fa3" stroke-width="1" stroke-dasharray="2,2" opacity="0"/>
     <circle id="deltaDot" r="4" fill="#34d399" opacity="0"/>
     <circle id="gammaDot" r="4" fill="#c084fc" opacity="0"/>
+    <circle id="levDot" r="4" fill="#f59e0b" opacity="0"/>
     <g id="ggXTicks"></g>
     <g id="ggYTicksL"></g>
     <g id="ggYTicksR"></g>
     <text id="ggLegend" font-size="11" font-family="sans-serif"></text>
     <rect id="ggHit" x="${PADG.l}" y="${PADG.t}" width="${W-PADG.l-PADG.r}" height="${HG-PADG.t-PADG.b}" fill="transparent"/>
   </svg>`;
-  document.getElementById('plotG').innerHTML = svg;
+  document.getElementById('plotGsvg').innerHTML = svg;
   const g = (id) => document.getElementById(id);
   els.g = {
     yGrid: g('ggYGrid'), zero: g('ggZero'), k1: g('ggK1'), k2: g('ggK2'),
-    delta: g('deltaPath'), gamma: g('gammaPath'), spotNow: g('ggSpotNow'),
+    delta: g('deltaPath'), gamma: g('gammaPath'), lev: g('levPath'), spotNow: g('ggSpotNow'),
     whatIf: g('ggWhatIf'), cross: g('ggCross'), deltaDot: g('deltaDot'), gammaDot: g('gammaDot'),
-    xTicks: g('ggXTicks'), yTicksL: g('ggYTicksL'), yTicksR: g('ggYTicksR'),
+    levDot: g('levDot'), xTicks: g('ggXTicks'), yTicksL: g('ggYTicksL'), yTicksR: g('ggYTicksR'),
     legend: g('ggLegend'), hit: g('ggHit'),
   };
   els.g.hit.addEventListener('mousemove', (e) => {
@@ -5756,9 +5772,38 @@ function greekAt(S, days, ivShift) {
   return {delta: (up - dn) / (2 * h), gamma: (up - 2 * v + dn) / (h * h)};
 }
 
+// Leverage at spot S: the % change in the spread's value for a +1% move in the
+// underlying, per 1% of move — i.e. the value's elasticity to spot (size- and
+// multiplier-independent, since contracts/×100 cancel in the ratio). Same shape
+// as the Finder's Leverage column, evaluated at each spot along the x-axis.
+// null where the spread is worth ~nothing (elasticity blows up meaninglessly).
+function levAt(S, days, ivShift) {
+  const v = valueAt(S, days, ivShift);
+  const floor = Math.max(1, (d.maxProfit || 0) * 0.002);
+  if (v <= floor) return null;
+  const up = valueAt(S * 1.01, days, ivShift);
+  return (up - v) / v / 0.01;
+}
+
+// Bottom-pane mode: 'greeks' (net delta + gamma, default) or 'leverage'.
+let greeksMode = 'greeks';
+try { const gm = localStorage.getItem('curveGreeksMode'); if (gm === 'leverage') greeksMode = gm; } catch (e) {}
+function setGreeksMode(m) {
+  greeksMode = (m === 'leverage') ? 'leverage' : 'greeks';
+  try { localStorage.setItem('curveGreeksMode', greeksMode); } catch (e) {}
+  const gb = document.getElementById('gmGreeks'), lb = document.getElementById('gmLev');
+  if (gb) gb.classList.toggle('on', greeksMode === 'greeks');
+  if (lb) lb.classList.toggle('on', greeksMode === 'leverage');
+  scheduleRedraw();
+}
+
 function redrawGreeks(days, ivShift) {
   if (!els.g) return;
   const g = els.g;
+  if (greeksMode === 'leverage') { redrawLeverage(days, ivShift); return; }
+  // Delta/gamma mode owns these; leverage mode hides them (and vice versa).
+  g.lev.setAttribute('opacity', '0'); g.levDot.setAttribute('opacity', '0');
+  g.delta.setAttribute('opacity', '1'); g.gamma.setAttribute('opacity', '1');
   const n = 240, xs = [], del = [], gam = [];
   let dHi = 0, gLo = 0, gHi = 0;
   for (let i = 0; i <= n; i++) {
@@ -5836,6 +5881,87 @@ function redrawGreeks(days, ivShift) {
   g.legend.setAttribute('text-anchor', 'middle');
   g.legend.innerHTML = `<tspan fill="#34d399">━ net delta ($/pt)</tspan>`
     + `<tspan fill="#8b8fa3">   ·   </tspan><tspan fill="#c084fc">━ gamma ($/pt²)</tspan>`;
+}
+
+// Leverage pane: one amber curve of levAt(S) across the same spot axis. Shares
+// the x-scale, strike lines and spot markers with the delta/gamma pane; a single
+// left axis in units of "× (value moves N% per +1% spot)". Spikes at the deep-OTM
+// edge are clamped to a p95 top so the readable body isn't crushed.
+function redrawLeverage(days, ivShift) {
+  const g = els.g;
+  g.delta.setAttribute('opacity', '0'); g.gamma.setAttribute('opacity', '0');
+  g.deltaDot.setAttribute('opacity', '0'); g.gammaDot.setAttribute('opacity', '0');
+  g.lev.setAttribute('opacity', '1');
+
+  const n = 240, xs = [], lv = [], finite = [];
+  for (let i = 0; i <= n; i++) {
+    const S = dom.xMin + (dom.xMax - dom.xMin) * i / n;
+    const L = levAt(S, days, ivShift);
+    xs.push(S); lv.push(L);
+    if (L !== null && isFinite(L)) finite.push(L);
+  }
+  // Top of the axis: p95 of the finite leverages (+ headroom), so a deep-OTM
+  // spike doesn't set the scale. Floor of 1 keeps a sane axis when flat.
+  let hi = 1;
+  if (finite.length) {
+    const sorted = finite.slice().sort((a, b) => a - b);
+    hi = Math.max(1, sorted[Math.floor(sorted.length * 0.95)] * 1.12);
+  }
+  const ph = HG - PADG.t - PADG.b;
+  const yL = (v) => PADG.t + (1 - Math.max(0, Math.min(v, hi)) / hi) * ph;
+
+  // Build the path, restarting after any null gap (deep-OTM edge).
+  let dseg = '', pen = false;
+  for (let i = 0; i <= n; i++) {
+    if (lv[i] === null || !isFinite(lv[i])) { pen = false; continue; }
+    dseg += (pen ? 'L' : 'M') + xScale(xs[i]).toFixed(1) + ',' + yL(lv[i]).toFixed(1) + ' ';
+    pen = true;
+  }
+  g.lev.setAttribute('d', dseg.trim());
+
+  // Zero baseline at the axis floor.
+  const yz = yL(0);
+  g.zero.setAttribute('x1', PADG.l); g.zero.setAttribute('x2', W - PADG.r);
+  g.zero.setAttribute('y1', yz); g.zero.setAttribute('y2', yz);
+
+  for (const [el, K] of [[g.k1, d.K1], [g.k2, d.K2]]) {
+    const x = xScale(K);
+    el.setAttribute('x1', x); el.setAttribute('x2', x);
+    el.setAttribute('y1', PADG.t); el.setAttribute('y2', HG - PADG.b);
+  }
+  const vline = (el, x, show) => {
+    el.setAttribute('x1', x); el.setAttribute('x2', x);
+    el.setAttribute('y1', PADG.t); el.setAttribute('y2', HG - PADG.b);
+    el.setAttribute('opacity', show ? '1' : '0');
+  };
+  vline(g.spotNow, xScale(d.spot), true);
+  const S = +document.getElementById('slSpot').value;
+  const step = +document.getElementById('slSpot').step || 1;
+  vline(g.whatIf, xScale(S), Math.abs(S - d.spot) > step / 2);
+
+  // Marker dot + crosshair at the active spot (cursor if hovering, else slider).
+  const aS = hoverS !== null ? hoverS : S;
+  const aL = levAt(aS, days, ivShift);
+  if (aL !== null && isFinite(aL)) {
+    g.levDot.setAttribute('cx', xScale(aS)); g.levDot.setAttribute('cy', yL(aL));
+    g.levDot.setAttribute('opacity', '1');
+  } else {
+    g.levDot.setAttribute('opacity', '0');
+  }
+  vline(g.cross, xScale(aS), hoverS !== null);
+
+  g.xTicks.innerHTML = niceTicks(dom.xMin, dom.xMax, 8).map(v =>
+    `<text x="${xScale(v).toFixed(1)}" y="${HG - PADG.b + 15}" fill="#8b8fa3" font-size="10" text-anchor="middle" font-family="sans-serif">${fmtK(v)}</text>`
+  ).join('');
+  g.yTicksL.innerHTML = niceTicks(0, hi, 4).map(v =>
+    `<text x="${PADG.l - 8}" y="${(yL(v) + 3).toFixed(1)}" fill="#f59e0b" font-size="10" text-anchor="end" font-family="sans-serif">${v.toFixed(1)}×</text>`
+    + `<line x1="${PADG.l}" y1="${yL(v).toFixed(1)}" x2="${W - PADG.r}" y2="${yL(v).toFixed(1)}" stroke="#1a1d27" stroke-width="1"/>`
+  ).join('');
+  g.yTicksR.innerHTML = '';
+  g.legend.setAttribute('x', (PADG.l + W - PADG.r) / 2);
+  g.legend.setAttribute('y', PADG.t - 3);
+  g.legend.setAttribute('text-anchor', 'middle');
+  g.legend.innerHTML = `<tspan fill="#f59e0b">━ leverage (× value per +1% spot)</tspan>`;
 }
 
 let rafPending = false;
@@ -5963,6 +6089,8 @@ function updateReadouts(S, days, ivShift, be, hovering) {
   const up = valueAt(S + h, days, ivShift), dn = valueAt(S - h, days, ivShift);
   g('roDelta').textContent = fmt0((up - dn) / (2 * h));
   g('roGamma').textContent = ((up - 2 * v + dn) / (h * h)).toFixed(2);
+  const L = levAt(S, days, ivShift);
+  g('roLev').textContent = (L === null || !isFinite(L)) ? '--' : L.toFixed(1) + '×';
 
   g('roBeLive').textContent = be === null ? '--' : fmtPts(be);
   g('roBeMove').textContent = be === null ? '--'
@@ -6073,6 +6201,7 @@ function applyData(firstRun) {
     sl.value = d.spot; slD.value = d.dte;
     try { const m = localStorage.getItem('curveYMode'); if (m === 'value' || m === 'pnl') mode = m; } catch (e) {}
     setMode(mode);
+    setGreeksMode(greeksMode);   // sync the bottom-pane toggle buttons to the saved choice
   } else if (wasAtNow) {
     sl.value = d.spot;                        // still tracking the market
     if (+slD.value > d.dte) slD.value = d.dte;  // never allow more time than is left

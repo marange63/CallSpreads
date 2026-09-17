@@ -1,0 +1,25 @@
+# Create with:  conda env create -f environment.yml
+#
+# Generated 2026-09-10, and built the same day.
+#
+# Until then CallSpreads had no environment of its own: its dependencies lived
+# in the Anaconda base environment, and the PyCharm interpreter pointed at the
+# base root. The pins below are the versions base was carrying at the time.
+#
+# Both consumers now use this environment. "Launch CallSpreads.bat" activates it
+# instead of reaching for the `py` launcher, and the PyCharm interpreter points
+# at C:\Users\wamfo\anaconda3\envs\CallSpreads.
+
+name: CallSpreads
+channels:
+  - defaults
+dependencies:
+  # The app is pure stdlib http.server plus the four pins below, so the patch
+  # level is not load-bearing. The built environment landed on 3.13.15.
+  - python=3.13
+  - pip
+  - pip:
+      - yfinance==1.3.0
+      - pandas==2.3.3
+      - numpy==2.3.5
+      - matplotlib==3.10.6

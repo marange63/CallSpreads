@@ -23,7 +23,8 @@ A personal tool for finding and monitoring **call debit spreads** on US equity/i
 - Backend entry points: `fetch_and_find_spreads(...)` (Finder scan) and `fetch_position_quotes(...)` (monitor). Shared Black-Scholes toolkit (`bs_call_price`, `bs_call_delta`, `bs_gamma`, `bs_vega`, `bs_call_theta`, `implied_vol`) is defined once near the top and reused by both.
 
 ## Running & testing
-- Launch: `Launch CallSpreads.bat`, or `python spx_call_spread_finder.py`. It **auto-detects a free port** starting at 8765 and prints a banner with the URL.
+- **Environment:** conda env `CallSpreads` — interpreter `C:\Users\wamfo\anaconda3\envs\CallSpreads\python.exe` (Python 3.13). Dependencies are in `environment.yml`. Do **not** use the `py` launcher (reaches Python 3.14) or `python` on PATH (reaches the Anaconda base env); neither is what this app runs on.
+- Launch: `Launch CallSpreads.bat`, which activates that env for you. To run it by hand, `conda activate CallSpreads` first, then `python spx_call_spread_finder.py`. It **auto-detects a free port** starting at 8765 and prints a banner with the URL.
 - The startup banner uses box-drawing characters; `main()` reconfigures stdout/stderr to UTF-8 so redirecting output to a file works. If you invoke Python yourself in a cp1252 shell, set `PYTHONIOENCODING=utf-8`.
 - Quotes come from **Yahoo via `yfinance`** (auto-installed if missing). Option quotes are **~15 min delayed**; the underlying `regularMarketPrice` is fresher.
 - **Yahoo rate-limits repeated option-chain scans** — heavy back-to-back Finder scans during testing will start hanging/returning empty. Space them out; prefer verifying page structure (serving `/` doesn't hit Yahoo) over repeated live scans.
