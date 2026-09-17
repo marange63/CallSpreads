@@ -22,7 +22,7 @@ import time
 import uuid
 import webbrowser
 import socketserver
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.request
 from urllib.parse import urlparse, parse_qs
@@ -123,6 +123,36 @@ def bs_call_theta(S, K, T, r, sigma):
             - r * K * math.exp(-r * T) * norm_cdf(d2))
 
 
+# --- Put variants (put-call parity) -------------------------------------
+# Only the chain screen (/omon) needs these; the spread machinery is all calls.
+# gamma and vega are identical for puts, so bs_gamma / bs_vega serve both.
+
+
+def bs_put_price(S, K, T, r, sigma):
+    """Black-Scholes put price: call - S + K*exp(-rT)."""
+    if T <= 0:
+        return max(K - S, 0.0)
+    if sigma <= 0:
+        return max(K * math.exp(-r * T) - S, 0.0)
+    return bs_call_price(S, K, T, r, sigma) - S + K * math.exp(-r * T)
+
+
+def bs_put_delta(S, K, T, r, sigma):
+    """Black-Scholes put delta = call delta - 1 (negative)."""
+    if T <= 0 or sigma <= 0:
+        return -1.0 if S < K else 0.0
+    return bs_call_delta(S, K, T, r, sigma) - 1.0
+
+
+def bs_put_theta(S, K, T, r, sigma):
+    """Black-Scholes theta per year for a European put. Divide by 365 for
+    per-day. Parity: put theta = call theta + r*K*exp(-rT)."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    return (bs_call_theta(S, K, T, r, sigma)
+            + r * K * math.exp(-r * T))
+
+
 def implied_vol(price, S, K, T, r, max_iter=50, tol=1e-6):
     """
     Back out implied volatility from an option's market price using
@@ -165,6 +195,20 @@ def implied_vol(price, S, K, T, r, max_iter=50, tol=1e-6):
         else:
             lo = mid
     return (lo + hi) / 2.0
+
+
+def implied_vol_put(price, S, K, T, r, max_iter=50, tol=1e-6):
+    """IV of a put from its market price.
+
+    Parity makes this exact with no second solver: a put at `price` has the
+    same vol as the call at C = P + S - K*exp(-rT), so convert and reuse
+    implied_vol. A put marked below its own intrinsic converts to a call below
+    *its* intrinsic, which implied_vol already rejects with None.
+    """
+    if T <= 0 or price <= 0:
+        return None
+    return implied_vol(price + S - K * math.exp(-r * T), S, K, T, r,
+                       max_iter, tol)
 
 
 # ---------------------------------------------------------------------------
@@ -363,24 +407,30 @@ def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
 # two-sided quotes are persisted as they're fetched and reloaded at startup, so
 # a Friday-session cache survives restarts and powers weekend Test-mode scans.
 # Emptied (memory AND disk) only via the "Clear cache" button.
-_TEST_CHAIN_CACHE = {}   # (source, symbol, exp) -> chain snapshot (SimpleNamespace)
+_TEST_CHAIN_CACHE = {}   # (source, symbol, exp, sides) -> chain snapshot (SimpleNamespace)
 _TEST_EXP_CACHE = {}     # (source, symbol) -> expirations tuple
 
 CHAIN_CACHE_FILE = Path(__file__).parent / "chain_cache.pkl"
-CHAIN_CACHE_VERSION = 2   # v1 keys had no source prefix (pre-PriceSource, all Yahoo)
+CHAIN_CACHE_VERSION = 3   # v1: no source prefix (pre-PriceSource, all Yahoo); v2: no sides suffix
 
 
 def _chain_has_live_quotes(oc):
-    """True if at least one call row shows a two-sided market (bid & ask > 0).
+    """True if at least one option row shows a two-sided market (bid & ask > 0).
 
     Yahoo zeroes bids/asks outside market hours (worst on weekends); such a
     chain is useless for spread-building and must not overwrite a good cache.
+    Either side counts, since a sides="both" snapshot may carry puts.
     """
-    try:
-        c = oc.calls
-        return bool(((c["bid"] > 0) & (c["ask"] > 0)).any())
-    except Exception:
-        return False
+    for attr in ("calls", "puts"):
+        try:
+            df = getattr(oc, attr, None)
+            if df is None or df.empty:
+                continue
+            if bool(((df["bid"] > 0) & (df["ask"] > 0)).any()):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _save_chain_cache():
@@ -409,12 +459,17 @@ def _load_chain_cache():
             payload = pickle.load(f)
         chains = payload.get("chains", {})
         exps = payload.get("exps", {})
-        if payload.get("version", 1) < 2:
+        version = payload.get("version", 1)
+        if version < 2:
             # v1 predates the PriceSource layer: keys were (symbol, exp) /
             # symbol and all data was Yahoo's by construction. Prefix in place
             # so a captured Friday cache survives the upgrade.
             chains = {("yahoo",) + k: v for k, v in chains.items()}
             exps = {("yahoo", k): v for k, v in exps.items()}
+        if version < 3:
+            # v2 predates the puts-capable `sides` key component. Everything
+            # cached then was a calls-only fetch by construction.
+            chains = {k + ("call",): v for k, v in chains.items()}
         _TEST_CHAIN_CACHE.update(chains)
         _TEST_EXP_CACHE.update(exps)
         return len(chains)
@@ -478,13 +533,30 @@ def _last_trade_epoch(row):
         return None
 
 
-def get_option_chain(symbol, exp, test_mode=False):
+def _fetch_chain(src, symbol, exp, sides):
+    """Chain fetch that tolerates a vendor subclass predating the `sides` kwarg.
+
+    CLAUDE.md promises a new vendor needs only get_expirations +
+    get_option_chain; a class written against the old two-argument signature
+    would TypeError here, so fall back to a calls-only fetch rather than fail.
+    """
+    try:
+        return src.get_option_chain(symbol, exp, sides=sides)
+    except TypeError:
+        return src.get_option_chain(symbol, exp)
+
+
+def get_option_chain(symbol, exp, test_mode=False, sides="call"):
     src = get_source()
     if test_mode:
-        key = (src.name, symbol, exp)
+        key = (src.name, symbol, exp, sides)
         oc = _TEST_CHAIN_CACHE.get(key)
+        # A both-sides snapshot also satisfies a calls-only request, so an OMON
+        # fetch warms the Finder's cache for free (never the reverse).
+        if oc is None and sides == "call":
+            oc = _TEST_CHAIN_CACHE.get((src.name, symbol, exp, "both"))
         if oc is None:
-            oc = src.get_option_chain(symbol, exp)
+            oc = _fetch_chain(src, symbol, exp, sides)
             _TEST_CHAIN_CACHE[key] = oc
             # Persist only chains with a live two-sided market so a weekend /
             # after-hours fetch (zeroed bid/ask) can't poison the disk cache.
@@ -492,7 +564,7 @@ def get_option_chain(symbol, exp, test_mode=False):
             if _chain_has_live_quotes(oc):
                 _save_chain_cache()
         return oc
-    return src.get_option_chain(symbol, exp)
+    return _fetch_chain(src, symbol, exp, sides)
 
 
 def get_expirations(symbol, test_mode=False):
@@ -1390,7 +1462,7 @@ def _leg_snapshot(row):
             "_iv_raw": iv}
 
 
-def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
+def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv, right="call"):
     """Best-usable IV for one leg of a monitored spread, as (iv, source).
 
     Yahoo reports a near-zero impliedVolatility for contracts with no live
@@ -1406,6 +1478,9 @@ def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
     chart can say when it is drawing a fallback: on the "atm" rung both legs
     share one vol and the spread's skew is gone, which a bare curve would
     otherwise present as though it were the real surface.
+
+    `right` ("call"/"put") only selects the solver used on the "implied" rung;
+    it exists for the /omon chain screen, the one caller that prices puts.
     """
     iv = leg.get("_iv_raw")
     if iv and iv >= MIN_TRUSTED_IV and leg.get("quotedMid"):
@@ -1414,7 +1489,8 @@ def _trusted_leg_iv(leg, spot, strike, T, r, atm_iv):
         return atm_iv, "atm"
     mark = leg.get("mid")
     if spot and mark and mark > 0 and T > 0:
-        implied = implied_vol(mark, spot, strike, T, r)
+        solve = implied_vol_put if right == "put" else implied_vol
+        implied = solve(mark, spot, strike, T, r)
         if implied and implied >= MIN_TRUSTED_IV:
             return implied, "implied"
     return iv, "raw"
@@ -2105,6 +2181,159 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
 
 
 # ---------------------------------------------------------------------------
+# Option chain screen (/omon) — one expiration, calls | strike | puts
+# ---------------------------------------------------------------------------
+
+
+def _chain_side_rows(df):
+    """{strike: row} for an option DataFrame, or {} when there is no side."""
+    if df is None or getattr(df, "empty", True):
+        return {}
+    return {float(r["strike"]): r for _, r in df.iterrows()}
+
+
+def _chain_leg_view(row, right, spot, strike, T, r, atm_iv, ref_iv, as_of):
+    """One side of one strike, quotes + greeks, as a JSON-ready dict.
+
+    Greeks use the strike's OWN trusted IV (the real surface). `theo` instead
+    prices the strike at `ref_iv` — a single flat reference vol for the whole
+    expiration — so `theoDiff` (mid - theo) reads as the skew premium the
+    market charges for this strike, not as a mispricing.
+    """
+    leg = _leg_snapshot(row)
+    iv, iv_source = _trusted_leg_iv(leg, spot, strike, T, r, atm_iv, right=right)
+    price_fn = bs_put_price if right == "put" else bs_call_price
+    delta_fn = bs_put_delta if right == "put" else bs_call_delta
+    theta_fn = bs_put_theta if right == "put" else bs_call_theta
+
+    out = dict(leg)
+    out.pop("_iv_raw", None)
+    try:
+        oi_raw = float(row["openInterest"])
+        out["openInterest"] = 0 if math.isnan(oi_raw) else int(oi_raw)
+    except Exception:
+        out["openInterest"] = 0
+    # Show the vol the greeks were actually computed with, not the raw vendor
+    # value — otherwise a wing priced off the ATM fallback shows greeks beside
+    # a blank IV. `ivSource` says which rung it came from so nothing is hidden.
+    out["iv"] = round(iv * 100, 1) if iv else None
+    out["ivSource"] = iv_source
+    lt = leg.get("lastTrade")
+    out["stale"] = bool(lt and as_of - lt > STALE_TRADE_AGE_SECS)
+
+    if iv and iv > 0 and T > 0 and spot:
+        out["delta"] = round(delta_fn(spot, strike, T, r, iv), 4)
+        out["gamma"] = round(bs_gamma(spot, strike, T, r, iv), 6)
+        # Per DAY (the toolkit returns per year) and per 1 vol POINT (per the
+        # repo's "$ per 1 vol-point" vega convention).
+        out["theta"] = round(theta_fn(spot, strike, T, r, iv) / 365.0, 4)
+        out["vega"] = round(bs_vega(spot, strike, T, r, iv) / 100.0, 4)
+    else:
+        out["delta"] = out["gamma"] = out["theta"] = out["vega"] = None
+
+    if ref_iv and ref_iv > 0 and T > 0 and spot:
+        theo = price_fn(spot, strike, T, r, ref_iv)
+        out["theo"] = round(theo, 3)
+        out["theoDiff"] = (round(leg["mid"] - theo, 3)
+                           if leg.get("mid") is not None else None)
+    else:
+        out["theo"] = out["theoDiff"] = None
+    return out
+
+
+def compute_chain_view(symbol="^SPX", exp=None, test_mode=False,
+                       risk_free_rate=None):
+    """Full option chain for ONE expiration, aligned calls-vs-puts by strike.
+
+    Costs one expirations call plus one chain call (both test-cacheable), and
+    returns EVERY listed strike — the page windows around ATM client-side, so
+    widening the view never costs another vendor request.
+    """
+    if risk_free_rate is None:
+        risk_free_rate = RISK_FREE_RATE_PCT / 100.0
+    src = get_source()
+
+    expirations = list(get_expirations(symbol, test_mode))
+    if not expirations:
+        raise ValueError(f"No listed options found for {symbol}")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if exp not in expirations:
+        # Default to the nearest expiration on/after today (else the last one).
+        future = [e for e in expirations if e >= today]
+        exp = future[0] if future else expirations[-1]
+
+    oc = get_option_chain(symbol, exp, test_mode, sides="both")
+    calls = getattr(oc, "calls", None)
+    puts = getattr(oc, "puts", None)
+    has_puts = puts is not None and not getattr(puts, "empty", True)
+
+    spot, quote_time, prev_close = _underlying_spot_and_time(oc, symbol)
+    if not spot:
+        raise ValueError(f"Could not determine spot price for {symbol}")
+
+    # Time to expiry: FRACTIONAL here, unlike the Finder's dte/365. The Finder
+    # only ever looks >= min_dte days out, so whole days are fine there; this
+    # screen routinely shows the front expiration, where truncating to whole
+    # days makes T = 0 for tomorrow's expiry and blanks every greek on the page.
+    # Options stop trading at 16:00 on the expiration date.
+    now = datetime.now()
+    exp_dt = datetime.strptime(exp, "%Y-%m-%d") + timedelta(hours=16)
+    dte = max(0, (datetime.strptime(exp, "%Y-%m-%d") - now).days)
+    T = max((exp_dt - now).total_seconds(), 0.0) / (365.0 * 86400.0)
+
+    # One flat reference vol for the whole expiration (see _chain_leg_view).
+    atm_iv_call = _atm_iv_from_calls(calls, spot)
+    atm_iv_put = _atm_iv_from_calls(puts, spot) if has_puts else None
+    ref_iv = atm_iv_call or atm_iv_put
+
+    as_of = getattr(oc, "fetched_at", None) or datetime.now().timestamp()
+    call_rows = _chain_side_rows(calls)
+    put_rows = _chain_side_rows(puts)
+    strikes = sorted(set(call_rows) | set(put_rows))
+    if not strikes:
+        raise ValueError(f"Chain for {symbol} {exp} came back empty")
+    atm_strike = min(strikes, key=lambda k: abs(k - spot))
+
+    rows = []
+    for k in strikes:
+        cr, pr = call_rows.get(k), put_rows.get(k)
+        rows.append({
+            "strike": k,
+            "call": (_chain_leg_view(cr, "call", spot, k, T, risk_free_rate,
+                                     atm_iv_call, ref_iv, as_of)
+                     if cr is not None else None),
+            "put": (_chain_leg_view(pr, "put", spot, k, T, risk_free_rate,
+                                    atm_iv_put or atm_iv_call, ref_iv, as_of)
+                    if pr is not None else None),
+        })
+
+    day_move = round(spot - prev_close, 2) if prev_close else None
+    return {
+        "symbol": symbol,
+        "expiration": exp,
+        "expirations": expirations,
+        "spot": round(spot, 2),
+        "quoteTime": quote_time,
+        "prevClose": round(prev_close, 2) if prev_close else None,
+        "dayMove": day_move,
+        "dayMovePct": (round(day_move / prev_close * 100, 2)
+                       if day_move is not None and prev_close else None),
+        "dte": dte,
+        "T": round(T, 6),
+        "riskFreeRatePct": round(risk_free_rate * 100, 2),
+        "atmIv": round(ref_iv * 100, 1) if ref_iv else None,
+        "atmStrike": atm_strike,
+        "hasPuts": has_puts,
+        "source": src.name,
+        "feed": src.get_feed(),
+        "fetchedAt": as_of,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "rows": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTML Frontend (embedded)
 # ---------------------------------------------------------------------------
 
@@ -2675,6 +2904,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="primary" id="searchBtn" onclick="doSearch()">Find Spreads</button>
     <button type="button" class="primary" id="scatterBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="openScatter()" title="Open a scatter plot of the current results in a new tab (pick any two columns for the axes).">&#128202; Scatter</button>
     <button type="button" class="primary" id="dipScanBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="window.open('/dip','_blank')" title="Open the Dip Scanner: rank a watchlist of large caps for pullbacks, then click one to screen it here.">&#128201; Dip Scanner</button>
+    <button type="button" class="primary" id="omonBtn" style="background:transparent;color:var(--accent);border:1px solid var(--accent);" onclick="openOmon()" title="Open the full option chain (OMON) for this ticker in a new tab: calls | strike | puts for one expiration, with greeks and an IV smile.">&#128203; Option Chain</button>
   </div>
 </div>
 <div class="controls collapsed" id="advancedFilters" style="border-top:none;padding-top:0;">
@@ -3186,6 +3416,16 @@ let _scatterStashTimer = null;
 function stashScatterDataSoon() {
   clearTimeout(_scatterStashTimer);
   _scatterStashTimer = setTimeout(stashScatterData, 200);
+}
+
+function openOmon() {
+  const t = document.getElementById('ticker').value.trim().toUpperCase();
+  if (!t) { showError('Enter a ticker first.'); return; }
+  // Window name derived from the ticker (the openCurve trick): re-clicking the
+  // same ticker refocuses its tab, while a different one opens its own, so two
+  // names can sit side by side.
+  window.open('/omon?ticker=' + encodeURIComponent(t),
+              'omon_' + t.replace(/[^A-Za-z0-9_]/g, '_'));
 }
 
 function openScatter() {
@@ -6443,6 +6683,439 @@ loadWatchlist();
 """
 
 
+# -------------------------------------------------------------------------
+# Option chain / OMON page (/omon)
+#
+# Self-contained static HTML like DIP_PAGE: no .replace() tokens. Every
+# number - greeks, IV, theo - arrives computed from /api/chain, so this page
+# needs no client-side Black-Scholes and must NOT carry a copy of BS_JS.
+# -------------------------------------------------------------------------
+OMON_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Option Chain</title>
+<style>
+  :root {
+    --bg:#0f1117; --surface:#1a1d27; --surface2:#242837; --border:#2e3348;
+    --text:#e4e6f0; --text-dim:#8b8fa3; --accent:#4f8ff7; --accent-hover:#6ba1ff;
+    --green:#34d399; --red:#f87171; --yellow:#fbbf24;
+    --font:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;
+    --mono:'SF Mono','Cascadia Code','Consolas',monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:var(--font); background:var(--bg); color:var(--text);
+         min-height:100vh; padding:18px 22px; }
+  h1 { font-size:20px; font-weight:600; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { color:var(--accent-hover); }
+  header { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
+  header .nav { margin-left:auto; font-size:13px; display:flex; gap:14px; }
+  .tag { font-size:11px; font-weight:600; padding:2px 8px; border-radius:10px;
+         background:var(--accent); color:#fff; vertical-align:middle; }
+  .sub { color:var(--text-dim); font-size:12px; }
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:10px;
+           padding:14px 16px; margin-bottom:16px; }
+  .panel h2 { font-size:13px; font-weight:600; color:var(--text-dim); text-transform:uppercase;
+              letter-spacing:.04em; margin-bottom:10px; }
+  .row { display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap; }
+  .fld { display:flex; flex-direction:column; gap:4px; }
+  .fld label { font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.03em; }
+  input, select { background:var(--bg); border:1px solid var(--border); border-radius:5px;
+                  color:var(--text); font-family:var(--mono); font-size:13px; padding:6px 8px; }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
+  input[type=checkbox] { width:15px; height:15px; accent-color:var(--yellow); }
+  button { background:var(--accent); color:#fff; border:none; border-radius:6px;
+           padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  button:hover { background:var(--accent-hover); }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .chk { display:flex; align-items:center; gap:6px; font-size:13px;
+         color:var(--text-dim); cursor:pointer; padding-bottom:6px; }
+  .spot { font-family:var(--mono); font-size:20px; color:var(--green); font-weight:600; }
+  .warn { background:rgba(251,191,36,.12); border:1px solid var(--yellow); color:var(--yellow);
+          border-radius:6px; padding:8px 12px; font-size:12px; margin-top:10px; display:none; }
+  .note { background:rgba(79,143,247,.10); border:1px solid var(--border); color:var(--text-dim);
+          border-radius:6px; padding:8px 12px; font-size:12px; margin-top:10px; display:none; }
+  .msg { color:var(--text-dim); font-size:13px; padding:14px 4px; }
+  .err { color:var(--red); font-size:13px; padding:14px 4px; }
+  .plot { width:100%; height:200px; }
+  .plot svg { display:block; width:100%; height:100%; }
+  .tbl-wrap { overflow:auto; max-height:calc(100vh - 340px); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { padding:4px 7px; text-align:right; white-space:nowrap;
+           border-bottom:1px solid var(--border); }
+  thead th { position:sticky; background:var(--surface); z-index:2; color:var(--text-dim);
+             font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:.03em; }
+  thead tr:first-child th { top:0; z-index:3; border-bottom:1px solid var(--border); }
+  thead tr:nth-child(2) th { top:23px; }
+  th.grp { text-align:center; font-size:11px; letter-spacing:.08em; color:var(--text); }
+  th.grp.calls { color:var(--green); }
+  th.grp.puts { color:var(--red); }
+  td { font-family:var(--mono); }
+  td.k, th.k { font-family:var(--mono); font-weight:700; text-align:center;
+               background:var(--surface2); color:var(--text); border-left:1px solid var(--border);
+               border-right:1px solid var(--border); }
+  tbody tr:hover td { background:rgba(79,143,247,.07); }
+  tbody tr:hover td.k { background:var(--border); }
+  td.itm { background:rgba(255,255,255,.035); }
+  tr.atm td { background:rgba(79,143,247,.14); }
+  tr.atm td.k { background:var(--accent); color:#fff; }
+  tr.atm td:first-child { box-shadow:inset 3px 0 0 var(--accent); }
+  .dim { color:var(--text-dim); }
+  .stale { color:var(--yellow); }
+  .neg { color:var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128203; Option Chain <span class="tag" id="modeTag">LIVE</span></h1>
+  <div class="spot"><span class="sub" id="spotLabel">--</span> <span id="spotPx">--</span></div>
+  <span class="sub" id="meta"></span>
+  <nav class="nav">
+    <a href="/" id="finderLink">Find spreads &#8594;</a>
+    <a href="/positions">My Positions</a>
+    <a href="/dip">Dip Scanner</a>
+  </nav>
+</header>
+
+<div class="panel">
+  <div class="row">
+    <div class="fld">
+      <label>Ticker</label>
+      <input type="text" id="ticker" value="^SPX" style="width:110px;text-transform:uppercase;">
+    </div>
+    <div class="fld">
+      <label>Expiration</label>
+      <select id="expSel" style="width:190px;"></select>
+    </div>
+    <button id="loadBtn" onclick="load()">Refresh</button>
+    <div class="fld">
+      <label>Strikes around ATM</label>
+      <input type="number" id="winN" value="10" min="1" max="200" step="1" style="width:80px;">
+    </div>
+    <label class="chk" title="Show every listed strike instead of a window around ATM. Costs no extra data - the whole chain is already loaded."><input type="checkbox" id="showAll"> All strikes</label>
+    <label class="chk" title="Show the gamma, theta and vega columns."><input type="checkbox" id="showGreeks" checked> Greeks</label>
+    <label class="chk" title="Test mode caches each chain so repeated loads reuse frozen data instead of re-fetching."><input type="checkbox" id="testMode"> Test mode</label>
+    <span class="sub" id="srcInfo"></span>
+  </div>
+  <div class="warn" id="billWarn"></div>
+  <div class="note" id="putNote"></div>
+</div>
+
+<div class="panel" id="smilePanel" style="display:none">
+  <h2>IV smile <span class="sub" style="text-transform:none;letter-spacing:0;font-weight:400;">&mdash;
+    IV % vs strike: <span style="color:var(--green)">OTM calls</span> /
+    <span style="color:var(--red)">OTM puts</span>. Quoted strikes only, so neither fallback
+    vols nor deep-ITM artifacts bend the curve.</span></h2>
+  <div class="plot" id="plot"></div>
+</div>
+
+<div class="panel">
+  <div id="results"><div class="msg">Enter a ticker and hit Refresh.</div></div>
+</div>
+
+<script>
+let data = null;
+
+const IV_RUNG = {
+  leg: 'Quoted IV for this contract.',
+  atm: 'No live two-sided quote - greeks use the expiration ATM IV.',
+  implied: 'No usable vendor IV - re-implied from this contract mark.',
+  raw: 'Raw vendor IV; treat with suspicion.'
+};
+
+function fmt(v, dp) { return (v === null || v === undefined || !isFinite(v)) ? '--' : (+v).toFixed(dp); }
+function intf(v) { return (v === null || v === undefined) ? '--' : (+v).toLocaleString(); }
+function ivf(v) { return (v === null || v === undefined) ? '--' : (+v).toFixed(1); }
+
+// key, label, formatter, isGreek (hidden when the Greeks toggle is off)
+const C = {
+  oi:    { k:'openInterest', l:'OI',     f:intf,        g:false },
+  vol:   { k:'volume',       l:'Vol',    f:intf,        g:false },
+  vega:  { k:'vega',         l:'Vega',   f:v=>fmt(v,3), g:true  },
+  theta: { k:'theta',        l:'Θ', f:v=>fmt(v,3), g:true  },
+  gamma: { k:'gamma',        l:'Γ', f:v=>fmt(v,4), g:true  },
+  delta: { k:'delta',        l:'Δ', f:v=>fmt(v,3), g:false },
+  iv:    { k:'iv',           l:'IV',     f:ivf,         g:false },
+  vatm:  { k:'theoDiff',     l:'vs ATM', f:v=>fmt(v,2), g:false },
+  last:  { k:'last',         l:'Last',   f:v=>fmt(v,2), g:false },
+  bid:   { k:'bid',          l:'Bid',    f:v=>fmt(v,2), g:false },
+  ask:   { k:'ask',          l:'Ask',    f:v=>fmt(v,2), g:false }
+};
+const CALL_COLS = [C.oi, C.vol, C.vega, C.theta, C.gamma, C.delta, C.iv, C.vatm, C.last, C.bid, C.ask];
+const PUT_COLS  = [C.bid, C.ask, C.last, C.vatm, C.iv, C.delta, C.gamma, C.theta, C.vega, C.vol, C.oi];
+
+const VS_ATM_TITLE = 'Market mid minus a Black-Scholes price computed at the expiration ATM IV '
+  + '(one flat reference vol for the whole expiration). Positive = the smile charges a premium '
+  + 'for this strike. It reads the skew in dollars - it is not a mispricing signal.';
+
+function activeCols(cols) {
+  const g = document.getElementById('showGreeks').checked;
+  return cols.filter(c => g || !c.g);
+}
+
+function testOn() { return document.getElementById('testMode').checked; }
+
+function updateModeTag() {
+  const t = testOn();
+  const tag = document.getElementById('modeTag');
+  tag.textContent = t ? 'TEST · cached' : ('LIVE' + (data && data.source ? ' · ' + data.source : ''));
+  tag.style.background = t ? 'var(--yellow)' : 'var(--accent)';
+  tag.style.color = t ? '#0f1117' : '#fff';
+}
+
+async function checkSource() {
+  try {
+    const j = await (await fetch('/api/source')).json();
+    document.getElementById('srcInfo').textContent =
+      'source: ' + j.active + (j.feed ? ' · feed: ' + j.feed : '')
+      + (j.spot ? ' · spot: ' + j.spot : '');
+    const warn = document.getElementById('billWarn');
+    if (j.active === 'marketdata' && j.feed !== 'cached') {
+      warn.style.display = 'block';
+      warn.textContent = '⚠ This screen loads calls AND puts. On feed '
+        + (j.feed || 'live (feedless)')
+        + ', marketdata bills 1 credit per CONTRACT, so a full chain here costs roughly twice '
+        + 'a calls-only fetch. Switch the feed to cached (1 credit per call) on the '
+        + 'My Positions page if that matters.';
+    } else {
+      warn.style.display = 'none';
+    }
+  } catch (e) { /* the readout is informational only */ }
+}
+
+async function load(exp) {
+  const btn = document.getElementById('loadBtn');
+  const res = document.getElementById('results');
+  const sym = document.getElementById('ticker').value.trim().toUpperCase();
+  if (!sym) { res.innerHTML = '<div class="err">Enter a ticker.</div>'; return; }
+  document.getElementById('ticker').value = sym;
+  document.getElementById('finderLink').href = '/?ticker=' + encodeURIComponent(sym);
+  btn.disabled = true; btn.textContent = 'Loading...';
+  res.innerHTML = '<div class="msg">Fetching the option chain for ' + sym + '...</div>';
+  try {
+    let url = '/api/chain?symbol=' + encodeURIComponent(sym);
+    if (exp) url += '&exp=' + encodeURIComponent(exp);
+    if (testOn()) url += '&test=1';
+    const j = await (await fetch(url)).json();
+    if (j.error) throw new Error(j.error);
+    data = j;
+    fillExpirations();
+    updateHeader();
+    render();
+  } catch (e) {
+    data = null;
+    document.getElementById('smilePanel').style.display = 'none';
+    res.innerHTML = '<div class="err">Could not load the chain: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Refresh';
+    updateModeTag();
+  }
+}
+
+function fillExpirations() {
+  const sel = document.getElementById('expSel');
+  sel.innerHTML = '';
+  for (const e of (data.expirations || [])) {
+    const o = document.createElement('option');
+    o.value = e; o.textContent = e;
+    if (e === data.expiration) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+function updateHeader() {
+  document.getElementById('spotLabel').textContent = data.symbol + ' Last:';
+  document.getElementById('spotPx').textContent = fmt(data.spot, 2);
+  const bits = [];
+  if (data.dayMove !== null && data.dayMove !== undefined) {
+    bits.push((data.dayMove >= 0 ? '+' : '') + fmt(data.dayMove, 2)
+      + ' (' + (data.dayMovePct >= 0 ? '+' : '') + fmt(data.dayMovePct, 2) + '%)');
+  }
+  bits.push(data.dte + 'd to ' + data.expiration);
+  if (data.atmIv) bits.push('ATM IV ' + fmt(data.atmIv, 1) + '%');
+  bits.push('r ' + fmt(data.riskFreeRatePct, 2) + '%');
+  bits.push('as of ' + data.timestamp);
+  document.getElementById('meta').textContent = bits.join('  ·  ');
+
+  const note = document.getElementById('putNote');
+  if (data.hasPuts === false) {
+    note.style.display = 'block';
+    note.textContent = 'This data source returned no put side for ' + data.symbol
+      + ' - showing calls only.';
+  } else {
+    note.style.display = 'none';
+  }
+}
+
+function windowedRows() {
+  const rows = data.rows || [];
+  if (document.getElementById('showAll').checked) return rows;
+  let n = parseInt(document.getElementById('winN').value, 10);
+  if (!isFinite(n) || n < 1) n = 10;
+  let at = rows.findIndex(r => r.strike === data.atmStrike);
+  if (at < 0) at = Math.floor(rows.length / 2);
+  return rows.slice(Math.max(0, at - n), Math.min(rows.length, at + n + 1));
+}
+
+function cell(side, col, itm) {
+  const cls = [];
+  if (itm) cls.push('itm');
+  if (!side) return '<td class="' + cls.join(' ') + '">--</td>';
+  const v = side[col.k];
+  let txt = col.f(v);
+  let title = '';
+  if (col.k === 'iv' && side.ivSource && side.ivSource !== 'leg') {
+    cls.push('dim');
+    title = ' title="' + (IV_RUNG[side.ivSource] || side.ivSource) + '"';
+  }
+  if (col.k === 'bid' && side.stale) {
+    txt = '<span class="stale" title="This contract has not traded in over a day - its quote '
+        + 'may not be tradable.">&#9888;</span> ' + txt;
+  }
+  if ((col.k === 'theoDiff' || col.k === 'delta') && v !== null && v !== undefined && v < 0) {
+    cls.push('neg');
+  }
+  return '<td class="' + cls.join(' ') + '"' + title + '>' + txt + '</td>';
+}
+
+function render() {
+  const res = document.getElementById('results');
+  if (!data || !data.rows || !data.rows.length) {
+    res.innerHTML = '<div class="msg">No strikes returned.</div>';
+    document.getElementById('smilePanel').style.display = 'none';
+    return;
+  }
+  const cc = activeCols(CALL_COLS), pc = activeCols(PUT_COLS);
+  const rows = windowedRows();
+
+  let h = '<div class="tbl-wrap"><table><thead>';
+  h += '<tr><th class="grp calls" colspan="' + cc.length + '">CALLS</th>'
+     + '<th class="k" rowspan="2">STRIKE</th>'
+     + '<th class="grp puts" colspan="' + pc.length + '">PUTS</th></tr><tr>';
+  for (const c of cc.concat(pc)) {
+    h += '<th' + (c.k === 'theoDiff' ? ' title="' + VS_ATM_TITLE + '"' : '') + '>' + c.l + '</th>';
+  }
+  h += '</tr></thead><tbody>';
+
+  for (const r of rows) {
+    const isAtm = r.strike === data.atmStrike;
+    const callItm = r.strike < data.spot;
+    const putItm = r.strike > data.spot;
+    h += '<tr' + (isAtm ? ' class="atm"' : '') + '>';
+    for (const c of cc) h += cell(r.call, c, callItm);
+    h += '<td class="k">' + (Number.isInteger(r.strike) ? r.strike : fmt(r.strike, 2)) + '</td>';
+    for (const c of pc) h += cell(r.put, c, putItm);
+    h += '</tr>';
+  }
+  h += '</tbody></table></div>';
+
+  const total = data.rows.length;
+  if (rows.length < total) {
+    h += '<div class="sub" style="padding-top:8px;">Showing ' + rows.length + ' of ' + total
+       + ' strikes around ATM. Widen the window or tick All strikes - the whole chain is '
+       + 'already loaded, so neither costs another request.</div>';
+  }
+  res.innerHTML = h;
+  drawSmile();
+}
+
+function drawSmile() {
+  const panel = document.getElementById('smilePanel');
+  const pts = { call: [], put: [] };
+  for (const r of (data.rows || [])) {
+    for (const side of ['call', 'put']) {
+      const s = r[side];
+      // Only genuinely quoted strikes: a fallback vol would draw a flat ATM
+      // line and pass it off as the real surface.
+      if (!s || !s.iv || s.ivSource !== 'leg') continue;
+      // OTM side only - the standard smile construction. Deep-ITM contracts
+      // carry wide spreads and wild implied vols (a 200%-IV deep ITM call is
+      // an artifact, not a market view) which would otherwise flatten the
+      // whole curve into the bottom of the panel.
+      if (side === 'call' && r.strike < data.spot) continue;
+      if (side === 'put' && r.strike > data.spot) continue;
+      pts[side].push([r.strike, s.iv]);
+    }
+  }
+  const all = pts.call.concat(pts.put);
+  if (all.length < 2) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const W = 1000, H = 200, pad = { l: 46, r: 12, t: 12, b: 26 };
+  const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
+  const xs = all.map(p => p[0]), ys = all.map(p => p[1]);
+  let xLo = Math.min.apply(null, xs), xHi = Math.max.apply(null, xs);
+  let yLo = Math.min.apply(null, ys), yHi = Math.max.apply(null, ys);
+  if (xHi === xLo) xHi = xLo + 1;
+  const yPad = (yHi - yLo) * 0.12 || 1;
+  yLo -= yPad; yHi += yPad;
+  const xS = v => pad.l + (v - xLo) / (xHi - xLo) * cw;
+  const yS = v => pad.t + ch - (v - yLo) / (yHi - yLo) * ch;
+
+  let g = '';
+  for (let i = 0; i <= 4; i++) {
+    const yv = yLo + (yHi - yLo) * i / 4, y = yS(yv);
+    g += '<line x1="' + pad.l + '" y1="' + y + '" x2="' + (pad.l + cw) + '" y2="' + y
+       + '" stroke="#242837"/>'
+       + '<text x="' + (pad.l - 8) + '" y="' + (y + 3) + '" text-anchor="end" fill="#8b8fa3" '
+       + 'font-size="10">' + yv.toFixed(1) + '</text>';
+    const xv = xLo + (xHi - xLo) * i / 4, x = xS(xv);
+    g += '<line x1="' + x + '" y1="' + pad.t + '" x2="' + x + '" y2="' + (pad.t + ch)
+       + '" stroke="#242837"/>'
+       + '<text x="' + x + '" y="' + (pad.t + ch + 16) + '" text-anchor="middle" fill="#8b8fa3" '
+       + 'font-size="10">' + (Math.abs(xHi - xLo) < 10 ? xv.toFixed(2) : Math.round(xv)) + '</text>';
+  }
+  const line = (arr, color) => {
+    if (arr.length < 2) return '';
+    arr.sort((a, b) => a[0] - b[0]);
+    const d = arr.map(p => xS(p[0]).toFixed(1) + ',' + yS(p[1]).toFixed(1)).join(' ');
+    return '<polyline points="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>'
+      + arr.map(p => '<circle cx="' + xS(p[0]).toFixed(1) + '" cy="' + yS(p[1]).toFixed(1)
+        + '" r="2.4" fill="' + color + '"/>').join('');
+  };
+  let spotLine = '';
+  if (data.spot >= xLo && data.spot <= xHi) {
+    const x = xS(data.spot);
+    spotLine = '<line x1="' + x + '" y1="' + pad.t + '" x2="' + x + '" y2="' + (pad.t + ch)
+      + '" stroke="#4f8ff7" stroke-width="1" stroke-dasharray="4,3"/>'
+      + '<text x="' + (x + 4) + '" y="' + (pad.t + ch - 4) + '" fill="#4f8ff7" font-size="10">spot</text>';
+  }
+  // The legend lives in the panel heading, not in here: preserveAspectRatio
+  // "none" stretches glyphs horizontally, which mangles any long SVG label.
+  document.getElementById('plot').innerHTML =
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">'
+    + g + spotLine + line(pts.call, '#34d399') + line(pts.put, '#f87171') + '</svg>';
+}
+
+document.getElementById('expSel').addEventListener('change', e => load(e.target.value));
+document.getElementById('showAll').addEventListener('change', () => { if (data) render(); });
+document.getElementById('showGreeks').addEventListener('change', () => { if (data) render(); });
+document.getElementById('winN').addEventListener('change', () => { if (data) render(); });
+document.getElementById('ticker').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+document.getElementById('testMode').addEventListener('change', e => {
+  localStorage.setItem('finderTestMode', e.target.checked ? '1' : '0');
+  updateModeTag();
+});
+
+(function boot() {
+  if (localStorage.getItem('finderTestMode') === '1') document.getElementById('testMode').checked = true;
+  updateModeTag();
+  checkSource();
+  const q = new URLSearchParams(window.location.search);
+  const t = (q.get('ticker') || '').trim().toUpperCase();
+  if (t) document.getElementById('ticker').value = t;
+  document.getElementById('finderLink').href = '/?ticker='
+    + encodeURIComponent(document.getElementById('ticker').value);
+  load();
+})();
+</script>
+</body>
+</html>
+"""
+
+
 # ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
@@ -6543,6 +7216,13 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                     .replace("__RF_RATE__", str(RISK_FREE_RATE_PCT)))
             self.wfile.write(page.encode("utf-8"))
 
+        elif parsed.path == "/omon":
+            # Option chain (OMON): static HTML, all data via /api/chain.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(OMON_PAGE.encode("utf-8"))
+
         elif parsed.path == "/dip":
             # Dip Scanner: static HTML, data via /api/dipscan + /api/watchlist.
             self.send_response(200)
@@ -6605,6 +7285,19 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/watchlist":
             self._send_json({"symbols": load_watchlist()})
+
+        elif parsed.path == "/api/chain":
+            # Full option chain for ONE expiration (the /omon screen). Returns
+            # the expirations list too, so the page's dropdown costs no second
+            # round trip.
+            params = parse_qs(parsed.query)
+            symbol = params.get("symbol", ["^SPX"])[0].strip().upper()
+            exp = params.get("exp", [""])[0].strip() or None
+            test_mode = params.get("test", ["0"])[0].lower() in ("1", "true", "test", "on")
+            try:
+                self._send_json(compute_chain_view(symbol, exp, test_mode))
+            except Exception as e:
+                self._send_json({"error": str(e)})
 
         elif parsed.path == "/api/dipscan":
             params = parse_qs(parsed.query)

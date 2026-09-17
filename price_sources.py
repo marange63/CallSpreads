@@ -130,16 +130,27 @@ class PriceSource(abc.ABC):
         ascending. Empty tuple if the symbol has no options."""
 
     @abc.abstractmethod
-    def get_option_chain(self, symbol, exp):
+    def get_option_chain(self, symbol, exp, sides="call"):
         """One expiration's chain as a plain, picklable snapshot:
         SimpleNamespace(calls, puts, underlying, fetched_at).
+
+        sides — "call" (the default: only .calls need be populated, which is all
+          the spread finder and monitor ever read) or "both" (the OMON chain
+          screen also needs .puts). Implementations that get both sides in one
+          response regardless (Yahoo) may ignore it; implementations that bill
+          or filter per side (marketdata) should honour it. Callers must pass it
+          positionally-safe as a keyword — a vendor subclass written against the
+          older two-argument signature is retried without it (see the app's
+          get_option_chain wrapper) and simply yields a calls-only view.
 
         .calls — DataFrame. REQUIRED columns (Yahoo names/semantics): strike,
           bid, ask, lastPrice, impliedVolatility (annualized fraction), volume,
           openInterest. OPTIONAL (the app degrades gracefully): change
           (lastPrice − prior official close; feeds per-leg prevClose),
           lastTradeDate (tz-aware Timestamp or NaT; feeds staleness flags).
-        .puts — DataFrame or None (never read by the app; cache fidelity only).
+        .puts — DataFrame with the same columns as .calls, or None. Populated
+          only when sides="both"; a source that cannot supply puts may always
+          return None and the chain screen degrades to a calls-only view.
         .underlying — dict with Yahoo quote keys. Supply at minimum
           regularMarketPrice + regularMarketTime (epoch secs) so spot is
           time-aligned with the option quotes; optional: postMarketPrice/Time,
@@ -193,7 +204,10 @@ class YahooSource(PriceSource):
     def get_expirations(self, symbol):
         return tuple(yf.Ticker(self.map_symbol(symbol)).options)
 
-    def get_option_chain(self, symbol, exp):
+    def get_option_chain(self, symbol, exp, sides="call"):
+        # `sides` is ignored: one option_chain() response carries calls AND puts
+        # at no extra cost or latency, and _snap_chain keeps both. So a Yahoo
+        # snapshot always satisfies a sides="both" request.
         snap = _snap_chain(yf.Ticker(self.map_symbol(symbol)).option_chain(exp))
         ov = self._spot_override(symbol)
         if ov:
@@ -286,8 +300,10 @@ class MarketDataSource(PriceSource):
       cached — 1 credit per CALL regardless of chain size; data seconds to a
                few minutes old. The default: effectively unlimited here.
       live   — 1 credit per CONTRACT returned; never fetch broad chains on it.
-    We only request calls (side=call — the app never reads puts), which also
-    halves any live-feed cost. Free/trial accounts always get delayed data
+    We request calls only (side=call) unless the caller asks for sides="both"
+    — the spread finder and monitor never read puts, and skipping them halves
+    any live-feed cost; the OMON chain screen is the one caller that wants both
+    (free on the cached feed, 2x on live). Free/trial accounts always get delayed data
     and reject the feed parameter — that error is SURFACED, never silently
     downgraded to feedless (= live, per-contract billing); feedless requires
     an explicit "feed": "" in sources.json.
@@ -373,9 +389,29 @@ class MarketDataSource(PriceSource):
                     f"set feed \"\" explicitly.") from None
             raise
 
-    def get_option_chain(self, symbol, exp):
-        data = self._chain_request(self.map_symbol(symbol),
-                                   {"expiration": exp, "side": "call"})
+    @staticmethod
+    def _right_of(option_symbol):
+        """'C' or 'P' from an OCC symbol (ROOT + YYMMDD + C/P + 8-digit strike),
+        or None. Fallback for responses that omit the `side` array."""
+        try:
+            ch = str(option_symbol)[-9].upper()
+        except (IndexError, TypeError):
+            return None
+        return ch if ch in ("C", "P") else None
+
+    def get_option_chain(self, symbol, exp, sides="call"):
+        both = (sides == "both")
+        params = {"expiration": exp}
+        if not both:
+            params["side"] = "call"
+        elif self.feed != "cached":
+            # On the cached feed a chain is 1 credit regardless of size, so both
+            # sides are free. Any other feed bills per CONTRACT, so asking for
+            # puts as well doubles the cost — surfaced, never silently avoided.
+            print(f"  Note: both-sides chain request for {symbol} {exp} on "
+                  f"feed={self.feed or 'live (feedless)'} — bills per contract, "
+                  f"so this costs ~2x a calls-only fetch.")
+        data = self._chain_request(self.map_symbol(symbol), params)
         if data.get("s") != "ok":
             raise RuntimeError(
                 f"marketdata: no chain data for {symbol} {exp} (s={data.get('s')})")
@@ -385,21 +421,46 @@ class MarketDataSource(PriceSource):
             vals = data.get(key)
             return vals if isinstance(vals, list) and len(vals) == n else [None] * n
 
-        calls = pd.DataFrame({
-            "strike": col("strike"),
-            "bid": col("bid"), "ask": col("ask"),
-            "lastPrice": col("last"),
-            "impliedVolatility": col("iv"),
-            "volume": col("volume"),
-            "openInterest": col("openInterest"),
-        })
-        # Null quotes -> 0.0, mirroring Yahoo's zeroed-out semantics (the app
-        # treats bid/ask 0 as "no live two-sided market" and IV 0 as missing).
-        for c in calls.columns:
-            calls[c] = pd.to_numeric(calls[c], errors="coerce").fillna(0.0)
-        # 'updated' is the per-contract quote time — not a trade time, but the
-        # honest freshness signal the staleness flags exist to convey.
-        calls["lastTradeDate"] = pd.to_datetime(col("updated"), unit="s", utc=True)
+        def frame(idx):
+            """Rows `idx` of the response as an app-shaped option DataFrame."""
+            def take(key):
+                vals = col(key)
+                return [vals[i] for i in idx]
+            df = pd.DataFrame({
+                "strike": take("strike"),
+                "bid": take("bid"), "ask": take("ask"),
+                "lastPrice": take("last"),
+                "impliedVolatility": take("iv"),
+                "volume": take("volume"),
+                "openInterest": take("openInterest"),
+            })
+            # Null quotes -> 0.0, mirroring Yahoo's zeroed-out semantics (the app
+            # treats bid/ask 0 as "no live two-sided market" and IV 0 as missing).
+            for c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            # 'updated' is the per-contract quote time — not a trade time, but the
+            # honest freshness signal the staleness flags exist to convey.
+            df["lastTradeDate"] = pd.to_datetime(take("updated"), unit="s", utc=True)
+            return df
+
+        if both:
+            # Prefer the response's own `side` array; fall back to the right
+            # encoded in each OCC option symbol if this plan/endpoint omits it.
+            side_col = data.get("side")
+            if isinstance(side_col, list) and len(side_col) == n:
+                rights = [str(v or "").upper()[:1] for v in side_col]
+            else:
+                rights = [self._right_of(v) for v in col("optionSymbol")]
+            call_idx = [i for i in range(n) if rights[i] == "C"]
+            put_idx = [i for i in range(n) if rights[i] == "P"]
+            if not call_idx and not put_idx:
+                # Neither discriminator was usable — treat the payload as calls
+                # (what side=call would have returned) rather than losing it.
+                calls, puts = frame(list(range(n))), None
+            else:
+                calls, puts = frame(call_idx), frame(put_idx)
+        else:
+            calls, puts = frame(list(range(n))), None
 
         underlying = {}
         upx, upd = data.get("underlyingPrice"), data.get("updated")
@@ -422,7 +483,7 @@ class MarketDataSource(PriceSource):
                 underlying.update(self.get_underlying_quote(symbol))
         except Exception:
             pass  # chain-derived spot still works; candle fallback covers the rest
-        return SimpleNamespace(calls=calls, puts=None, underlying=underlying,
+        return SimpleNamespace(calls=calls, puts=puts, underlying=underlying,
                                fetched_at=datetime.now().timestamp())
 
     @staticmethod
