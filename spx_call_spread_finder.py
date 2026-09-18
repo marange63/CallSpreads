@@ -6891,6 +6891,10 @@ async function load(exp) {
   const sym = document.getElementById('ticker').value.trim().toUpperCase();
   if (!sym) { res.innerHTML = '<div class="err">Enter a ticker.</div>'; return; }
   document.getElementById('ticker').value = sym;
+  // Refresh / Enter on the SAME ticker keeps the chosen expiration; a new
+  // ticker starts from its own nearest expiry. (A rolled-off date is fine:
+  // the server falls back to the nearest listed one.)
+  if (!exp && data && data.symbol === sym) exp = document.getElementById('expSel').value;
   document.getElementById('finderLink').href = '/?ticker=' + encodeURIComponent(sym);
   btn.disabled = true; btn.textContent = 'Loading...';
   res.innerHTML = '<div class="msg">Fetching the option chain for ' + sym + '...</div>';
