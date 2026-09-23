@@ -18,6 +18,7 @@ file owns the config file (sources.json) and passes its dict to
 
 import abc
 import json
+import math
 import subprocess
 import sys
 import urllib.error
@@ -240,10 +241,13 @@ class YahooSource(PriceSource):
         fast_info can also fail transiently (its 1y-history fetch raises on a
         rate-limit blip), so the fallback is the daily close series — the last
         close dated before today — and never `previous_close`: a silent retreat
-        to the prepost mark is exactly the bug this guards against."""
+        to the prepost mark is exactly the bug this guards against.
+
+        fast_info can also return NaN (truthy, so a bare `if pc:` lets it
+        through and it poisons the JSON response) — treat that as a miss."""
         try:
             pc = yf.Ticker(sym).fast_info.regular_market_previous_close
-            if pc:
+            if pc and math.isfinite(pc):
                 return float(pc)
         except Exception:
             pass

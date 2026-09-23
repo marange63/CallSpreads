@@ -637,9 +637,11 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
 
     # Previous close (for day move)
     prev_close = src.get_previous_close(symbol)
+    if prev_close is not None and not math.isfinite(prev_close):
+        prev_close = None
     if prev_close is None:
         try:
-            hist = src.get_daily_closes(symbol, "5d")
+            hist = src.get_daily_closes(symbol, "5d").dropna()
             if len(hist) >= 2:
                 prev_close = float(hist.iloc[-2])
         except Exception:
@@ -1825,7 +1827,7 @@ def _underlying_spot_and_time(oc, symbol, candle_fallback=False):
     """
     u = getattr(oc, "underlying", None) or {}
     prev_close = u.get("regularMarketPreviousClose") or u.get("previousClose")
-    prev_close = float(prev_close) if prev_close else None
+    prev_close = float(prev_close) if prev_close and math.isfinite(prev_close) else None
     # Best quote bundled with the chain: each price source paired with its
     # own timestamp, then a bid/ask mid.
     px = ts = None
@@ -7124,6 +7126,19 @@ document.getElementById('testMode').addEventListener('change', e => {
 # HTTP Server
 # ---------------------------------------------------------------------------
 
+def _json_safe(obj):
+    """Copy of `obj` with every non-finite float (NaN/±inf, incl. numpy
+    floats, which subclass float) replaced by None, so it serializes to
+    strict JSON the browser can parse."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 class SpreadHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -7177,17 +7192,10 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
                 print(f"{'='*60}")
                 result = fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width, max_otm, risk_free_rate, expiration_filter, min_net_delta, min_reward_risk, commission, min_dte, max_leg_premium, symbol, move_pct, profit_target_pct, min_gamma, min_short_leg_delta, move_basis, test_mode)
                 print(f"Found {result['total_spreads']} matching spreads across {result['expirations_scanned']} expirations")
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode("utf-8"))
+                self._send_json(result)
 
             except Exception as e:
-                self.send_response(200)  # 200 with error in body for clean frontend handling
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                self._send_json({"error": str(e)})  # 200 with error in body for clean frontend handling
 
         elif parsed.path == "/positions":
             self.send_response(200)
@@ -7507,7 +7515,10 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps(payload).encode("utf-8"))
+        # allow_nan=False would raise instead; the browser's JSON.parse rejects
+        # the bare NaN/Infinity tokens Python emits by default, killing the
+        # whole response over one bad field — so null them out instead.
+        self.wfile.write(json.dumps(_json_safe(payload)).encode("utf-8"))
 
     @staticmethod
     def _validate_position_payload(body):
