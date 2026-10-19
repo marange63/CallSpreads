@@ -331,6 +331,9 @@ def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
       probProfitExp      — % of paths whose *terminal* Adjusted P&L is positive
                            (commission- and haircut-aware P(profit at expiration)).
       probLoss50         — % of paths whose terminal Adjusted P&L <= -50% of cost.
+      probWorthless      — % of paths that never touch the target AND finish at/below
+                           the long strike: the full-debit loss under exit-at-target.
+                           Disjoint from probTarget, so the two sum to <= 100.
 
     target_frac is the target as a fraction of entry cost (e.g. 0.05 for 5%). Adjusted P&L
     is (liquidation - entry)*mult, haircut on gains, minus commission (the exact formula
@@ -380,6 +383,10 @@ def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
     adj_pnl = np.where(raw_pnl > 0, raw_pnl * haircut, raw_pnl) - total_commission
     prob_profit_exp = float((adj_pnl > 0).mean()) * 100.0
     prob_loss50 = float((adj_pnl <= -0.5 * entry_cost).mean()) * 100.0
+    worthless = S[:, -1] <= K1
+    if hit is not None:
+        worthless = worthless & ~hit   # target-hitting paths were exited, not held
+    prob_worthless = float(worthless.mean()) * 100.0
     # Exit-at-target expectancy: hitting paths bank the target, others ride to expiry.
     strat_pnl = adj_pnl if hit is None else np.where(hit, target_dollars, adj_pnl)
     ev_prem = float(strat_pnl.mean()) / entry_cost * 100.0
@@ -391,6 +398,7 @@ def spread_mc_stats(S_paths, T_remaining, K1, K2, iv_l, iv_s, r, T,
         "evPrem": round(ev_prem, 1),
         "probProfitExp": round(prob_profit_exp, 1),
         "probLoss50": round(prob_loss50, 1),
+        "probWorthless": round(prob_worthless, 1),
     }
 
 
@@ -1958,6 +1966,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
         result["indexSymbol"] = index_symbol
         result["indexIvPct"] = index_iv_pct
         result["probTarget"] = None
+        result["probWorthless"] = None
         result["dte"] = None
         result["history"] = _PNL_HISTORY.get(p.get("id"), [])
 
@@ -2165,6 +2174,7 @@ def fetch_position_quotes(positions, haircut_pct=0.80, profit_target_pct=15.0,
                         profit_target_pct / 100.0, result["totalCommission"],
                         haircut_pct, K2 - K1, value_offset=value_offset)
                     result["probTarget"] = mc.get("probTarget") if mc else None
+                    result["probWorthless"] = mc.get("probWorthless") if mc else None
 
                 # Strip internal keys before returning
                 long_leg.pop("_iv_raw", None)
@@ -4371,7 +4381,7 @@ POSITIONS_PAGE = r"""<!DOCTYPE html>
         <th title="Total premium paid at entry (top), then the current total value at mid (best: both legs at bid/ask midpoint) and at liquidation (worst: long sold at bid, short bought at ask), with entry commission as subtext.">Cost / Value</th>
         <th title="Raw P&amp;L vs entry cost. best = exit both legs at mid; worst = liquidation (long @ bid, short @ ask).">P&amp;L</th>
         <th id="colAdjPnlLabel" class="adj-col" title="Adjusted P&amp;L: haircut on gains, then round-trip commission. best = mid exit (drives alerts and P(+X%)); worst = liquidation exit.">Adj P&amp;L (80%)</th>
-        <th id="colProbTarget">P(+15%)</th>
+        <th id="colProbTarget" title="Top: path-aware Monte-Carlo probability the Adjusted P&amp;L touches the profit target before expiry. P(0, no tgt): probability the spread never touches the target and expires worthless (underlying at/below the long strike) — the full-debit loss under exit-at-target. Same paths, disjoint outcomes, so the two sum to at most 100%.">P(+15%)</th>
         <th title="Main: Daily Theo P&amp;L — BS reprice for this underlying's one-day move (spot vs prior close), option quotes held aside. MTM sub-line: this spread's realized daily mark-to-market — today's mid marks vs yesterday's option closes. Bottom sub-lines: the day's move in points and %, then the underlying prices it spans (prior close &rarr; current spot).">Daily Theo P&amp;L</th>
         <th id="colBetaIdx" title="Theoretical P&amp;L for a &plusmn;1&sigma; move in the reference index, scaled by each underlying's beta (2yr daily) to that index. Top = +1&sigma;, bottom = &minus;1&sigma;.">&plusmn;1&sigma; Idx P&amp;L (&beta;)</th>
         <th id="colGreeks" title="Own-vol &plusmn;&sigma; one-day P&amp;L (full BS reprice, ~30d ATM IV — same engine and tenor basis as the &beta; column), plus &Theta; per day and Vega per 1% IV.">Greeks (&plusmn;1&sigma; P&amp;L / &Theta;$/d / Vega)</th>
@@ -4705,9 +4715,17 @@ function renderTable() {
       </div></td>`;
     }
 
+    // Sub-line: MC probability the spread never touches the target and then expires
+    // worthless — the full-debit loss under exit-at-target. Same paths as P(+X%) and
+    // disjoint from it, so the two sum to <= 100%.
+    const worthlessStr = (p.probWorthless === null || p.probWorthless === undefined)
+      ? '' : `<span class="tt-dim" title="Monte-Carlo probability the spread never touches the profit target and then expires worthless (underlying at/below the long strike) — your full-debit loss if you exit at target. Disjoint from P(+X%).">P(0, no tgt) ${p.probWorthless.toFixed(1)}%</span>`;
     const probCell = (p.probTarget === null || p.probTarget === undefined)
       ? '<td class="dim">--</td>'
-      : `<td class="mono">${p.probTarget.toFixed(1)}%</td>`;
+      : `<td class="mono"><div class="pnl-block">
+        <span>${p.probTarget.toFixed(1)}%</span>
+        ${worthlessStr}
+      </div></td>`;
 
     // Daily theoretical P&L: BS reprice of the spread for the underlying's
     // one-day move (spot vs. prior close), independent of the stale option quotes.
