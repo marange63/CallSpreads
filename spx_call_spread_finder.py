@@ -682,12 +682,29 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
     print(f"  {symbol} spot: {spot}")
     print(f"  Expirations to scan: {len(expirations)}")
 
+    # Rejection diagnostics, aggregated across expirations and returned to the
+    # client, so an empty result can say WHICH filter killed the scan and how
+    # close the best candidate came — instead of a generic "loosen something".
+    rejected = {"premiumZero": 0, "premiumHigh": 0, "legPremium": 0, "shortLegDelta": 0,
+                "moveReturn": 0, "netDelta": 0, "gamma": 0, "rewardRisk": 0}
+    closest = {}   # per filter: the nearest miss among the candidates it rejected
+
+    def _closest(key, val, lower_is_better=False):
+        cur = closest.get(key)
+        if cur is None or (val < cur if lower_is_better else val > cur):
+            closest[key] = val
+
+    candidates = 0          # strike pairs that passed the structural width/OTM screens
+    exps_skipped_dte = 0
+    exps_no_quotes = 0      # chains with < 2 OTM calls carrying live two-sided quotes
+
     for exp_date_str in expirations:
         try:
             exp_date = datetime.strptime(exp_date_str, "%Y-%m-%d")
             dte = (exp_date - now).days
             if dte < max(1, min_dte):
                 print(f"  {exp_date_str}: skipped ({dte}d < {min_dte}d min DTE)")
+                exps_skipped_dte += 1
                 continue
             T = dte / 365.0
 
@@ -696,6 +713,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
 
             if calls.empty:
                 print(f"  {exp_date_str}: skipped (empty chain)")
+                exps_no_quotes += 1
                 continue
 
             # ATM IV for this expiration: nearest-to-spot strike with a
@@ -720,6 +738,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
             print(f"{len(otm_calls)} OTM w/ valid bid/ask/IV")
 
             if len(otm_calls) < 2:
+                exps_no_quotes += 1
                 continue
 
             # Show a sample of the data
@@ -757,6 +776,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                     pct_otm = ((K1 / spot) - 1) * 100
                     if pct_otm > max_otm:
                         continue
+                    candidates += 1
 
                     # Cost: pay ask for long, receive bid for short
                     buy_price = float(row_buy["ask"])
@@ -776,6 +796,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
 
                     if max_contracts < 1:
                         skipped_premium_high += 1
+                        _closest("premiumHigh", per_contract_dollars, lower_is_better=True)
                         continue  # even 1 contract exceeds max budget
                     if min_contracts > max_contracts:
                         continue  # can't reach min budget without exceeding max
@@ -789,6 +810,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                     if max_leg_premium > 0:
                         if buy_leg_dollars > max_leg_premium or sell_leg_dollars > max_leg_premium:
                             skipped_leg_premium += 1
+                            _closest("legPremium", max(buy_leg_dollars, sell_leg_dollars), lower_is_better=True)
                             continue
 
                     total_premium = net_premium * contracts
@@ -805,6 +827,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                     # a too-far-OTM / illiquid token. Independent of contract count.
                     if min_short_leg_delta > 0 and delta_sell < min_short_leg_delta:
                         skipped_short_leg += 1
+                        _closest("shortLegDelta", delta_sell)
                         continue
 
                     gamma_buy = bs_gamma(spot, K1, T, risk_free_rate, iv_buy)
@@ -864,12 +887,14 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                     move_return = (pnl_move_per / net_premium * 100) if net_premium > 0 else 0
                     if move_return < min_move_return:
                         skipped_move_return += 1
+                        _closest("moveReturn", move_return)
                         continue
 
                     # Filter on per-contract net delta (Δ/Contract) — the spread's
                     # directional signature, independent of budget-driven sizing.
                     if net_delta < min_net_delta:
                         skipped_delta += 1
+                        _closest("netDelta", net_delta)
                         continue
 
                     # Gamma made intuitive: delta gained per 1% underlying move, at the
@@ -879,6 +904,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                     gamma_per_1pct = net_gamma * (spot * 0.01) * contracts
                     if gamma_per_1pct < min_gamma:
                         skipped_gamma += 1
+                        _closest("gamma", gamma_per_1pct)
                         continue
 
                     # Return on a +1σ one-day move, as a % of premium paid (the
@@ -900,6 +926,7 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
 
                     if reward_risk < min_reward_risk:
                         skipped_rr += 1
+                        _closest("rewardRisk", reward_risk)
                         continue
 
                     found += 1
@@ -911,9 +938,11 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
 
                     breakeven_move_pct = (breakeven - spot) / spot * 100
                     iv_avg = (iv_buy + iv_sell) / 2
-                    # Use ATM IV as the sigma yardstick so BE distance is comparable across strikes
-                    # and consistent with the P&L 1σ/2σ columns. Fall back to leg-average IV if ATM IV
-                    # for the expiration isn't available.
+                    # Breakeven distance in σ to EXPIRY (ATM IV × √T), so it's comparable
+                    # across strikes and expirations. NOTE: a different yardstick from the
+                    # return columns, which shock by a ONE-DAY σ (ATM IV × √(1/252)) — the
+                    # UI labels this one "σ(exp)" for that reason. Falls back to the
+                    # leg-average IV if the expiration has no ATM IV.
                     sigma_iv = exp_atm_iv if exp_atm_iv else iv_avg
                     be_move_sigma = (
                         (breakeven - spot) / (spot * sigma_iv * math.sqrt(T))
@@ -999,6 +1028,11 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
                         "totalCommission": round(commission * contracts, 2),
                     })
 
+            for k, v in (("premiumZero", skipped_premium_zero), ("premiumHigh", skipped_premium_high),
+                         ("legPremium", skipped_leg_premium), ("shortLegDelta", skipped_short_leg),
+                         ("moveReturn", skipped_move_return), ("netDelta", skipped_delta),
+                         ("gamma", skipped_gamma), ("rewardRisk", skipped_rr)):
+                rejected[k] += v
             print(f"    => {found} matched | skipped: {skipped_premium_zero} zero/neg prem, {skipped_premium_high} over max prem, {skipped_leg_premium} over max leg prem, {skipped_short_leg} under min short-leg delta, {skipped_move_return} under min move return, {skipped_delta} under min delta, {skipped_gamma} under min gamma, {skipped_rr} under min R/R")
 
         except Exception as e:
@@ -1023,6 +1057,14 @@ def fetch_and_find_spreads(min_premium, max_premium, min_move_return, max_width=
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "expirations_scanned": len(expirations),
         "total_spreads": len(spreads),
+        # Why candidates were rejected (see the empty-state message in HTML_PAGE).
+        "diagnostics": {
+            "candidates": candidates,
+            "expirationsSkippedDte": exps_skipped_dte,
+            "expirationsNoQuotes": exps_no_quotes,
+            "rejected": rejected,
+            "closest": {k: round(v, 4) for k, v in closest.items()},
+        },
         "spreads": spreads
     }
 
@@ -2777,6 +2819,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--text-dim);
   }
 
+  .empty-state ul { list-style: none; display: inline-block; text-align: left; margin-top: 10px; }
+  .empty-state li { margin: 4px 0; }
   .empty-state h2 {
     font-size: 18px;
     margin-bottom: 8px;
@@ -3095,7 +3139,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-col="evPrem" onclick="sortTable('evPrem')" title="Expected Adjusted P&amp;L as a % of premium under the exit-at-target strategy: paths that touch the target bank it, the rest hold to expiry. Zero-drift (no-edge) paths, so this is a conservative floor.">EV %</th>
         <th data-col="return1sigma" onclick="sortTable('return1sigma')" title="P&amp;L for a +1&sigma; one-day move in the underlying, as a % return on the premium paid.">Return 1&sigma; 1d %</th>
         <th data-col="breakevenMovePct" onclick="sortTable('breakevenMovePct')">BE Move %</th>
-        <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')">BE Move &sigma;</th>
+        <th data-col="breakevenMoveSigma" onclick="sortTable('breakevenMoveSigma')" title="Breakeven distance in standard deviations to EXPIRY (ATM IV &times; &radic;T) &mdash; NOT the one-day &sigma; behind Return 1&sigma; 1d and Return @ +N&sigma;. On a 51-day, 68%-IV name, 0.30&sigma;(exp) &asymp; 1.8 one-day &sigma;.">BE Move &sigma;(exp)</th>
         <th data-col="netDelta" onclick="sortTable('netDelta')" title="Position dollar delta: $ P&amp;L per 1% move in the underlying (first-order directional exposure).">$&Delta; /1%</th>
         <th data-col="netDeltaPer" onclick="sortTable('netDeltaPer')">&Delta;/Contract</th>
         <th data-col="gammaPer1pct" onclick="sortTable('gammaPer1pct')" title="Gamma as delta gained per 1% move in the underlying — how fast the spread's directional exposure accelerates. Higher = more convex/punchy.">&Gamma; (&Delta;/1%)</th>
@@ -3530,6 +3574,56 @@ function spreadCurveDescriptor(s) {
   };
 }
 
+// Explain an empty result from the server's `diagnostics` block: which filter
+// rejected the candidates, in the order the server applies them (so it reads
+// as a funnel), and how close the nearest miss came to the user's threshold.
+// `f` = the filter values this scan was sent with. Falls back to one generic
+// line if an older server payload has no diagnostics.
+function emptyStateHtml(data, f) {
+  const h = '<h2>No spreads found</h2>';
+  const g = data.diagnostics;
+  if (!g) return h + '<p>Try loosening a filter.</p>';
+  const plural = n => (n === 1 ? '' : 's');
+  const n = Number(data.expirations_scanned) || 0;
+  if (n && g.expirationsSkippedDte >= n) {
+    return h + `<p>All ${n} selected expiration${plural(n)} fall inside your Min DTE of ${f.minDte}. Lower Min DTE or check a later expiration.</p>`;
+  }
+  const scanned = n - g.expirationsSkippedDte;
+  if (!g.candidates) {
+    if (scanned && g.expirationsNoQuotes >= scanned) {
+      return h + `<p>None of the ${scanned} expiration${plural(scanned)} scanned had two or more OTM calls with live two-sided quotes. Outside market hours Yahoo zeroes option bid/ask &mdash; scan during the session, or use Test mode on a chain cached while quotes were live.</p>`;
+    }
+    return h + `<p>No strike pairs fit the structure filters &mdash; Max Width ${f.maxWidth} pts and Max % OTM ${f.maxOtm}% leave nothing to pair up. Widen one of them.</p>`;
+  }
+  const money = v => '$' + Math.round(v).toLocaleString();
+  const moveLbl = (f.moveBasis === 'sigma' ? `+${f.movePct}σ` : `+${f.movePct}%`);
+  // [key, label, the user's threshold, formatter for the nearest miss]
+  const FILTERS = [
+    ['premiumZero',   'Credit / zero-cost pairs', null, null],
+    ['premiumHigh',   'Max Premium',              money(f.maxPremiumDollars), v => 'cheapest spread ' + money(v)],
+    ['legPremium',    'Max Leg Premium',          money(f.maxLegPremium),     v => 'smallest leg ' + money(v)],
+    ['shortLegDelta', 'Min Short-Leg Delta',      f.minShortLegDelta,         v => 'best ' + v.toFixed(2)],
+    ['moveReturn',    `Min Return on Move (${moveLbl})`, f.minMoveReturn + '%', v => 'best ' + v.toFixed(1) + '%'],
+    ['netDelta',      'Min Net Delta',            f.minNetDelta,              v => 'best ' + v.toFixed(2)],
+    ['gamma',         'Min Gamma',                f.minGamma,                 v => 'best ' + v.toFixed(2)],
+    ['rewardRisk',    'Min Reward/Risk',          f.minRewardRisk,            v => 'best ' + v.toFixed(2)],
+  ];
+  const rows = FILTERS.filter(([k]) => g.rejected[k] > 0);
+  const worst = rows.reduce((a, b) => (g.rejected[b[0]] > g.rejected[a[0]] ? b : a), rows[0]);
+  let out = h + `<p>${g.candidates} strike pair${plural(g.candidates)} passed the structure filters (DTE &ge; ${f.minDte}, width &le; ${f.maxWidth} pts, long &le; ${f.maxOtm}% OTM); each was then rejected by:</p><ul>`;
+  for (const [k, label, yours, fmt] of rows) {
+    const c = g.closest[k];
+    const near = (fmt && c !== undefined && c !== null) ? ` &mdash; ${fmt(c)} vs your ${yours}` : '';
+    const line = `${label}: ${g.rejected[k]}${near}`;
+    out += `<li>${k === worst[0] ? '<b>' + line + '</b>' : line}</li>`;
+  }
+  out += '</ul>';
+  if (rows.length > 1) {
+    out += '<p class="hint">Filters apply top to bottom, so loosening one hands its rejects to the next.</p>';
+  }
+  return out;
+}
+
 async function doSearch() {
   const symbol = document.getElementById('ticker').value.trim().toUpperCase();
   if (!symbol) { showError('Please enter a ticker symbol.'); return; }
@@ -3656,7 +3750,9 @@ async function doSearch() {
     refreshOpenCurves(allSpreads.map(spreadCurveDescriptor));
 
     if (allSpreads.length === 0) {
-      document.getElementById('emptyState').innerHTML = '<h2>No spreads found</h2><p>Try increasing the max premium or decreasing the min leverage.</p>';
+      document.getElementById('emptyState').innerHTML = emptyStateHtml(data, {
+        maxPremiumDollars, maxWidth, maxOtm, minNetDelta, minGamma, minRewardRisk,
+        maxLegPremium, minShortLegDelta, minDte, minMoveReturn, moveBasis, movePct });
       document.getElementById('emptyState').style.display = 'block';
       document.getElementById('resultsTable').style.display = 'none';
     } else {
@@ -5548,7 +5644,7 @@ const COLS = [
   {key:'pnlMove',      label:'P&L @'+mvLbl+' $',    get:s=>s.returnAtMove != null ? s.returnAtMove / 100 * s.totalPremium * 100 : null},
   {key:'return1sigma', label:'Return 1σ 1d %',      get:s=>s.return1sigma},
   {key:'beMovePct',    label:'BE Move %',          get:s=>s.breakevenMovePct},
-  {key:'beMoveSigma',  label:'BE Move σ',          get:s=>s.breakevenMoveSigma},
+  {key:'beMoveSigma',  label:'BE Move σ(exp)',     get:s=>s.breakevenMoveSigma},
   {key:'dollarDelta',  label:'$Δ /1%',             get:s=>s.netDelta*(currentSpot||0)},
   {key:'netDeltaPer',  label:'Δ/Contract',         get:s=>s.netDeltaPer},
   {key:'gammaPer1pct', label:'Γ (Δ/1%)',           get:s=>s.gammaPer1pct},
