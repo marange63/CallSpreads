@@ -1060,6 +1060,33 @@ DEFAULT_WATCHLIST = [
     "V", "MA", "UNH", "XOM", "HD", "COST", "PG", "JNJ", "WMT", "LLY", "ORCL",
 ]
 
+# S&P 100 (OEF) members — a fixed, built-in Dip Scanner universe, scanned
+# without touching the user's watchlist.json. Hand-maintained snapshot (index
+# membership drifts a few names a year — last synced to the 2026-03-23
+# rebalance + DELL/PANW from 2026-09-21; extra/missing names only add or drop
+# rows); Yahoo-style symbols (BRK-B), and only GOOGL of the two Alphabet
+# classes since both would score identically.
+SP100_TICKERS = [
+    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "AMAT", "AMD", "AMGN", "AMT", "AMZN",
+    "AVGO", "AXP", "BA", "BAC", "BK", "BKNG", "BLK", "BMY", "BRK-B", "C",
+    "CAT", "CHTR", "CL", "CMCSA", "COF", "COP", "COST", "CRM", "CSCO", "CVS",
+    "CVX", "DE", "DELL", "DHR", "DIS", "DUK", "EMR", "F", "FDX", "GD",
+    "GE", "GEV", "GILD", "GM", "GOOGL", "GS", "HD", "HON", "IBM", "INTC",
+    "INTU", "ISRG", "JNJ", "JPM", "KO", "LIN", "LLY", "LMT", "LOW", "LRCX",
+    "MA", "MCD", "MDLZ", "MDT", "META", "MMM", "MO", "MRK", "MS", "MSFT",
+    "MU", "NEE", "NFLX", "NKE", "NOW", "NVDA", "ORCL", "PANW", "PEP", "PFE",
+    "PG", "PLTR", "PM", "QCOM", "RTX", "SBUX", "SCHW", "SO", "SPG", "T",
+    "TMO", "TMUS", "TSLA", "TXN", "UBER", "UNH", "UNP", "UPS", "USB", "V",
+    "VZ", "WFC", "WMT", "XOM",
+]
+
+# Dip Scanner universes: name -> symbol-list loader. "watchlist" is the
+# editable curated list; the rest are built-in, read-only.
+DIP_UNIVERSES = {
+    "watchlist": lambda: load_watchlist(),
+    "sp100": lambda: list(SP100_TICKERS),
+}
+
 
 def load_watchlist():
     """Return the saved watchlist (list of upper-cased tickers). Seeds the file
@@ -1252,6 +1279,14 @@ def get_index_sigma_1d(index_symbol, test_mode=False):
 DIP_CACHE_FILE = Path(__file__).parent / "dip_cache.json"
 DIP_HISTORY = "1y"        # enough for the 200-day SMA + realized vol + RSI
 DIP_MIN_ROWS = 60         # skip names with too little history to be meaningful
+DIP_SPEED_DAYS = 3        # drop-speed window: the last N daily returns
+DIP_SPEED_VOL_DAYS = 20   # ...measured against vol over the N days before it
+# Composite weights (sum to 1). Drop speed rewards a sharp, recent break over a
+# slow drift of the same size; z10 was trimmed most since it overlaps it.
+DIP_WEIGHTS = {"below": 0.30, "z": 0.20, "rsi": 0.20, "speed": 0.20, "vix": 0.10}
+# Bump when candidate fields/scoring change so same-day dip_cache.json entries
+# computed by older code are treated as misses instead of served stale.
+DIP_CACHE_VERSION = 2
 
 
 def _rsi(closes, period):
@@ -1276,10 +1311,11 @@ def _dip_metrics_for(closes):
     """Per-symbol dip signals from a daily-close Series. Returns a dict of
     signals + a 0-100 composite dipScore, or None if history is insufficient.
 
-    Composite: raw = 0.35*sBelow + 0.30*sZ + 0.25*sRSI + 0.10*sVix, then a trend
-    gate multiply (×1 if above the 50/200-day, ×0.35 if not) so dips in uptrends
-    score full and falling knives are penalized — same shape as the Finder
-    Score's liquidity-gate multiply. sVix is injected by the caller (shared macro).
+    Composite: raw = DIP_WEIGHTS-blend of sBelow, sZ, sRSI, sSpeed, sVix, then a
+    trend gate multiply (×1 if above the 200-day, ×0.35 if not) so dips in
+    uptrends score full and falling knives are penalized — same shape as the
+    Finder Score's liquidity-gate multiply. sVix is injected by the caller
+    (shared macro).
     """
     c = closes.dropna()
     if len(c) < DIP_MIN_ROWS:
@@ -1301,6 +1337,20 @@ def _dip_metrics_for(closes):
     else:
         z10 = 0.0
 
+    # Drop speed: the last DIP_SPEED_DAYS' return in σ of the daily vol over
+    # the DIP_SPEED_VOL_DAYS *before* it — so the drop doesn't inflate its own
+    # yardstick, and a calm name that suddenly breaks reads as a big shock.
+    # A slow drift of the same total size spreads its move across the window
+    # and scores near zero. Negative = falling fast.
+    rets = c.pct_change().dropna()
+    pre = rets.iloc[-(DIP_SPEED_DAYS + DIP_SPEED_VOL_DAYS):-DIP_SPEED_DAYS]
+    if len(pre) >= DIP_SPEED_VOL_DAYS:
+        ret_n = price / float(c.iloc[-(DIP_SPEED_DAYS + 1)]) - 1.0
+        pre_std = float(pre.std())
+        drop_speed = ret_n / (pre_std * math.sqrt(DIP_SPEED_DAYS)) if pre_std > 0 else 0.0
+    else:
+        drop_speed = 0.0
+
     rsi2 = _rsi(c, 2)
     rsi14 = _rsi(c, 14)
 
@@ -1315,6 +1365,7 @@ def _dip_metrics_for(closes):
     # Sub-scores mapped to 0-100 (deeper pullback -> higher).
     s_below = _clamp(pct_below_20, 0, 5) / 5 * 100
     s_z = _clamp(-z10, 0, 3) / 3 * 100
+    s_speed = _clamp(-drop_speed, 0, 3) / 3 * 100
     rsi_blend = ((100 - rsi2) if rsi2 is not None else 0) * 0.5 + \
                 ((100 - rsi14) if rsi14 is not None else 0) * 0.5
     s_rsi = _clamp(rsi_blend, 0, 100)
@@ -1323,25 +1374,34 @@ def _dip_metrics_for(closes):
         "price": round(price, 2),
         "pctBelow20": round(pct_below_20, 2),
         "z10": round(z10, 2),
+        "dropSpeed": round(drop_speed, 2),
         "rsi2": round(rsi2, 1) if rsi2 is not None else None,
         "rsi14": round(rsi14, 1) if rsi14 is not None else None,
         "aboveTrend": bool(above_trend),
         "pctAbove200": round(pct_above_200, 2) if pct_above_200 is not None else None,
         # sub-scores kept for the composite; blended (with sVix) by the caller
-        "_sBelow": s_below, "_sZ": s_z, "_sRSI": s_rsi,
+        "_sBelow": s_below, "_sZ": s_z, "_sRSI": s_rsi, "_sSpeed": s_speed,
     }
 
 
-def compute_dip_signals(symbols=None, force=False):
-    """Rank a watchlist by dipScore. One batched daily-close download for the
+def compute_dip_signals(symbols=None, force=False, universe="watchlist"):
+    """Rank a universe by dipScore. One batched daily-close download for the
     whole list + one ^VIX series, cached per calendar day on disk (force=True
-    bypasses). Returns {asOf, vixRank, candidates:[...]} sorted by dipScore desc.
-    Names with insufficient history are dropped. Never raises — vendor failure
-    yields an empty candidate list with a warning, like get_betas."""
-    symbols = list(dict.fromkeys(s.strip().upper() for s in (symbols or load_watchlist()) if s.strip()))
+    bypasses), one cache entry per universe name. `symbols` defaults to the
+    universe's DIP_UNIVERSES list. Returns {asOf, vixRank, candidates:[...]}
+    sorted by dipScore desc. Names with insufficient history are dropped.
+    Never raises — vendor failure yields an empty candidate list with a
+    warning, like get_betas."""
+    if not symbols:
+        symbols = DIP_UNIVERSES.get(universe, DIP_UNIVERSES["watchlist"])()
+    symbols = list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))
     today = datetime.now().strftime("%Y-%m-%d")
-    cache = _load_json_dict(DIP_CACHE_FILE)
+    cache_all = _load_json_dict(DIP_CACHE_FILE)
+    if "date" in cache_all:   # legacy single-entry format: discard
+        cache_all = {}
+    cache = cache_all.get(universe) or {}
     if not force and cache.get("date") == today and \
+            cache.get("v") == DIP_CACHE_VERSION and \
             set(cache.get("symbols") or []) == set(symbols):
         return {"asOf": cache.get("asOf"), "vixRank": cache.get("vixRank"),
                 "candidates": cache.get("candidates") or []}
@@ -1366,8 +1426,10 @@ def compute_dip_signals(symbols=None, force=False):
             m = _dip_metrics_for(data[sym])
             if m is None:
                 continue
-            raw = 0.35 * m.pop("_sBelow") + 0.30 * m.pop("_sZ") + \
-                  0.25 * m.pop("_sRSI") + 0.10 * s_vix
+            w = DIP_WEIGHTS
+            raw = w["below"] * m.pop("_sBelow") + w["z"] * m.pop("_sZ") + \
+                  w["rsi"] * m.pop("_sRSI") + w["speed"] * m.pop("_sSpeed") + \
+                  w["vix"] * s_vix
             gate = 1.0 if m["aboveTrend"] else 0.35
             m["ticker"] = sym
             m["dipScore"] = round(raw * gate, 1)
@@ -1378,8 +1440,9 @@ def compute_dip_signals(symbols=None, force=False):
 
     candidates.sort(key=lambda x: x["dipScore"], reverse=True)
     as_of = datetime.now().strftime("%Y-%m-%d %H:%M")
-    _save_json_dict(DIP_CACHE_FILE, {"date": today, "asOf": as_of, "symbols": symbols,
-                                     "vixRank": vix_rank, "candidates": candidates})
+    cache_all[universe] = {"v": DIP_CACHE_VERSION, "date": today, "asOf": as_of, "symbols": symbols,
+                           "vixRank": vix_rank, "candidates": candidates}
+    _save_json_dict(DIP_CACHE_FILE, cache_all)
     return {"asOf": as_of, "vixRank": vix_rank, "candidates": candidates}
 
 
@@ -6532,6 +6595,11 @@ DIP_PAGE = r"""<!DOCTYPE html>
   button.ghost { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
   button.ghost:hover { background:var(--border); }
   button.mini { padding:4px 10px; font-size:12px; }
+  .panel h2 select { margin-left:8px; background:var(--surface2); color:var(--text);
+                     border:1px solid var(--border); border-radius:5px; padding:3px 6px;
+                     font-size:12px; text-transform:none; letter-spacing:0; }
+  .panel h2 .sub { text-transform:none; letter-spacing:0; font-weight:400; margin-left:8px; }
+  textarea[readonly] { color:var(--text-dim); }
   .macro { display:flex; gap:22px; align-items:baseline; flex-wrap:wrap; }
   .macro b { font-size:16px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -6561,12 +6629,18 @@ DIP_PAGE = r"""<!DOCTYPE html>
 </header>
 
 <div class="panel">
-  <h2>Watchlist</h2>
+  <h2>Universe
+    <select id="universe" onchange="onUniverseChange()">
+      <option value="watchlist">My watchlist</option>
+      <option value="sp100">S&amp;P 100</option>
+    </select>
+    <span class="sub" id="wlCount"></span>
+  </h2>
   <textarea id="wl" spellcheck="false" placeholder="AAPL MSFT NVDA ..."></textarea>
   <div class="row">
     <button onclick="scan(false)" id="scanBtn">Scan for dips</button>
     <button class="ghost" onclick="scan(true)">Force refresh</button>
-    <button class="ghost" onclick="saveWatchlist()">Save watchlist</button>
+    <button class="ghost" onclick="saveWatchlist()" id="saveWlBtn">Save watchlist</button>
     <span class="sub" id="wlMsg"></span>
   </div>
 </div>
@@ -6586,9 +6660,13 @@ DIP_PAGE = r"""<!DOCTYPE html>
 let rows = [];
 let sortKey = 'dipScore', sortDir = -1;
 
+// [key, label, optional header tooltip]
 const COLS = [
   ['ticker','Ticker'], ['price','Price'], ['pctBelow20','% &lt;20d MA'],
-  ['z10','z (10d)'], ['rsi2','RSI(2)'], ['rsi14','RSI(14)'],
+  ['z10','z (10d)'],
+  ['dropSpeed','Drop speed', 'Last 3 days\' return in σ of the daily vol over the 20 days before it. ' +
+    'Strongly negative = a sharp, recent break; near zero = a slow drift (or no drop). Feeds 20% of the Dip Score.'],
+  ['rsi2','RSI(2)'], ['rsi14','RSI(14)'],
   ['aboveTrend','Trend'], ['pctAbove200','% vs 200d'], ['dipScore','Dip Score'],
 ];
 
@@ -6600,12 +6678,26 @@ function scoreColor(s) {
 }
 function fmt(v, dp) { return (v === null || v === undefined) ? '--' : (+v).toFixed(dp); }
 
+function universe() { return document.getElementById('universe').value; }
+
 async function loadWatchlist() {
+  // The editable watchlist, or a built-in list (S&P 100) shown read-only.
+  const u = universe();
+  const ta = document.getElementById('wl');
+  ta.readOnly = (u !== 'watchlist');
+  document.getElementById('saveWlBtn').style.display = (u === 'watchlist') ? '' : 'none';
   try {
-    const r = await fetch('/api/watchlist');
+    const r = await fetch('/api/watchlist?universe=' + encodeURIComponent(u));
     const j = await r.json();
-    document.getElementById('wl').value = (j.symbols || []).join(' ');
+    ta.value = (j.symbols || []).join(' ');
+    document.getElementById('wlCount').textContent = (j.symbols || []).length + ' names';
   } catch (e) {}
+}
+
+async function onUniverseChange() {
+  try { localStorage.setItem('dipUniverse', universe()); } catch (e) {}
+  await loadWatchlist();
+  scan(false);   // switching universe is the "quick run": scan immediately (day-cached)
 }
 
 function parseWl() {
@@ -6630,11 +6722,14 @@ async function scan(force) {
   const btn = document.getElementById('scanBtn');
   const res = document.getElementById('results');
   btn.disabled = true; btn.textContent = 'Scanning...';
-  res.innerHTML = '<div class="msg">Fetching daily history for the watchlist...</div>';
+  const u = universe();
+  res.innerHTML = '<div class="msg">Fetching daily history for ' +
+    (u === 'sp100' ? 'the S&amp;P 100' : 'the watchlist') + '...</div>';
   try {
-    // Save the current watchlist first so a Scan reflects any edits.
-    await saveWatchlist();
-    const r = await fetch('/api/dipscan' + (force ? '?force=1' : ''));
+    // Save the current watchlist first so a Scan reflects any edits
+    // (built-in universes are read-only — never written to watchlist.json).
+    if (u === 'watchlist') await saveWatchlist();
+    const r = await fetch('/api/dipscan?universe=' + encodeURIComponent(u) + (force ? '&force=1' : ''));
     const j = await r.json();
     if (j.error) throw new Error(j.error);
     rows = j.candidates || [];
@@ -6650,8 +6745,10 @@ async function scan(force) {
   } finally { btn.disabled = false; btn.textContent = 'Scan for dips'; }
 }
 
+// Columns where LOWER = more dip-like sort ascending on first click.
+const ASC_FIRST = new Set(['ticker', 'z10', 'dropSpeed', 'rsi2', 'rsi14']);
 function setSort(k) {
-  if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = (k === 'ticker') ? 1 : -1; }
+  if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = ASC_FIRST.has(k) ? 1 : -1; }
   render();
 }
 
@@ -6667,9 +6764,9 @@ function render() {
     return sortDir * (x - y);
   });
   let h = '<table><thead><tr>';
-  for (const [k, label] of COLS) {
+  for (const [k, label, tip] of COLS) {
     const arrow = sortKey === k ? (sortDir < 0 ? ' &#9662;' : ' &#9652;') : '';
-    h += '<th onclick="setSort(\'' + k + '\')">' + label + arrow + '</th>';
+    h += '<th onclick="setSort(\'' + k + '\')"' + (tip ? ' title="' + tip + '"' : '') + '>' + label + arrow + '</th>';
   }
   h += '<th></th></tr></thead><tbody>';
   for (const r of sorted) {
@@ -6678,6 +6775,7 @@ function render() {
     h += '<td>' + fmt(r.price, 2) + '</td>';
     h += '<td class="' + (r.pctBelow20 > 0 ? '' : 'neg') + '">' + fmt(r.pctBelow20, 2) + '</td>';
     h += '<td class="' + (r.z10 < 0 ? 'neg' : '') + '">' + fmt(r.z10, 2) + '</td>';
+    h += '<td class="' + (r.dropSpeed < 0 ? 'neg' : '') + '">' + fmt(r.dropSpeed, 2) + '</td>';
     h += '<td>' + fmt(r.rsi2, 0) + '</td>';
     h += '<td>' + fmt(r.rsi14, 0) + '</td>';
     h += '<td class="' + (r.aboveTrend ? 'trend-up' : 'trend-no') + '">' + (r.aboveTrend ? '&#9650; up' : 'below') + '</td>';
@@ -6696,6 +6794,11 @@ function findSpreads(ticker) {
   window.open('/?ticker=' + encodeURIComponent(ticker) + '&preset=dip', '_blank');
 }
 
+try {
+  const saved = localStorage.getItem('dipUniverse');
+  if (saved) document.getElementById('universe').value = saved;
+  if (!document.getElementById('universe').value) document.getElementById('universe').value = 'watchlist';
+} catch (e) {}
 loadWatchlist();
 </script>
 </body>
@@ -7314,7 +7417,11 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(load_templates())
 
         elif parsed.path == "/api/watchlist":
-            self._send_json({"symbols": load_watchlist()})
+            # ?universe=sp100 returns a built-in (read-only) Dip Scanner list.
+            params = parse_qs(parsed.query)
+            universe = params.get("universe", ["watchlist"])[0]
+            loader = DIP_UNIVERSES.get(universe, DIP_UNIVERSES["watchlist"])
+            self._send_json({"symbols": loader()})
 
         elif parsed.path == "/api/chain":
             # Full option chain for ONE expiration (the /omon screen). Returns
@@ -7332,8 +7439,11 @@ class SpreadHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == "/api/dipscan":
             params = parse_qs(parsed.query)
             force = params.get("force", ["0"])[0].lower() in ("1", "true", "on")
+            universe = params.get("universe", ["watchlist"])[0]
+            if universe not in DIP_UNIVERSES:
+                universe = "watchlist"
             try:
-                self._send_json(compute_dip_signals(force=force))
+                self._send_json(compute_dip_signals(force=force, universe=universe))
             except Exception as e:
                 self._send_json({"error": str(e)})
 
